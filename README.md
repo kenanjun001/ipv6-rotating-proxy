@@ -1,4 +1,4 @@
-# IPv6 Rotating Proxy Server - 多端口版本
+# IPv6 Rotating Proxy Server
 
 [中文](#中文) | [English](#english)
 
