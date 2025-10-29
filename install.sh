@@ -37,6 +37,42 @@ echo "  端口: $START_PORT-$((START_PORT + PORT_COUNT - 1))"
 echo "  用户: $USERNAME"
 echo ""
 
+# 检查 Go 环境
+print_info "检查 Go 环境..."
+export PATH=$PATH:/usr/local/go/bin
+
+if ! command -v go &> /dev/null; then
+    print_info "Go 未安装，正在安装..."
+    cd /tmp
+    wget -q --show-progress https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
+    
+    if [ $? -ne 0 ]; then
+        print_error "下载 Go 失败"
+        exit 1
+    fi
+    
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
+    
+    # 添加到环境变量
+    if ! grep -q "/usr/local/go/bin" /etc/profile; then
+        echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+    fi
+    
+    export PATH=$PATH:/usr/local/go/bin
+    
+    if command -v go &> /dev/null; then
+        print_success "Go 安装成功: $(go version)"
+    else
+        print_error "Go 安装失败"
+        exit 1
+    fi
+else
+    print_success "Go 已安装: $(go version)"
+fi
+
+echo ""
+
 # 停止服务
 print_info "停止服务..."
 systemctl stop ipv6-proxy 2>/dev/null || true
@@ -507,6 +543,10 @@ if systemctl is-active --quiet ipv6-proxy; then
     echo "测试命令:"
     echo "  HTTP:   curl -x http://$USERNAME:$PASSWORD@127.0.0.1:$START_PORT http://ip.sb"
     echo "  SOCKS5: curl -x socks5://$USERNAME:$PASSWORD@127.0.0.1:$START_PORT http://ip.sb"
+    echo ""
+    echo "查看状态:"
+    echo "  systemctl status ipv6-proxy"
+    echo "  journalctl -u ipv6-proxy -f"
     echo ""
 else
     print_error "服务启动失败"
