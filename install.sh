@@ -290,11 +290,35 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
-	w, _ := io.CopyBuffer(dst, src, buf)
-	if dir == "up" {
-		atomic.AddInt64(&bytesOut, w)
-	} else {
-		atomic.AddInt64(&bytesIn, w)
+	
+	// 动态更新超时: 每次有数据传输就延长5分钟
+	for {
+		// 尝试读取数据(有超时控制)
+		n, err := src.Read(buf)
+		if n > 0 {
+			// 更新统计
+			if dir == "up" {
+				atomic.AddInt64(&bytesOut, int64(n))
+			} else {
+				atomic.AddInt64(&bytesIn, int64(n))
+			}
+			
+			// 写入数据
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
+			}
+			
+			// 有数据传输,延长超时
+			if conn, ok := dst.(net.Conn); ok {
+				conn.SetDeadline(time.Now().Add(5 * time.Minute))
+			}
+			if conn, ok := src.(net.Conn); ok {
+				conn.SetDeadline(time.Now().Add(5 * time.Minute))
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -396,44 +420,50 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		}
 	}
-	d.Timeout = 15 * time.Second
+	d.Timeout = 10 * time.Second // 连接超时缩短到10秒
 	
-	// 重试机制: 最多尝试 3 次
+	// 快速重试: 最多2次,无延迟
 	var remote net.Conn
 	var err error
-	maxRetries := 3
 	
-	for retry := 0; retry < maxRetries; retry++ {
+	for retry := 0; retry < 2; retry++ {
 		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 		if err == nil {
 			break // 连接成功
 		}
-		
-		// 最后一次失败才记录
-		if retry == maxRetries-1 {
-			atomic.AddInt64(&failedConns, 1)
-			if socks {
-				c.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
-			} else {
-				c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			}
-			return err
+	}
+	
+	// 两次都失败
+	if err != nil {
+		atomic.AddInt64(&failedConns, 1)
+		if socks {
+			c.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
+		} else {
+			c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		}
-		
-		// 等待后重试
-		time.Sleep(100 * time.Millisecond)
+		return err
 	}
 	
 	defer remote.Close()
 	if tcp, ok := remote.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
+		tcp.SetKeepAlive(true)
+		tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
+	
 	atomic.AddInt64(&successConns, 1)
+	
 	if socks {
 		c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 	} else {
 		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
+	
+	// 设置数据传输超时: 5分钟无数据传输则断开
+	deadline := time.Now().Add(5 * time.Minute)
+	c.SetDeadline(deadline)
+	remote.SetDeadline(deadline)
+	
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go transfer(remote, c, "up", &wg)
@@ -447,13 +477,19 @@ func handleConn(c net.Conn) {
 	defer atomic.AddInt64(&activeConns, -1)
 	atomic.AddInt64(&activeConns, 1)
 	atomic.AddInt64(&totalConns, 1)
-	c.SetDeadline(time.Now().Add(60 * time.Second))
+	
+	// 初始握手超时: 30秒
+	c.SetDeadline(time.Now().Add(30 * time.Second))
+	
 	ipv6 := randomIPv6()
 	fb := make([]byte, 1)
 	if _, err := c.Read(fb); err != nil {
 		return
 	}
+	
+	// 握手成功后,取消超时(后续在 connectAndForward 中设置)
 	c.SetDeadline(time.Time{})
+	
 	if fb[0] == 0x05 {
 		handleSOCKS5(c, ipv6)
 	} else {
