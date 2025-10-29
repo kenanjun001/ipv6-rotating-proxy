@@ -16,11 +16,11 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 clear
 echo ""
 echo "========================================="
-echo "  IPv6 Rotating Proxy - 极简高性能版"
-echo "  ✅ 每IP限制5并发"
-echo "  ✅ 2^64个IPv6池"
-echo "  ✅ 纯随机负载均衡"
-echo "  ✅ ndppd自动NDP"
+echo "  IPv6 Rotating Proxy - SNAT 方案"
+echo "  ✅ ip6tables SNAT 规则"
+echo "  ✅ 每端口固定 IPv6"
+echo "  ✅ 自动定时清理"
+echo "  ✅ 无需 ndppd"
 echo "========================================="
 echo ""
 
@@ -32,7 +32,7 @@ fi
 # ==================== 清理 ====================
 print_info "清理现有服务..."
 
-for service in go-proxy ipv6-proxy ipv6-proxy-multi dynamic-proxy python-proxy ndppd; do
+for service in go-proxy ipv6-proxy ipv6-proxy-multi dynamic-proxy python-proxy ndppd ipv6-cleanup; do
     systemctl stop $service 2>/dev/null || true
     systemctl disable $service 2>/dev/null || true
     rm -f /etc/systemd/system/$service.service
@@ -41,6 +41,10 @@ done
 systemctl daemon-reload
 pkill -9 -f "ipv6-proxy" 2>/dev/null || true
 pkill -9 -f "ndppd" 2>/dev/null || true
+
+# 清理旧的 iptables 规则
+ip6tables -t nat -F 2>/dev/null || true
+ip6tables -t nat -X 2>/dev/null || true
 
 print_success "清理完成"
 echo ""
@@ -67,13 +71,9 @@ IPV6_INTERFACE=""
 if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
     # 方法1: 使用 ip 命令（推荐）
     if command -v ip &>/dev/null; then
-        # 直接从接口定义行获取接口名
         IFACE_LINE=$(ip -6 addr show scope global 2>/dev/null | grep -E "^[0-9]+:" | head -1)
         if [ -n "$IFACE_LINE" ]; then
-            # 提取接口名：格式是 "2: eth0: <FLAGS>"
             IPV6_INTERFACE=$(echo "$IFACE_LINE" | awk '{print $2}' | tr -d ':')
-            
-            # 获取该接口的全局IPv6地址（排除fe80）
             IPV6_ADDR=$(ip -6 addr show "$IPV6_INTERFACE" scope global 2>/dev/null | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -d'/' -f1)
             
             if [ -n "$IPV6_ADDR" ]; then
@@ -82,21 +82,7 @@ if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
         fi
     fi
     
-    # 方法2: 使用 ifconfig（备用）
-    if [ -z "$IPV6_INTERFACE" ] && command -v ifconfig &>/dev/null; then
-        # 查找有全局IPv6的接口
-        for iface in $(ifconfig -a | grep -oP '^[a-z0-9]+(?=:)'); do
-            IPV6_TEST=$(ifconfig "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | grep -v "::1" | head -1)
-            if [ -n "$IPV6_TEST" ]; then
-                IPV6_INTERFACE="$iface"
-                IPV6_ADDR=$(echo "$IPV6_TEST" | awk '{print $2}' | cut -d'/' -f1)
-                IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
-                break
-            fi
-        done
-    fi
-    
-    # 方法3: 尝试常见接口名
+    # 方法2: 尝试常见接口名
     if [ -z "$IPV6_INTERFACE" ]; then
         for iface in eth0 ens3 ens5 enp0s3 venet0:0 venet0; do
             if ip -6 addr show "$iface" 2>/dev/null | grep -q "inet6.*scope global"; then
@@ -174,9 +160,8 @@ if $USE_IPV6; then
     echo ""
     echo "IPv6: $IPV6_PREFIX::/64"
     echo "接口: $IPV6_INTERFACE"
-    echo "策略: 每IP限制5并发，自动负载均衡"
-    EXPECTED_IPV6=$(( 200000 / 5 ))
-    echo "预计: 20万并发需要约 ${EXPECTED_IPV6} 个活跃IPv6"
+    echo "策略: SNAT 方案，每端口固定 IPv6"
+    echo "清理: 每 10 分钟自动清理连接跟踪"
 fi
 echo "========================================="
 echo ""
@@ -189,122 +174,13 @@ print_info "安装依赖..."
 
 if command -v apt-get &> /dev/null; then
     export DEBIAN_FRONTEND=noninteractive
-    print_info "更新软件包列表..."
     apt-get update -qq 2>&1 | grep -E "^(Hit|Get|Fetched)" || true
-    
-    print_info "安装编译工具..."
-    apt-get install -y build-essential 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - build-essential"
-    
-    print_info "安装 Boost 库..."
-    apt-get install -y libboost-all-dev 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - libboost-all-dev"
-    
-    print_info "安装其他依赖..."
-    apt-get install -y g++ cmake git curl wget 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - g++ cmake git curl wget"
-    
+    apt-get install -y build-essential curl wget iptables 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - 安装完成"
 elif command -v yum &> /dev/null; then
-    print_info "安装编译工具..."
-    yum install -y gcc-c++ boost-devel cmake git curl wget 2>&1 | grep -E "^(Installing|Updating)" || echo "  - 依赖包安装中..."
+    yum install -y gcc-c++ curl wget iptables 2>&1 | grep -E "^(Installing|Updating)" || echo "  - 安装完成"
 fi
 
 print_success "依赖完成"
-
-# ==================== ndppd ====================
-if $USE_IPV6; then
-    print_info "安装 ndppd..."
-    
-    cd /tmp
-    rm -rf ndppd
-    
-    if ! git clone -q https://github.com/DanielAdolfsson/ndppd.git 2>/dev/null; then
-        wget -q https://github.com/DanielAdolfsson/ndppd/archive/refs/heads/master.zip -O ndppd.zip
-        unzip -q ndppd.zip
-        mv ndppd-master ndppd
-    fi
-    
-    cd ndppd
-    print_info "编译 ndppd (可能需要1-2分钟)..."
-    if make -j$(nproc) 2>&1 | grep -E "^\[|%|Building|Compiling" || make -j$(nproc) >/dev/null 2>&1; then
-        print_success "编译成功"
-    else
-        print_error "编译失败"
-        exit 1
-    fi
-    
-    if [ -f "ndppd" ]; then
-        cp ndppd /usr/local/sbin/
-        chmod +x /usr/local/sbin/ndppd
-        print_success "ndppd 编译完成"
-    else
-        print_error "ndppd 编译失败"
-        exit 1
-    fi
-    
-    mkdir -p /etc/ndppd
-    cat > /etc/ndppd/ndppd.conf << NDPPD_EOF
-route-ttl 30000
-
-proxy ${IPV6_INTERFACE} {
-    router no
-    timeout 500
-    ttl 30000
-    
-    rule ${IPV6_PREFIX}::/64 {
-        auto
-    }
-}
-NDPPD_EOF
-    
-    cat > /etc/systemd/system/ndppd.service << 'NDPPD_SERVICE'
-[Unit]
-Description=NDP Proxy Daemon
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/sbin/ndppd -c /etc/ndppd/ndppd.conf
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-NDPPD_SERVICE
-    
-    systemctl daemon-reload
-    systemctl enable ndppd >/dev/null 2>&1
-    systemctl start ndppd
-    
-    sleep 2
-    
-    if systemctl is-active --quiet ndppd; then
-        print_success "ndppd 启动成功"
-    else
-        print_warning "ndppd 启动失败（将由代理程序自动修复）"
-    fi
-fi
-
-# ==================== IPv6 路由 ====================
-if $USE_IPV6; then
-    print_info "配置 IPv6 路由..."
-    
-    ip -6 route add local ${IPV6_PREFIX}::/64 dev lo 2>/dev/null || true
-    sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.accept_ra=0 >/dev/null 2>&1
-    sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1
-    
-    cat > /etc/ipv6-proxy-route.sh << ROUTE_SCRIPT
-#!/bin/bash
-ip -6 route add local ${IPV6_PREFIX}::/64 dev lo 2>/dev/null || true
-sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp=1 >/dev/null 2>&1
-sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.accept_ra=0 >/dev/null 2>&1
-sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1
-ROUTE_SCRIPT
-    chmod +x /etc/ipv6-proxy-route.sh
-    
-    print_success "IPv6 路由配置完成"
-fi
 
 # ==================== 系统优化 ====================
 print_info "系统优化..."
@@ -332,7 +208,7 @@ net.ipv4.tcp_timestamps = 1
 net.netfilter.nf_conntrack_max = 10000000
 net.nf_conntrack_max = 10000000
 net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp = 1
+net.ipv6.conf.${IPV6_INTERFACE}.forwarding = 1
 net.ipv6.ip_nonlocal_bind = 1
 vm.overcommit_memory = 1
 EOF
@@ -354,6 +230,136 @@ if ! command -v go &> /dev/null; then
     print_success "Go 安装完成"
 else
     print_success "Go 已安装: $(go version | awk '{print $3}')"
+fi
+
+# ==================== IPv6 SNAT 配置 ====================
+if $USE_IPV6; then
+    print_info "配置 IPv6 SNAT 规则..."
+    
+    # 清理旧规则
+    ip6tables -t nat -F 2>/dev/null || true
+    
+    # 生成 IPv6 地址池文件
+    mkdir -p /etc/ipv6-proxy
+    cat > /etc/ipv6-proxy/ipv6-pool.txt << POOL_EOF
+# IPv6 地址池 (端口:IPv6)
+# 格式: PORT=IPv6_ADDRESS
+POOL_EOF
+    
+    print_info "生成 IPv6 地址池..."
+    for ((i=0; i<PORT_COUNT; i++)); do
+        PORT=$((START_PORT + i))
+        # 为每个端口生成一个固定的 IPv6
+        IPV6="${IPV6_PREFIX}:$(printf '%x' $((i / 65536))):$(printf '%x' $((i % 65536))):$(printf '%x' $RANDOM):$(printf '%x' $RANDOM)"
+        echo "$PORT=$IPV6" >> /etc/ipv6-proxy/ipv6-pool.txt
+    done
+    
+    print_success "IPv6 地址池生成完成 ($PORT_COUNT 个)"
+    
+    # 创建 SNAT 规则脚本
+    cat > /etc/ipv6-proxy/setup-snat.sh << 'SNAT_SCRIPT'
+#!/bin/bash
+
+# 清理旧规则
+ip6tables -t nat -F 2>/dev/null || true
+ip6tables -t nat -X 2>/dev/null || true
+
+# 读取配置
+IPV6_INTERFACE=$(grep "^IPV6_INTERFACE=" /etc/ipv6-proxy/config.txt | cut -d'=' -f2)
+
+# 应用 SNAT 规则
+while IFS='=' read -r PORT IPV6; do
+    [[ "$PORT" =~ ^#.*$ || -z "$PORT" ]] && continue
+    ip6tables -t nat -A POSTROUTING -p tcp -o "$IPV6_INTERFACE" -m mark --mark "$PORT" -j SNAT --to-source "$IPV6"
+done < /etc/ipv6-proxy/ipv6-pool.txt
+
+echo "✓ SNAT 规则已应用"
+SNAT_SCRIPT
+    
+    chmod +x /etc/ipv6-proxy/setup-snat.sh
+    
+    print_success "IPv6 SNAT 配置完成"
+fi
+
+# ==================== 定时清理服务 ====================
+if $USE_IPV6; then
+    print_info "配置定时清理服务..."
+    
+    cat > /etc/ipv6-proxy/cleanup.sh << 'CLEANUP_SCRIPT'
+#!/bin/bash
+
+LOG_FILE="/var/log/ipv6-proxy-cleanup.log"
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# 清理 conntrack 表中的旧连接
+cleanup_conntrack() {
+    BEFORE=$(conntrack -C 2>/dev/null | awk '{print $1}' || echo 0)
+    
+    # 清理 TIME_WAIT 状态的连接
+    conntrack -D -p tcp --state TIME_WAIT 2>/dev/null || true
+    
+    # 清理超过 5 分钟的 ESTABLISHED 连接
+    conntrack -D -p tcp --state ESTABLISHED --timeout 300 2>/dev/null || true
+    
+    AFTER=$(conntrack -C 2>/dev/null | awk '{print $1}' || echo 0)
+    CLEANED=$((BEFORE - AFTER))
+    
+    log_msg "Conntrack 清理: $BEFORE → $AFTER (清理 $CLEANED)"
+}
+
+# 清理无用的 IPv6 邻居缓存
+cleanup_ipv6_neigh() {
+    IPV6_INTERFACE=$(grep "^IPV6_INTERFACE=" /etc/ipv6-proxy/config.txt | cut -d'=' -f2)
+    
+    if [ -n "$IPV6_INTERFACE" ]; then
+        BEFORE=$(ip -6 neigh show dev "$IPV6_INTERFACE" | wc -l)
+        ip -6 neigh flush dev "$IPV6_INTERFACE" 2>/dev/null || true
+        log_msg "IPv6 邻居缓存清理: $BEFORE 条"
+    fi
+}
+
+# 主清理流程
+log_msg "========== 开始定时清理 =========="
+cleanup_conntrack
+cleanup_ipv6_neigh
+log_msg "========== 清理完成 =========="
+log_msg ""
+CLEANUP_SCRIPT
+    
+    chmod +x /etc/ipv6-proxy/cleanup.sh
+    
+    # 创建定时清理服务
+    cat > /etc/systemd/system/ipv6-cleanup.service << 'CLEANUP_SERVICE'
+[Unit]
+Description=IPv6 Proxy Cleanup Service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/ipv6-proxy/cleanup.sh
+CLEANUP_SERVICE
+    
+    # 创建定时器
+    cat > /etc/systemd/system/ipv6-cleanup.timer << 'CLEANUP_TIMER'
+[Unit]
+Description=IPv6 Proxy Cleanup Timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+CLEANUP_TIMER
+    
+    systemctl daemon-reload
+    systemctl enable ipv6-cleanup.timer
+    systemctl start ipv6-cleanup.timer
+    
+    print_success "定时清理服务已配置 (每 10 分钟)"
 fi
 
 # ==================== 创建代理程序 ====================
@@ -384,7 +390,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -401,7 +406,7 @@ import (
 
 var (
 	cfg          Config
-	ipv6Manager  *IPv6Manager
+	ipv6Pool     map[int]string // port -> ipv6
 	activeConns  int64
 	totalConns   int64
 	successConns int64
@@ -422,12 +427,6 @@ type Config struct {
 	IPv6Prefix    string
 	IPv6Interface string
 	IPv6Enabled   bool
-}
-
-type IPv6Manager struct {
-	activeConns sync.Map // map[string]*int64
-	maxPerIP    int64
-	prefix      string
 }
 
 func loadConfig() error {
@@ -462,61 +461,34 @@ func loadConfig() error {
 	return nil
 }
 
-func NewIPv6Manager(prefix string) *IPv6Manager {
-	return &IPv6Manager{
-		maxPerIP: 5,
-		prefix:   prefix,
-	}
-}
-
-func (m *IPv6Manager) randomIPv6() string {
-	if m.prefix == "" {
-		return ""
-	}
-	return fmt.Sprintf("%s:%x:%x:%x:%x",
-		m.prefix,
-		rand.Int31n(0x10000),
-		rand.Int31n(0x10000),
-		rand.Int31n(0x10000),
-		rand.Int31n(0x10000))
-}
-
-func (m *IPv6Manager) GetAvailableIPv6() string {
+func loadIPv6Pool() error {
+	ipv6Pool = make(map[int]string)
+	
 	if !cfg.IPv6Enabled {
-		return ""
+		return nil
 	}
 	
-	maxAttempts := 200
-	for i := 0; i < maxAttempts; i++ {
-		ipv6 := m.randomIPv6()
+	data, err := os.ReadFile("/etc/ipv6-proxy/ipv6-pool.txt")
+	if err != nil {
+		return err
+	}
+	
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		
-		val, _ := m.activeConns.LoadOrStore(ipv6, new(int64))
-		counter := val.(*int64)
-		current := atomic.LoadInt64(counter)
-		
-		if current < m.maxPerIP {
-			atomic.AddInt64(counter, 1)
-			return ipv6
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			port, _ := strconv.Atoi(parts[0])
+			ipv6 := parts[1]
+			ipv6Pool[port] = ipv6
 		}
 	}
 	
-	ipv6 := m.randomIPv6()
-	val, _ := m.activeConns.LoadOrStore(ipv6, new(int64))
-	atomic.AddInt64(val.(*int64), 1)
-	return ipv6
-}
-
-func (m *IPv6Manager) ReleaseIPv6(ipv6 string) {
-	if ipv6 == "" {
-		return
-	}
-	if val, ok := m.activeConns.Load(ipv6); ok {
-		counter := val.(*int64)
-		newCount := atomic.AddInt64(counter, -1)
-		if newCount <= 0 {
-			m.activeConns.Delete(ipv6)
-		}
-	}
+	log.Printf("加载 IPv6 地址池: %d 个", len(ipv6Pool))
+	return nil
 }
 
 func checkAuth(h string) bool {
@@ -529,7 +501,7 @@ func checkAuth(h string) bool {
 	return false
 }
 
-func handleSOCKS5(c net.Conn, ipv6 string) error {
+func handleSOCKS5(c net.Conn, localPort int) error {
 	buf := make([]byte, 512)
 	
 	c.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -627,10 +599,10 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
 		return fmt.Errorf("unsupported address type")
 	}
 	
-	return connectAndForward(c, host, port, ipv6, true)
+	return connectAndForward(c, host, port, localPort, true)
 }
 
-func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
+func handleHTTP(c net.Conn, fb byte, localPort int) error {
 	r := bufio.NewReader(io.MultiReader(strings.NewReader(string(fb)), c))
 	line, err := r.ReadString('\n')
 	if err != nil {
@@ -669,23 +641,21 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
 	}
 	
 	port, _ := strconv.Atoi(hp[1])
-	return connectAndForward(c, hp[0], uint16(port), ipv6, false)
+	return connectAndForward(c, hp[0], uint16(port), localPort, false)
 }
 
-func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks bool) error {
+func connectAndForward(c net.Conn, host string, port uint16, localPort int, socks bool) error {
 	var d net.Dialer
 	d.Timeout = 30 * time.Second
 	
-	if ipv6 != "" {
-		if addr, err := net.ResolveIPAddr("ip6", ipv6); err == nil {
-			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
+	// 使用 SO_MARK 标记连接，用于 iptables SNAT
+	if cfg.IPv6Enabled {
+		d.Control = func(network, address string, rc syscall.RawConn) error {
+			return rc.Control(func(fd uintptr) {
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, localPort)
+				syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
 		}
-	}
-	
-	d.Control = func(network, address string, c syscall.RawConn) error {
-		return c.Control(func(fd uintptr) {
-			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
-		})
 	}
 	
 	remote, err := d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
@@ -751,7 +721,7 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	}
 }
 
-func handleConn(c net.Conn) {
+func handleConn(c net.Conn, port int) {
 	atomic.AddInt64(&activeConns, 1)
 	atomic.AddInt64(&totalConns, 1)
 	defer func() {
@@ -768,14 +738,11 @@ func handleConn(c net.Conn) {
 	
 	c.SetDeadline(time.Time{})
 	
-	ipv6 := ipv6Manager.GetAvailableIPv6()
-	defer ipv6Manager.ReleaseIPv6(ipv6)
-	
 	var err error
 	if fb[0] == 0x05 {
-		err = handleSOCKS5(c, ipv6)
+		err = handleSOCKS5(c, port)
 	} else {
-		err = handleHTTP(c, fb[0], ipv6)
+		err = handleHTTP(c, fb[0], port)
 	}
 	
 	if err != nil {
@@ -798,7 +765,7 @@ func startProxyServer(port int) error {
 			if err != nil {
 				continue
 			}
-			go handleConn(conn)
+			go handleConn(conn, port)
 		}
 	}()
 	return nil
@@ -809,18 +776,11 @@ func statsRoutine() {
 	defer ticker.Stop()
 	
 	for range ticker.C {
-		activeIPCount := 0
-		ipv6Manager.activeConns.Range(func(key, value interface{}) bool {
-			activeIPCount++
-			return true
-		})
-		
-		log.Printf("[统计] 活跃:%d 总计:%d 成功:%d 失败:%d 活跃IPv6:%d 入站:%.2fGB 出站:%.2fGB",
+		log.Printf("[统计] 活跃:%d 总计:%d 成功:%d 失败:%d 入站:%.2fGB 出站:%.2fGB",
 			atomic.LoadInt64(&activeConns),
 			atomic.LoadInt64(&totalConns),
 			atomic.LoadInt64(&successConns),
 			atomic.LoadInt64(&failedConns),
-			activeIPCount,
 			float64(atomic.LoadInt64(&bytesIn))/1e9,
 			float64(atomic.LoadInt64(&bytesOut))/1e9)
 	}
@@ -830,12 +790,6 @@ func metricsServer() {
 	mux := http.NewServeMux()
 	
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		activeIPCount := 0
-		ipv6Manager.activeConns.Range(func(key, value interface{}) bool {
-			activeIPCount++
-			return true
-		})
-		
 		fmt.Fprintf(w, "proxy_ports_total %s\n", cfg.PortCount)
 		fmt.Fprintf(w, "proxy_ports_success %d\n", atomic.LoadInt64(&portSuccess))
 		fmt.Fprintf(w, "proxy_ports_failed %d\n", atomic.LoadInt64(&portFailed))
@@ -843,9 +797,9 @@ func metricsServer() {
 		fmt.Fprintf(w, "proxy_total_conns %d\n", atomic.LoadInt64(&totalConns))
 		fmt.Fprintf(w, "proxy_success_conns %d\n", atomic.LoadInt64(&successConns))
 		fmt.Fprintf(w, "proxy_failed_conns %d\n", atomic.LoadInt64(&failedConns))
-		fmt.Fprintf(w, "proxy_active_ipv6 %d\n", activeIPCount)
 		fmt.Fprintf(w, "proxy_bytes_in %d\n", atomic.LoadInt64(&bytesIn))
 		fmt.Fprintf(w, "proxy_bytes_out %d\n", atomic.LoadInt64(&bytesOut))
+		fmt.Fprintf(w, "proxy_ipv6_pool_size %d\n", len(ipv6Pool))
 	})
 	
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -855,168 +809,20 @@ func metricsServer() {
 	http.ListenAndServe(":"+cfg.MetricsPort, mux)
 }
 
-func autoDetectIPv6Interface() (string, string, error) {
-	// 方法1: 读取 /proc/net/if_inet6
-	data, err := os.ReadFile("/proc/net/if_inet6")
-	if err == nil {
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			fields := strings.Fields(line)
-			if len(fields) >= 6 {
-				// 跳过本地和链路本地地址
-				if strings.HasPrefix(fields[0], "00000000") || strings.HasPrefix(fields[0], "fe80") {
-					continue
-				}
-				iface := fields[5]
-				addr := fields[0]
-				if len(addr) == 32 {
-					prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
-					return iface, prefix, nil
-				}
-			}
-		}
-	}
-	
-	// 方法2: 尝试常见接口
-	commonIfaces := []string{"eth0", "ens3", "ens5", "enp0s3", "enp1s0", "venet0"}
-	for _, iface := range commonIfaces {
-		data, err := os.ReadFile("/proc/net/if_inet6")
-		if err == nil {
-			lines := strings.Split(string(data), "\n")
-			for _, line := range lines {
-				fields := strings.Fields(line)
-				if len(fields) >= 6 && fields[5] == iface {
-					addr := fields[0]
-					if !strings.HasPrefix(addr, "fe80") && !strings.HasPrefix(addr, "00000000") {
-						if len(addr) == 32 {
-							prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
-							return iface, prefix, nil
-						}
-					}
-				}
-			}
-		}
-	}
-	
-	return "", "", fmt.Errorf("无法检测IPv6接口")
-}
-
-func fixNdppd(iface, prefix string) error {
-	// 更新 ndppd 配置文件
-	ndppdConf := fmt.Sprintf(`route-ttl 30000
-
-proxy %s {
-    router no
-    timeout 500
-    ttl 30000
-    
-    rule %s::/64 {
-        auto
-    }
-}
-`, iface, prefix)
-	
-	err := os.WriteFile("/etc/ndppd/ndppd.conf", []byte(ndppdConf), 0644)
-	if err != nil {
-		return fmt.Errorf("更新ndppd配置失败: %v", err)
-	}
-	
-	log.Printf("✓ ndppd 配置已更新: 接口=%s 前缀=%s::/64", iface, prefix)
-	
-	// 重启 ndppd 服务
-	cmd := exec.Command("systemctl", "restart", "ndppd")
-	if err := cmd.Run(); err != nil {
-		log.Printf("警告: 重启ndppd失败: %v", err)
-		return err
-	}
-	
-	time.Sleep(1 * time.Second)
-	
-	// 检查服务状态
-	cmd = exec.Command("systemctl", "is-active", "ndppd")
-	output, _ := cmd.Output()
-	if strings.TrimSpace(string(output)) == "active" {
-		log.Printf("✓ ndppd 服务已成功重启")
-		return nil
-	}
-	
-	log.Printf("警告: ndppd 可能未正常运行")
-	return nil
-}
-
-func fixIPv6Config() error {
+func setupSNAT() error {
 	if !cfg.IPv6Enabled {
 		return nil
 	}
 	
-	// 检查配置是否有效
-	needFix := cfg.IPv6Interface == "" || cfg.IPv6Interface == "global" || cfg.IPv6Interface == "lo"
+	log.Printf("配置 SNAT 规则...")
 	
-	if needFix {
-		log.Printf("⚠ 检测到无效的接口配置: '%s'", cfg.IPv6Interface)
-		log.Printf("→ 开始自动修复...")
-		
-		iface, prefix, err := autoDetectIPv6Interface()
-		if err != nil {
-			return fmt.Errorf("自动检测失败: %v", err)
-		}
-		
-		log.Printf("✓ 检测到正确配置: 接口=%s 前缀=%s", iface, prefix)
-		
-		// 更新内存中的配置
-		cfg.IPv6Interface = iface
-		if cfg.IPv6Prefix == "" || cfg.IPv6Prefix != prefix {
-			cfg.IPv6Prefix = prefix
-		}
-		
-		// 保存到配置文件
-		configLines := []string{
-			"START_PORT=" + cfg.StartPort,
-			"PORT_COUNT=" + cfg.PortCount,
-			"METRICS_PORT=" + cfg.MetricsPort,
-			"USERNAME=" + cfg.Username,
-			"PASSWORD=" + cfg.Password,
-			"IPV6_ENABLED=true",
-			"IPV6_PREFIX=" + cfg.IPv6Prefix,
-			"IPV6_INTERFACE=" + cfg.IPv6Interface,
-		}
-		
-		err = os.WriteFile("/etc/ipv6-proxy/config.txt", []byte(strings.Join(configLines, "\n")), 0644)
-		if err != nil {
-			log.Printf("警告: 无法保存配置文件: %v", err)
-		} else {
-			log.Printf("✓ 配置文件已自动修复")
-		}
-		
-		// 修复 ndppd
-		if err := fixNdppd(iface, prefix); err != nil {
-			log.Printf("警告: ndppd修复失败: %v", err)
-		}
-		
-		// 更新路由脚本
-		routeScript := fmt.Sprintf(`#!/bin/bash
-ip -6 route add local %s::/64 dev lo 2>/dev/null || true
-sysctl -w net.ipv6.conf.%s.proxy_ndp=1 >/dev/null 2>&1
-sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-sysctl -w net.ipv6.conf.%s.accept_ra=0 >/dev/null 2>&1
-sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1
-`, prefix, iface, iface)
-		
-		if err := os.WriteFile("/etc/ipv6-proxy-route.sh", []byte(routeScript), 0755); err != nil {
-			log.Printf("警告: 无法更新路由脚本: %v", err)
-		} else {
-			// 执行路由配置
-			cmd := exec.Command("/etc/ipv6-proxy-route.sh")
-			if err := cmd.Run(); err != nil {
-				log.Printf("警告: 执行路由配置失败: %v", err)
-			} else {
-				log.Printf("✓ IPv6 路由已配置")
-			}
-		}
-		
-		log.Printf("✓ IPv6 配置自动修复完成!")
+	cmd := exec.Command("/etc/ipv6-proxy/setup-snat.sh")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("SNAT 配置失败: %v\n%s", err, output)
 	}
 	
+	log.Printf("%s", strings.TrimSpace(string(output)))
 	return nil
 }
 
@@ -1025,25 +831,24 @@ func main() {
 		log.Fatalf("加载配置失败: %v", err)
 	}
 	
-	rand.Seed(time.Now().UnixNano())
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	
-	// 自动修复 IPv6 配置
-	if err := fixIPv6Config(); err != nil {
-		log.Printf("警告: IPv6配置修复失败: %v", err)
+	if err := loadIPv6Pool(); err != nil {
+		log.Printf("警告: 加载 IPv6 池失败: %v", err)
 	}
 	
-	ipv6Manager = NewIPv6Manager(cfg.IPv6Prefix)
+	if err := setupSNAT(); err != nil {
+		log.Printf("警告: SNAT 配置失败: %v", err)
+	}
 	
 	startPort, _ := strconv.Atoi(cfg.StartPort)
 	portCount, _ := strconv.Atoi(cfg.PortCount)
 	endPort := startPort + portCount - 1
 	
-	log.Printf("IPv6 Rotating Proxy | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
+	log.Printf("IPv6 Rotating Proxy (SNAT) | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
 	if cfg.IPv6Enabled {
-		log.Printf("IPv6配置: 接口=%s 前缀=%s 每IP限制=5并发", cfg.IPv6Interface, cfg.IPv6Prefix)
+		log.Printf("SNAT 方案: 每端口固定 IPv6，基于 SO_MARK 标记")
 	}
-	
 	
 	go statsRoutine()
 	go metricsServer()
@@ -1082,13 +887,14 @@ fi
 # ==================== 创建服务 ====================
 cat > /etc/systemd/system/ipv6-proxy.service << 'SERVICE_EOF'
 [Unit]
-Description=IPv6 Rotating Proxy
+Description=IPv6 Rotating Proxy (SNAT)
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/ipv6-proxy
+ExecStartPre=/etc/ipv6-proxy/setup-snat.sh
 ExecStart=/opt/ipv6-proxy/ipv6-proxy
 Restart=always
 RestartSec=5
@@ -1116,19 +922,19 @@ fi
 
 if $USE_IPV6; then
     echo ""
-    print_info "验证 IPv6..."
+    print_info "验证 IPv6 SNAT..."
     
-    if ip -6 route show | grep -q "${IPV6_PREFIX}::/64"; then
-        print_success "IPv6 路由已配置"
+    # 检查 iptables 规则
+    RULE_COUNT=$(ip6tables -t nat -L POSTROUTING -n | grep -c "SNAT" || echo 0)
+    if [ "$RULE_COUNT" -gt 0 ]; then
+        print_success "SNAT 规则已配置 ($RULE_COUNT 条)"
+    else
+        print_warning "未检测到 SNAT 规则"
     fi
     
-    TEST_IPV6="${IPV6_PREFIX}:$(printf '%x' $RANDOM):$(printf '%x' $RANDOM):$(printf '%x' $RANDOM):$(printf '%x' $RANDOM)"
-    print_info "测试 IPv6: $TEST_IPV6"
-    
-    if timeout 3 ping6 -c 1 -I $TEST_IPV6 2001:4860:4860::8888 &>/dev/null; then
-        print_success "IPv6 测试通过"
-    else
-        print_warning "IPv6 测试失败(可能需要重启)"
+    # 检查定时器
+    if systemctl is-active --quiet ipv6-cleanup.timer; then
+        print_success "定时清理服务运行中"
     fi
 fi
 
@@ -1145,8 +951,8 @@ echo "密码: $PASSWORD"
 echo ""
 if $USE_IPV6; then
     echo "IPv6: $IPV6_PREFIX::/64"
-    echo "策略: 每IP限制5并发，纯随机负载均衡"
-    echo "说明: 单IP低并发极少触发429，无需额外重试"
+    echo "方案: SNAT (每端口固定 IPv6)"
+    echo "清理: 每 10 分钟自动清理"
     echo ""
 fi
 echo "测试命令:"
@@ -1158,8 +964,9 @@ echo "# SOCKS5:"
 echo "curl -x socks5://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ip.sb"
 echo ""
 if $USE_IPV6; then
-    echo "# IPv6 (多次运行查看不同IP):"
+    echo "# IPv6 (不同端口=不同IPv6):"
     echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
+    echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$((START_PORT+1)) http://ipv6.ip.sb"
     echo ""
 fi
 echo "# 监控:"
@@ -1168,6 +975,12 @@ echo ""
 echo "# 日志:"
 echo "journalctl -u ipv6-proxy -f"
 echo ""
-echo "# 状态:"
-echo "systemctl status ipv6-proxy"
+echo "# 清理日志:"
+echo "tail -f /var/log/ipv6-proxy-cleanup.log"
+echo ""
+echo "# SNAT 规则:"
+echo "ip6tables -t nat -L POSTROUTING -n -v | head -20"
+echo ""
+echo "# 清理状态:"
+echo "systemctl status ipv6-cleanup.timer"
 echo "========================================="
