@@ -397,16 +397,33 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 		}
 	}
 	d.Timeout = 15 * time.Second
-	remote, err := d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		atomic.AddInt64(&failedConns, 1)
-		if socks {
-			c.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
-		} else {
-			c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	
+	// 重试机制: 最多尝试 3 次
+	var remote net.Conn
+	var err error
+	maxRetries := 3
+	
+	for retry := 0; retry < maxRetries; retry++ {
+		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+		if err == nil {
+			break // 连接成功
 		}
-		return err
+		
+		// 最后一次失败才记录
+		if retry == maxRetries-1 {
+			atomic.AddInt64(&failedConns, 1)
+			if socks {
+				c.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
+			} else {
+				c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+			}
+			return err
+		}
+		
+		// 等待后重试
+		time.Sleep(100 * time.Millisecond)
 	}
+	
 	defer remote.Close()
 	if tcp, ok := remote.(*net.TCPConn); ok {
 		tcp.SetNoDelay(true)
