@@ -475,10 +475,13 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 }
 
 func handleConn(c net.Conn) {
-	defer c.Close()
-	defer atomic.AddInt64(&activeConns, -1)
 	atomic.AddInt64(&activeConns, 1)
 	atomic.AddInt64(&totalConns, 1)
+	
+	defer func() {
+		c.Close()
+		atomic.AddInt64(&activeConns, -1)
+	}()
 	
 	// 初始握手超时: 30秒
 	c.SetDeadline(time.Now().Add(30 * time.Second))
