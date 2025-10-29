@@ -26,31 +26,27 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# ==================== 清理端口函数 ====================
+# ==================== 快速清理端口 ====================
 cleanup_ports() {
     local start_port=$1
     local port_count=$2
     local end_port=$((start_port + port_count - 1))
     
-    print_info "清理端口范围: $start_port - $end_port"
+    print_info "检查端口范围: $start_port - $end_port"
     
-    local cleaned=0
-    for port in $(seq $start_port $end_port); do
-        local pids=$(lsof -ti :$port 2>/dev/null)
-        if [ -n "$pids" ]; then
-            for pid in $pids; do
-                kill -9 $pid 2>/dev/null && ((cleaned++)) || true
-            done
-        fi
-        fuser -k $port/tcp 2>/dev/null && ((cleaned++)) || true
-    done
+    # 一次性查询所有占用的端口,避免循环
+    local occupied_pids=$(lsof -ti :$start_port-$end_port 2>/dev/null | sort -u)
     
-    if [ $cleaned -gt 0 ]; then
-        print_success "已清理 $cleaned 个端口占用"
-        sleep 2
-    else
+    if [ -z "$occupied_pids" ]; then
         print_success "端口范围空闲,无需清理"
+        return 0
     fi
+    
+    # 批量终止进程
+    echo "$occupied_pids" | xargs -r kill -9 2>/dev/null
+    local cleaned=$(echo "$occupied_pids" | wc -w)
+    print_success "已清理 $cleaned 个进程"
+    sleep 1
 }
 
 # ==================== 第一步:清理现有服务 ====================
