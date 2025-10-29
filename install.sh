@@ -29,6 +29,7 @@ print_info "停止现有服务..."
 systemctl stop ipv6-proxy 2>/dev/null || true
 
 print_info "更新代理程序..."
+export PATH=$PATH:/usr/local/go/bin
 cd /opt/ipv6-proxy
 
 cat > main.go << 'GOCODE'
