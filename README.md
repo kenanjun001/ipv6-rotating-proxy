@@ -1,4 +1,6 @@
-# IPv6 Rotating Proxy Server
+# IPv6 轮换代理服务器 - IPv6 Rotating Proxy Server
+
+**支持百万级并发的高性能代理池 | High-Performance Proxy Pool with Million-Level Concurrency**
 
 [中文](#中文) | [English](#english)
 
@@ -8,7 +10,7 @@
 
 ### 🚀 项目简介
 
-一键安装脚本,用于部署支持 IPv6 轮换的代理服务器,同时支持 SOCKS5 和 HTTP CONNECT 协议。**支持创建 1-100000 个代理端口,1个进程管理所有端口**。
+支持百万级并发的高性能 IPv6 代理池系统,一键部署,开箱即用。每个端口自动轮换 IPv6 地址,支持 SOCKS5 和 HTTP CONNECT 协议,单进程可管理 1-100000 个代理端口。
 
 ### ✨ 核心特性
 
@@ -376,7 +378,7 @@ A: CPU 占用主要取决于请求量,不是端口数量。可以增加 CPU 核�
 
 ### 🚀 Overview
 
-A one-click installation script for setting up an IPv6 rotating proxy server with SOCKS5 and HTTP CONNECT support. **Supports 1-100,000 proxy ports managed by a single process**.
+High-performance IPv6 proxy pool system supporting million-level concurrency. One-click deployment with automatic IPv6 rotation per port. Supports SOCKS5 and HTTP CONNECT protocols. Single process manages 1-100,000 proxy ports.
 
 ### ✨ Key Features
 
