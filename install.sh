@@ -218,11 +218,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -568,7 +570,37 @@ func main() {
 	}
 	time.Sleep(2 * time.Second)
 	log.Printf("启动完成! 成功: %d | 失败: %d", atomic.LoadInt64(&portSuccess), atomic.LoadInt64(&portFailed))
-	select {}
+	
+	// 优雅关闭机制
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	
+	log.Printf("服务运行中,按 Ctrl+C 或发送 SIGTERM 优雅关闭...")
+	<-sigChan
+	
+	log.Printf("收到关闭信号,开始优雅关闭...")
+	log.Printf("当前活跃连接: %d", atomic.LoadInt64(&activeConns))
+	
+	// 等待活跃连接完成(最多60秒)
+	shutdownTimeout := 60
+	for i := 0; i < shutdownTimeout; i++ {
+		active := atomic.LoadInt64(&activeConns)
+		if active == 0 {
+			log.Printf("所有连接已关闭")
+			break
+		}
+		if i%5 == 0 {
+			log.Printf("等待 %d 个连接关闭... (%d/%d秒)", active, i, shutdownTimeout)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	
+	finalActive := atomic.LoadInt64(&activeConns)
+	if finalActive > 0 {
+		log.Printf("超时强制关闭,剩余 %d 个连接", finalActive)
+	}
+	
+	log.Printf("服务已关闭")
 }
 GOCODE
 
