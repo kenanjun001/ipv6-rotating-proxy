@@ -19,6 +19,7 @@
 - **💪 高性能**: 10000端口仅占用 ~200MB 内存
 - **🔧 交互配置**: 自定义端口数量和起始端口
 - **🛡️ 系统优化**: 自动调整内核参数和文件描述符
+- **🚀 无限制模式**: 默认配置支持百万级并发,文件描述符无限制
 
 ### 📋 系统要求
 
@@ -237,6 +238,24 @@ systemctl restart ipv6-proxy
 | 10,000 | ~200MB | <5% | ~5秒 | 1000万+ |
 | 50,000 | ~800MB | <10% | ~15秒 | 5000万+ |
 
+### ⚡ 优化特性
+
+**自动系统优化** (默认启用):
+```
+文件描述符: infinity (无限制)
+进程数限制: infinity (无限制)
+最大文件数: 10,000,000
+连接跟踪: 10,000,000
+TCP优化: 自动调整窗口和缓冲区
+```
+
+**支持场景**:
+- ✅ 百万级并发连接
+- ✅ 超大规模爬虫
+- ✅ 高负载代理服务
+- ✅ 长时间稳定运行
+- ✅ 不会出现 "too many open files" 错误
+
 ### 🐛 故障排查
 
 #### 端口被占用
@@ -333,6 +352,7 @@ A one-click installation script for setting up an IPv6 rotating proxy server wit
 - **💪 High Performance**: Only ~200MB RAM for 10,000 ports
 - **🔧 Interactive Setup**: Customize port count and starting port
 - **🛡️ System Optimization**: Auto-tunes kernel parameters
+- **🚀 Unlimited Mode**: Default config supports million-level concurrency, no file descriptor limits
 
 ### 📋 System Requirements
 
@@ -528,6 +548,24 @@ systemctl restart ipv6-proxy
 | 10,000 | ~200MB | <5% | ~5s | 10M+ |
 | 50,000 | ~800MB | <10% | ~15s | 50M+ |
 
+### ⚡ Optimization Features
+
+**Auto System Tuning** (enabled by default):
+```
+File Descriptors: infinity (unlimited)
+Process Limit: infinity (unlimited)
+Max Files: 10,000,000
+Connection Tracking: 10,000,000
+TCP Optimization: Auto-tuned windows and buffers
+```
+
+**Supported Scenarios**:
+- ✅ Million-level concurrent connections
+- ✅ Massive-scale web scraping
+- ✅ High-load proxy services
+- ✅ Long-term stable operation
+- ✅ No "too many open files" errors
+
 ### 🐛 Troubleshooting
 
 #### Port Already in Use
@@ -589,8 +627,9 @@ A: CPU depends on request volume, not port count. Scale up or rate-limit.
 
 ### 📞 Support
 
+- **Telegram**: [@KN_001](https://t.me/KN_001)
+- **Telegram Group**: [https://t.me/Oraclesu](https://t.me/Oraclesu)
 - **Issues**: [GitHub Issues](https://github.com/kenanjun001/ipv6-rotating-proxy/issues)
-- **Docs**: [Wiki](https://github.com/kenanjun001/ipv6-rotating-proxy/wiki)
 
 ---
 
