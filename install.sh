@@ -18,6 +18,7 @@ echo ""
 echo "========================================="
 echo "  IPv6 Rotating Proxy - 多端口版本"
 echo "  支持 1-100000 个代理端口"
+echo "  修复版：正确配置 IPv6 子网"
 echo "========================================="
 echo ""
 
@@ -62,21 +63,34 @@ else
     [[ $confirm =~ ^[Nn]$ ]] && read -p "请输入 IPv4: " IPV4
 fi
 
-# IPv6
+# IPv6 检测和配置
+USE_IPV6=false
+IPV6_PREFIX=""
+IPV6_INTERFACE=""
+
 if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
-    IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -1 | awk '{print $2}' | cut -d'/' -f1)
-    if [ -n "$IPV6_ADDR" ]; then
+    # 获取 IPv6 地址和接口
+    IPV6_INFO=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -1)
+    if [ -n "$IPV6_INFO" ]; then
+        IPV6_ADDR=$(echo "$IPV6_INFO" | awk '{print $2}' | cut -d'/' -f1)
+        IPV6_INTERFACE=$(echo "$IPV6_INFO" | awk '{print $NF}')
         IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+        
         print_success "检测到 IPv6: $IPV6_PREFIX::/64"
+        print_info "网卡接口: $IPV6_INTERFACE"
+        
         read -p "启用 IPv6 随机轮换? [Y/n] " use_ipv6
-        [[ $use_ipv6 =~ ^[Nn]$ ]] && USE_IPV6=false || USE_IPV6=true
+        if [[ ! $use_ipv6 =~ ^[Nn]$ ]]; then
+            USE_IPV6=true
+            print_warning "将配置 IPv6 /64 子网路由..."
+        fi
     else
+        print_warning "未找到全局 IPv6 地址"
         USE_IPV6=false
     fi
 else
     print_warning "IPv6 不可用"
     USE_IPV6=false
-    IPV6_PREFIX=""
 fi
 
 echo ""
@@ -129,14 +143,56 @@ echo "端口范围: $START_PORT - $END_PORT"
 echo "监控端口: $METRICS_PORT"
 echo "用户名: $USERNAME"
 echo "密码: $PASSWORD"
-$USE_IPV6 && echo "IPv6轮换: 启用 ($IPV6_PREFIX::/64)" || echo "IPv6轮换: 禁用"
+if $USE_IPV6; then
+    echo "IPv6轮换: 启用 ($IPV6_PREFIX::/64)"
+    echo "IPv6接口: $IPV6_INTERFACE"
+else
+    echo "IPv6轮换: 禁用"
+fi
 echo "========================================="
 echo ""
 
 read -p "确认安装? [Y/n] " confirm
 [[ $confirm =~ ^[Nn]$ ]] && exit 0
 
-# 跳过端口清理 (由用户自行处理或程序自动处理)
+# ==================== IPv6 子网配置 ====================
+if $USE_IPV6; then
+    print_info "配置 IPv6 /64 子网路由..."
+    
+    # 方法1: 添加本地路由（推荐）
+    ip -6 route add local ${IPV6_PREFIX}::/64 dev lo 2>/dev/null || true
+    
+    # 方法2: 配置 NDP 代理
+    sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    
+    # 验证配置
+    if ip -6 route show | grep -q "${IPV6_PREFIX}::/64"; then
+        print_success "IPv6 路由配置成功"
+    else
+        print_warning "IPv6 路由配置可能失败，将尝试备用方案"
+    fi
+    
+    # 创建持久化配置
+    cat > /etc/ipv6-proxy-route.sh << ROUTESCRIPT
+#!/bin/bash
+# IPv6 路由持久化脚本
+ip -6 route add local ${IPV6_PREFIX}::/64 dev lo 2>/dev/null || true
+sysctl -w net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+ROUTESCRIPT
+    chmod +x /etc/ipv6-proxy-route.sh
+    
+    # 添加到 rc.local 或使用 systemd
+    if [ -f /etc/rc.local ]; then
+        if ! grep -q "ipv6-proxy-route.sh" /etc/rc.local; then
+            sed -i '/^exit 0/i /etc/ipv6-proxy-route.sh' /etc/rc.local
+        fi
+    fi
+    
+    print_success "IPv6 子网配置完成"
+    echo ""
+fi
 
 # ==================== 第三步:系统优化(无限制模式) ====================
 print_info "第 3 步:优化系统参数(无限制模式)..."
@@ -165,6 +221,11 @@ net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_max_tw_buckets = 5000000
 net.netfilter.nf_conntrack_max = 10000000
 net.nf_conntrack_max = 10000000
+
+# IPv6 配置
+net.ipv6.conf.all.forwarding = 1
+net.ipv6.conf.${IPV6_INTERFACE}.proxy_ndp = 1
+net.ipv6.ip_nonlocal_bind = 1
 EOF
 
 sysctl -p /etc/sysctl.d/ipv6-proxy.conf >/dev/null 2>&1 || true
@@ -202,6 +263,7 @@ USERNAME=$USERNAME
 PASSWORD=$PASSWORD
 IPV6_ENABLED=$USE_IPV6
 IPV6_PREFIX=$IPV6_PREFIX
+IPV6_INTERFACE=$IPV6_INTERFACE
 CONFIG
 
 cat > main.go << 'GOCODE'
@@ -236,8 +298,8 @@ var (
 )
 
 type Config struct {
-	StartPort, PortCount, MetricsPort, Username, Password, IPv6Prefix string
-	IPv6Enabled                                                       bool
+	StartPort, PortCount, MetricsPort, Username, Password, IPv6Prefix, IPv6Interface string
+	IPv6Enabled                                                                      bool
 }
 
 func loadConfig() error {
@@ -264,6 +326,8 @@ func loadConfig() error {
 				cfg.IPv6Enabled = val == "true"
 			case "IPV6_PREFIX":
 				cfg.IPv6Prefix = val
+			case "IPV6_INTERFACE":
+				cfg.IPv6Interface = val
 			}
 		}
 	}
@@ -293,24 +357,19 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 	
-	// 动态更新超时: 每次有数据传输就延长5分钟
 	for {
-		// 尝试读取数据(有超时控制)
 		n, err := src.Read(buf)
 		if n > 0 {
-			// 更新统计
 			if dir == "up" {
 				atomic.AddInt64(&bytesOut, int64(n))
 			} else {
 				atomic.AddInt64(&bytesIn, int64(n))
 			}
 			
-			// 写入数据
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				return
 			}
 			
-			// 有数据传输,延长超时
 			if conn, ok := dst.(net.Conn); ok {
 				conn.SetDeadline(time.Now().Add(5 * time.Minute))
 			}
@@ -417,14 +476,26 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
 
 func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks bool) error {
 	var d net.Dialer
+	
+	// 关键修复: 使用随机 IPv6 地址作为源地址
 	if cfg.IPv6Enabled && ipv6 != "" {
+		// 解析 IPv6 地址
 		if addr, err := net.ResolveIPAddr("ip6", ipv6); err == nil {
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
+		} else {
+			log.Printf("警告: 无法解析 IPv6 地址 %s: %v", ipv6, err)
 		}
 	}
-	d.Timeout = 30 * time.Second // 连接超时设为30秒
 	
-	// 指数退避重试: 最多3次, 延迟 0ms, 100ms, 200ms
+	d.Timeout = 30 * time.Second
+	d.Control = func(network, address string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			// 设置 SO_REUSEADDR 和 SO_REUSEPORT
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x0F, 1) // SO_REUSEPORT
+		})
+	}
+	
 	var remote net.Conn
 	var err error
 	maxRetries := 3
@@ -432,18 +503,15 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 	for retry := 0; retry < maxRetries; retry++ {
 		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 		if err == nil {
-			break // 连接成功
+			break
 		}
 		
-		// 如果不是最后一次重试,等待后再试
 		if retry < maxRetries-1 {
-			// 指数退避: 100ms * 2^retry = 100ms, 200ms
 			backoff := time.Duration(100*(1<<uint(retry))) * time.Millisecond
 			time.Sleep(backoff)
 		}
 	}
 	
-	// 所有重试都失败
 	if err != nil {
 		atomic.AddInt64(&failedConns, 1)
 		if socks {
@@ -469,7 +537,6 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 	
-	// 设置数据传输超时: 5分钟无数据传输则断开
 	deadline := time.Now().Add(5 * time.Minute)
 	c.SetDeadline(deadline)
 	remote.SetDeadline(deadline)
@@ -491,7 +558,6 @@ func handleConn(c net.Conn) {
 		atomic.AddInt64(&activeConns, -1)
 	}()
 	
-	// 初始握手超时: 30秒
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	
 	ipv6 := randomIPv6()
@@ -500,7 +566,6 @@ func handleConn(c net.Conn) {
 		return
 	}
 	
-	// 握手成功后,取消超时(后续在 connectAndForward 中设置)
 	c.SetDeadline(time.Time{})
 	
 	if fb[0] == 0x05 {
@@ -570,6 +635,11 @@ func main() {
 	portCount, _ := strconv.Atoi(cfg.PortCount)
 	endPort := startPort + portCount - 1
 	log.Printf("IPv6 Rotating Proxy | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
+	
+	if cfg.IPv6Enabled {
+		log.Printf("IPv6 配置: 前缀=%s 接口=%s", cfg.IPv6Prefix, cfg.IPv6Interface)
+	}
+	
 	go statsRoutine()
 	go metricsServer()
 	log.Printf("正在启动 %d 个代理端口...", portCount)
@@ -582,7 +652,6 @@ func main() {
 	time.Sleep(2 * time.Second)
 	log.Printf("启动完成! 成功: %d | 失败: %d", atomic.LoadInt64(&portSuccess), atomic.LoadInt64(&portFailed))
 	
-	// 优雅关闭机制
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	
@@ -592,7 +661,6 @@ func main() {
 	log.Printf("收到关闭信号,开始优雅关闭...")
 	log.Printf("当前活跃连接: %d", atomic.LoadInt64(&activeConns))
 	
-	// 等待活跃连接完成(最多60秒)
 	shutdownTimeout := 60
 	for i := 0; i < shutdownTimeout; i++ {
 		active := atomic.LoadInt64(&activeConns)
@@ -629,6 +697,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/ipv6-proxy
+ExecStartPre=/etc/ipv6-proxy-route.sh
 ExecStart=/opt/ipv6-proxy/ipv6-proxy
 Restart=always
 RestartSec=5
@@ -644,6 +713,29 @@ systemctl enable ipv6-proxy
 systemctl start ipv6-proxy
 sleep 5
 
+# ==================== 验证 IPv6 配置 ====================
+if $USE_IPV6; then
+    echo ""
+    print_info "验证 IPv6 配置..."
+    
+    if ip -6 route show | grep -q "${IPV6_PREFIX}::/64"; then
+        print_success "IPv6 路由已配置"
+        ip -6 route show | grep "${IPV6_PREFIX}"
+    else
+        print_warning "IPv6 路由未找到"
+    fi
+    
+    # 测试随机 IPv6
+    TEST_IPV6="${IPV6_PREFIX}:$(printf '%x' $((RANDOM % 65536))):$(printf '%x' $((RANDOM % 65536))):$(printf '%x' $((RANDOM % 65536))):$(printf '%x' $((RANDOM % 65536)))"
+    print_info "测试随机 IPv6: $TEST_IPV6"
+    
+    if ping6 -c 1 -I $TEST_IPV6 2001:4860:4860::8888 &>/dev/null; then
+        print_success "随机 IPv6 地址可用!"
+    else
+        print_warning "随机 IPv6 地址测试失败（可能需要重启）"
+    fi
+fi
+
 # ==================== 完成 ====================
 echo ""
 echo "========================================="
@@ -656,9 +748,21 @@ echo "端口范围:  $START_PORT - $END_PORT"
 echo "用户名:    $USERNAME"
 echo "密码:      $PASSWORD"
 echo ""
+if $USE_IPV6; then
+    echo "IPv6状态:  已启用"
+    echo "IPv6前缀:  $IPV6_PREFIX::/64"
+    echo "IPv6接口:  $IPV6_INTERFACE"
+    echo ""
+fi
 echo "测试命令:"
-echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
+echo "# 测试 IPv4:"
+echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ip.sb"
 echo ""
+if $USE_IPV6; then
+    echo "# 测试 IPv6:"
+    echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
+    echo ""
+fi
 echo "监控: curl http://localhost:$METRICS_PORT/metrics"
 echo "日志: journalctl -u ipv6-proxy -f"
 echo "========================================="
