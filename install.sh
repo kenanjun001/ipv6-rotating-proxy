@@ -10,14 +10,12 @@ NC='\033[0m'
 
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[⚠]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 
 clear
 echo ""
 echo "========================================="
-echo "  IPv6 Rotating Proxy - 多端口版本"
-echo "  支持 1-100000 个代理端口"
+echo "  IPv6 Rotating Proxy - SOCKS5 修复"
 echo "========================================="
 echo ""
 
@@ -26,183 +24,28 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# ==================== 第一步:清理现有服务 ====================
-print_info "第 1 步:清理现有代理服务..."
+# 读取配置
+if [ ! -f /etc/ipv6-proxy/config.txt ]; then
+    print_error "配置文件不存在，请先运行安装脚本"
+    exit 1
+fi
+
+source /etc/ipv6-proxy/config.txt
+
+print_info "当前配置："
+echo "  端口: $START_PORT-$((START_PORT + PORT_COUNT - 1))"
+echo "  用户: $USERNAME"
 echo ""
 
-for service in go-proxy ipv6-proxy ipv6-proxy-multi dynamic-proxy python-proxy; do
-    if systemctl list-unit-files | grep -q "^$service.service"; then
-        systemctl stop $service 2>/dev/null || true
-        systemctl disable $service 2>/dev/null || true
-        rm -f /etc/systemd/system/$service.service
-        print_success "已清理服务: $service"
-    fi
-done
-
-systemctl daemon-reload
-
-pkill -9 -f "ipv6-proxy" 2>/dev/null && print_success "已终止: ipv6-proxy" || true
-pkill -9 -f "proxy-server" 2>/dev/null && print_success "已终止: proxy-server" || true
-
+# 停止服务
+print_info "停止服务..."
+systemctl stop ipv6-proxy 2>/dev/null || true
+pkill -9 -f "ipv6-proxy" 2>/dev/null || true
 sleep 2
-print_success "服务清理完成"
-echo ""
 
-# ==================== 第二步:交互式配置 ====================
-print_info "第 2 步:配置参数..."
-echo ""
-
-# IPv4
-IPV4=$(curl -s -4 --max-time 3 ifconfig.me 2>/dev/null || echo "")
-if [ -z "$IPV4" ]; then
-    read -p "请输入服务器 IPv4: " IPV4
-else
-    print_success "检测到 IPv4: $IPV4"
-    read -p "确认使用此IP? [Y/n] " confirm
-    [[ $confirm =~ ^[Nn]$ ]] && read -p "请输入 IPv4: " IPV4
-fi
-
-# IPv6
-if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
-    IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -1 | awk '{print $2}' | cut -d'/' -f1)
-    if [ -n "$IPV6_ADDR" ]; then
-        IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
-        print_success "检测到 IPv6: $IPV6_PREFIX::/64"
-        read -p "启用 IPv6 随机轮换? [Y/n] " use_ipv6
-        [[ $use_ipv6 =~ ^[Nn]$ ]] && USE_IPV6=false || USE_IPV6=true
-    else
-        USE_IPV6=false
-    fi
-else
-    print_warning "IPv6 不可用"
-    USE_IPV6=false
-    IPV6_PREFIX=""
-fi
-
-echo ""
-print_info "=== 代理端口配置 ==="
-
-# 端口数量
-read -p "创建多少个代理端口? [1000]: " PORT_COUNT
-PORT_COUNT=${PORT_COUNT:-1000}
-
-if ! [[ "$PORT_COUNT" =~ ^[0-9]+$ ]] || [ "$PORT_COUNT" -lt 1 ] || [ "$PORT_COUNT" -gt 100000 ]; then
-    print_error "端口数量必须在 1-100000 之间"
-    exit 1
-fi
-
-# 起始端口
-read -p "起始端口号? [20000]: " START_PORT
-START_PORT=${START_PORT:-20000}
-
-if ! [[ "$START_PORT" =~ ^[0-9]+$ ]] || [ "$START_PORT" -lt 1024 ] || [ "$START_PORT" -gt 65535 ]; then
-    print_error "起始端口必须在 1024-65535 之间"
-    exit 1
-fi
-
-END_PORT=$((START_PORT + PORT_COUNT - 1))
-
-if [ "$END_PORT" -gt 65535 ]; then
-    print_error "端口范围超出限制: $START_PORT-$END_PORT (最大65535)"
-    exit 1
-fi
-
-# 监控端口
-read -p "监控端口 [10001]: " METRICS_PORT
-METRICS_PORT=${METRICS_PORT:-10001}
-
-# 认证
-read -p "用户名 [proxy]: " USERNAME
-USERNAME=${USERNAME:-proxy}
-read -sp "密码 [回车自动生成]: " PASSWORD
-echo ""
-[ -z "$PASSWORD" ] && PASSWORD=$(openssl rand -hex 8) && print_info "生成密码: $PASSWORD"
-
-# 确认配置
-echo ""
-echo "========================================="
-echo "  配置摘要"
-echo "========================================="
-echo "服务器 IP: $IPV4"
-echo "代理数量: $PORT_COUNT 个"
-echo "端口范围: $START_PORT - $END_PORT"
-echo "监控端口: $METRICS_PORT"
-echo "用户名: $USERNAME"
-echo "密码: $PASSWORD"
-$USE_IPV6 && echo "IPv6轮换: 启用 ($IPV6_PREFIX::/64)" || echo "IPv6轮换: 禁用"
-echo "========================================="
-echo ""
-
-read -p "确认安装? [Y/n] " confirm
-[[ $confirm =~ ^[Nn]$ ]] && exit 0
-
-# 跳过端口清理 (由用户自行处理或程序自动处理)
-
-# ==================== 第三步:系统优化(无限制模式) ====================
-print_info "第 3 步:优化系统参数(无限制模式)..."
-
-cat > /etc/security/limits.d/ipv6-proxy.conf << EOF
-* soft nofile 10000000
-* hard nofile 10000000
-* soft nproc 10000000
-* hard nproc 10000000
-root soft nofile 10000000
-root hard nofile 10000000
-root soft nproc 10000000
-root hard nproc 10000000
-EOF
-
-cat > /etc/sysctl.d/ipv6-proxy.conf << EOF
-fs.file-max = 10000000
-fs.nr_open = 10000000
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_max_tw_buckets = 5000000
-net.netfilter.nf_conntrack_max = 10000000
-net.nf_conntrack_max = 10000000
-EOF
-
-sysctl -p /etc/sysctl.d/ipv6-proxy.conf >/dev/null 2>&1 || true
-print_success "系统参数优化完成(支持百万级并发)"
-
-# ==================== 第四步:安装 Go ====================
-print_info "第 4 步:检查 Go 环境..."
-
-export PATH=$PATH:/usr/local/go/bin
-if ! command -v go &> /dev/null; then
-    print_info "安装 Go..."
-    cd /tmp
-    wget -q --show-progress https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-    export PATH=$PATH:/usr/local/go/bin
-    print_success "Go 安装完成"
-else
-    print_success "Go 已安装: $(go version | awk '{print $3}')"
-fi
-
-# ==================== 第五步:创建程序 ====================
-print_info "第 5 步:创建代理程序..."
-
-rm -rf /opt/ipv6-proxy
-mkdir -p /opt/ipv6-proxy /etc/ipv6-proxy
+# 生成修复后的代码
+print_info "生成修复代码..."
 cd /opt/ipv6-proxy
-
-cat > /etc/ipv6-proxy/config.txt << CONFIG
-START_PORT=$START_PORT
-PORT_COUNT=$PORT_COUNT
-METRICS_PORT=$METRICS_PORT
-USERNAME=$USERNAME
-PASSWORD=$PASSWORD
-IPV6_ENABLED=$USE_IPV6
-IPV6_PREFIX=$IPV6_PREFIX
-CONFIG
 
 cat > main.go << 'GOCODE'
 package main
@@ -293,24 +136,19 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 	
-	// 动态更新超时: 每次有数据传输就延长5分钟
 	for {
-		// 尝试读取数据(有超时控制)
 		n, err := src.Read(buf)
 		if n > 0 {
-			// 更新统计
 			if dir == "up" {
 				atomic.AddInt64(&bytesOut, int64(n))
 			} else {
 				atomic.AddInt64(&bytesIn, int64(n))
 			}
 			
-			// 写入数据
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				return
 			}
 			
-			// 有数据传输,延长超时
 			if conn, ok := dst.(net.Conn); ok {
 				conn.SetDeadline(time.Now().Add(5 * time.Minute))
 			}
@@ -326,37 +164,64 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 
 func handleSOCKS5(c net.Conn, ipv6 string) error {
 	buf := make([]byte, 512)
+	
+	// 步骤1: 读取客户端支持的认证方法
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	if buf[0] != 5 {
+		return fmt.Errorf("invalid socks version")
+	}
+	
+	nMethods := int(buf[1])
+	if _, err := io.ReadFull(c, buf[:nMethods]); err != nil {
 		return err
 	}
+	
+	// 步骤2: 服务端选择用户名密码认证方法(0x02)
 	c.Write([]byte{5, 2})
+	
+	// 步骤3: 读取用户名密码认证请求
+	// 格式: [认证版本(1字节), 用户名长度(1字节), 用户名, 密码长度(1字节), 密码]
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	if buf[0] != 1 {
+		return fmt.Errorf("invalid auth version")
+	}
+	
+	// 读取用户名
+	userLen := int(buf[1])
+	if _, err := io.ReadFull(c, buf[:userLen]); err != nil {
 		return err
 	}
-	user := string(buf[:int(buf[1])])
+	user := string(buf[:userLen])
+	
+	// 读取密码
 	if _, err := io.ReadFull(c, buf[:1]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[0])]); err != nil {
+	passLen := int(buf[0])
+	if _, err := io.ReadFull(c, buf[:passLen]); err != nil {
 		return err
 	}
-	pass := string(buf[:int(buf[0])])
+	pass := string(buf[:passLen])
+	
+	// 验证认证
 	if user != cfg.Username || pass != cfg.Password {
 		c.Write([]byte{1, 1})
 		return fmt.Errorf("auth failed")
 	}
 	c.Write([]byte{1, 0})
+	
+	// 步骤4: 读取连接请求
 	if _, err := io.ReadFull(c, buf[:4]); err != nil {
 		return err
 	}
+	
 	var host string
 	var port uint16
+	
 	if buf[3] == 1 {
 		if _, err := io.ReadFull(c, buf[:6]); err != nil {
 			return err
@@ -374,6 +239,7 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
 		host = string(buf[:dlen])
 		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
 	}
+	
 	return connectAndForward(c, host, port, ipv6, true)
 }
 
@@ -422,9 +288,8 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		}
 	}
-	d.Timeout = 30 * time.Second // 连接超时设为30秒
+	d.Timeout = 30 * time.Second
 	
-	// 指数退避重试: 最多3次, 延迟 0ms, 100ms, 200ms
 	var remote net.Conn
 	var err error
 	maxRetries := 3
@@ -432,18 +297,15 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 	for retry := 0; retry < maxRetries; retry++ {
 		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 		if err == nil {
-			break // 连接成功
+			break
 		}
 		
-		// 如果不是最后一次重试,等待后再试
 		if retry < maxRetries-1 {
-			// 指数退避: 100ms * 2^retry = 100ms, 200ms
 			backoff := time.Duration(100*(1<<uint(retry))) * time.Millisecond
 			time.Sleep(backoff)
 		}
 	}
 	
-	// 所有重试都失败
 	if err != nil {
 		atomic.AddInt64(&failedConns, 1)
 		if socks {
@@ -469,10 +331,8 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 	
-	// 设置数据传输超时: 5分钟无数据传输则断开
-	deadline := time.Now().Add(5 * time.Minute)
-	c.SetDeadline(deadline)
-	remote.SetDeadline(deadline)
+	c.SetDeadline(time.Now().Add(5 * time.Minute))
+	remote.SetDeadline(time.Now().Add(5 * time.Minute))
 	
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -491,7 +351,6 @@ func handleConn(c net.Conn) {
 		atomic.AddInt64(&activeConns, -1)
 	}()
 	
-	// 初始握手超时: 30秒
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	
 	ipv6 := randomIPv6()
@@ -500,7 +359,6 @@ func handleConn(c net.Conn) {
 		return
 	}
 	
-	// 握手成功后,取消超时(后续在 connectAndForward 中设置)
 	c.SetDeadline(time.Time{})
 	
 	if fb[0] == 0x05 {
@@ -582,7 +440,6 @@ func main() {
 	time.Sleep(2 * time.Second)
 	log.Printf("启动完成! 成功: %d | 失败: %d", atomic.LoadInt64(&portSuccess), atomic.LoadInt64(&portFailed))
 	
-	// 优雅关闭机制
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	
@@ -592,7 +449,6 @@ func main() {
 	log.Printf("收到关闭信号,开始优雅关闭...")
 	log.Printf("当前活跃连接: %d", atomic.LoadInt64(&activeConns))
 	
-	// 等待活跃连接完成(最多60秒)
 	shutdownTimeout := 60
 	for i := 0; i < shutdownTimeout; i++ {
 		active := atomic.LoadInt64(&activeConns)
@@ -615,52 +471,47 @@ func main() {
 }
 GOCODE
 
+print_info "编译..."
 go mod init ipv6-proxy >/dev/null 2>&1 || true
 go build -ldflags="-s -w" -o ipv6-proxy main.go
-print_success "编译完成"
 
-# ==================== 创建服务 ====================
-cat > /etc/systemd/system/ipv6-proxy.service << EOF
-[Unit]
-Description=IPv6 Rotating Proxy (Multi-Port)
-After=network.target
+if [ $? -ne 0 ]; then
+    print_error "编译失败"
+    exit 1
+fi
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/ipv6-proxy
-ExecStart=/opt/ipv6-proxy/ipv6-proxy
-Restart=always
-RestartSec=5
-LimitNOFILE=infinity
-LimitNPROC=infinity
+print_success "编译成功"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
+# 启动服务
+print_info "启动服务..."
 systemctl daemon-reload
-systemctl enable ipv6-proxy
 systemctl start ipv6-proxy
-sleep 5
 
-# ==================== 完成 ====================
-echo ""
-echo "========================================="
-print_success "安装完成!"
-echo "========================================="
-echo ""
-echo "服务器IP:  $IPV4"
-echo "代理数量:  $PORT_COUNT 个"
-echo "端口范围:  $START_PORT - $END_PORT"
-echo "用户名:    $USERNAME"
-echo "密码:      $PASSWORD"
-echo ""
-echo "测试命令:"
-echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
-echo ""
-echo "监控: curl http://localhost:$METRICS_PORT/metrics"
-echo "日志: journalctl -u ipv6-proxy -f"
-echo "========================================="
+sleep 3
 
-systemctl status ipv6-proxy --no-pager | head -10
+if systemctl is-active --quiet ipv6-proxy; then
+    print_success "服务已启动"
+    echo ""
+    echo "========================================="
+    echo "  修复完成"
+    echo "========================================="
+    echo ""
+    echo "修复内容:"
+    echo "  ✓ SOCKS5 认证协议解析错误"
+    echo ""
+    echo "未修改:"
+    echo "  • IPv6 轮换逻辑 (保持原样)"
+    echo "  • 超时机制 (保持原样)"
+    echo "  • 其他所有代码 (保持原样)"
+    echo ""
+    echo "测试命令:"
+    echo "  HTTP:   curl -x http://$USERNAME:$PASSWORD@127.0.0.1:$START_PORT http://ip.sb"
+    echo "  SOCKS5: curl -x socks5://$USERNAME:$PASSWORD@127.0.0.1:$START_PORT http://ip.sb"
+    echo ""
+else
+    print_error "服务启动失败"
+    echo ""
+    echo "查看日志:"
+    journalctl -u ipv6-proxy -n 30
+    exit 1
+fi
