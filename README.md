@@ -1,233 +1,6 @@
-# IPv6 Rotating Proxy Server
+# IPv6 Rotating Proxy Server - 多端口版本
 
-[English](#english) | [中文](#中文)
-
----
-
-## English
-
-### 🚀 Overview
-
-A one-click installation script for setting up an IPv6 rotating proxy server with SOCKS5 and HTTP CONNECT support. Perfect for scenarios requiring automatic IP rotation and high-concurrency proxy services.
-
-### ✨ Features
-
-- **Dual Protocol Support**: SOCKS5 and HTTP CONNECT protocols
-- **IPv6 Rotation**: Automatic rotation through IPv6 address pool (/64 subnet)
-- **Authentication**: Username/password authentication for secure access
-- **High Performance**: Built with Go for maximum concurrency and low latency
-- **Monitoring**: Built-in metrics endpoint for service monitoring
-- **Auto Cleanup**: Automatically removes conflicting services and processes
-- **Systemd Integration**: Runs as a system service with auto-restart
-- **Interactive Setup**: User-friendly installation wizard
-
-### 📋 System Requirements
-
-- **OS**: Ubuntu 20.04+ / Debian 10+ / CentOS 8+
-- **Network**: IPv6 connectivity with /64 subnet
-- **Privileges**: Root access
-- **Memory**: 512MB+ RAM
-- **Disk**: 100MB+ free space
-
-### 🔧 Quick Installation
-
-```bash
-# Download the installation script
-wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
-
-# Make it executable
-chmod +x install.sh
-
-# Run the installer
-sudo ./install.sh
-```
-
-The script will:
-1. Clean up any existing proxy services
-2. Detect your server's IPv4 and IPv6 configuration
-3. Guide you through interactive configuration
-4. Install Go (if not present)
-5. Compile and deploy the proxy server
-6. Set up systemd service
-
-### 📖 Usage
-
-#### Basic Configuration
-
-During installation, you'll be prompted for:
-- **Proxy Port**: Default 20000
-- **Metrics Port**: Default 20001
-- **Username**: Default "proxy"
-- **Password**: Auto-generated if not provided
-- **IPv6 Rotation**: Enable/disable IPv6 rotation
-
-#### Testing Your Proxy
-
-**SOCKS5 Test:**
-```bash
-curl -x socks5://username:password@YOUR_IP:20000 http://ipv6.ip.sb
-```
-
-**HTTP Test:**
-```bash
-curl -x http://username:password@YOUR_IP:20000 http://ipv6.ip.sb
-```
-
-#### Service Management
-
-```bash
-# Check service status
-systemctl status ipv6-proxy
-
-# View logs
-journalctl -u ipv6-proxy -f
-
-# Restart service
-systemctl restart ipv6-proxy
-
-# Stop service
-systemctl stop ipv6-proxy
-```
-
-#### Monitoring
-
-```bash
-# View metrics
-curl http://localhost:20001/metrics
-
-# Health check
-curl http://localhost:20001/health
-```
-
-**Metrics Output:**
-```
-proxy_active 5        # Active connections
-proxy_total 1234      # Total connections since start
-proxy_success 1200    # Successful connections
-proxy_failed 34       # Failed connections
-```
-
-### 🔐 Security Recommendations
-
-1. **Change Default Credentials**: Always use strong passwords
-2. **Firewall Rules**: Restrict proxy port access
-   ```bash
-   ufw allow from YOUR_IP to any port 20000
-   ```
-3. **Regular Updates**: Keep system and Go runtime updated
-4. **Monitor Usage**: Check logs regularly for suspicious activity
-5. **Use HTTPS**: For web proxy requests when possible
-
-### 🏗️ Architecture
-
-```
-Client Request
-    ↓
-[SOCKS5/HTTP Handler]
-    ↓
-[Authentication Check]
-    ↓
-[Random IPv6 Selection] (/64 pool)
-    ↓
-[Outbound Connection] (with selected IPv6)
-    ↓
-[Bidirectional Relay]
-    ↓
-Target Server
-```
-
-### 📊 Performance
-
-- **Concurrency**: Supports 10,000+ concurrent connections
-- **Latency**: <5ms additional overhead
-- **Throughput**: Limited only by network bandwidth
-- **IPv6 Pool**: 18 quintillion addresses per /64 subnet
-
-### 🛠️ Manual Configuration
-
-Configuration file location: `/etc/ipv6-proxy/config.txt`
-
-```bash
-PROXY_PORT=20000
-METRICS_PORT=20001
-USERNAME=proxy
-PASSWORD=your_password
-IPV6_ENABLED=true
-IPV6_PREFIX=2001:db8:1234:5678
-```
-
-After editing, restart the service:
-```bash
-systemctl restart ipv6-proxy
-```
-
-### 🐛 Troubleshooting
-
-**Port already in use:**
-```bash
-# The script handles this, but if needed:
-lsof -i :20000
-kill -9 <PID>
-```
-
-**IPv6 not working:**
-```bash
-# Test IPv6 connectivity
-ping6 2001:4860:4860::8888
-
-# Check IPv6 addresses
-ip -6 addr show
-```
-
-**Service won't start:**
-```bash
-# Check detailed logs
-journalctl -u ipv6-proxy -n 50 --no-pager
-```
-
-### 📝 Configuration Examples
-
-**Example 1: Basic HTTP Proxy (with IPv6)**
-```bash
-# In your application
-export http_proxy="http://username:password@YOUR_IP:20000"
-export https_proxy="http://username:password@YOUR_IP:20000"
-```
-
-**Example 2: SOCKS5 with curl**
-```bash
-curl --socks5 YOUR_IP:20000 --proxy-user username:password http://example.com
-```
-
-**Example 3: Python requests**
-```python
-import requests
-
-proxies = {
-    'http': 'socks5://username:password@YOUR_IP:20000',
-    'https': 'socks5://username:password@YOUR_IP:20000'
-}
-
-response = requests.get('http://ipv6.ip.sb', proxies=proxies)
-print(response.text)
-```
-
-### 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-### 📜 License
-
-MIT License - see [LICENSE](LICENSE) file for details
-
-### ⚠️ Disclaimer
-
-This software is provided for educational and legitimate use cases only. Users are responsible for complying with all applicable laws and regulations. The authors assume no liability for misuse.
-
-### 📮 Support
-
-- **Issues**: [GitHub Issues](https://github.com/kenanjun001/ipv6-rotating-proxy/issues)
-- **Wiki**: [Documentation](https://github.com/kenanjun001/ipv6-rotating-proxy/wiki)
+[中文](#中文) | [English](#english)
 
 ---
 
@@ -235,69 +8,130 @@ This software is provided for educational and legitimate use cases only. Users a
 
 ### 🚀 项目简介
 
-一键安装脚本，用于部署支持 IPv6 轮换的代理服务器，同时支持 SOCKS5 和 HTTP CONNECT 协议。适用于需要自动 IP 轮换和高并发代理服务的场景。
+一键安装脚本,用于部署支持 IPv6 轮换的代理服务器,同时支持 SOCKS5 和 HTTP CONNECT 协议。**支持创建 1-100000 个代理端口,1个进程管理所有端口**。
 
-### ✨ 功能特性
+### ✨ 核心特性
 
-- **双协议支持**：SOCKS5 和 HTTP CONNECT 协议
-- **IPv6 轮换**：自动在 IPv6 地址池中轮换（/64 子网）
-- **用户认证**：用户名/密码认证保障安全访问
-- **高性能**：Go 语言开发，支持高并发低延迟
-- **监控接口**：内置监控端点，实时查看服务状态
-- **自动清理**：自动清理冲突的服务和进程
-- **系统集成**：作为 systemd 服务运行，支持自动重启
-- **交互式安装**：友好的安装向导
+- **🎯 大规模端口**: 1个Go进程监听 1-100000 个端口
+- **⚡ IPv6随机轮换**: 每个端口每次请求使用不同的 IPv6 地址
+- **🔐 双协议支持**: SOCKS5 和 HTTP CONNECT
+- **📊 统一监控**: 所有端口的连接统计和流量监控
+- **💪 高性能**: 10000端口仅占用 ~200MB 内存
+- **🔧 交互配置**: 自定义端口数量和起始端口
+- **🛡️ 系统优化**: 自动调整内核参数和文件描述符
 
 ### 📋 系统要求
 
-- **操作系统**：Ubuntu 20.04+ / Debian 10+ / CentOS 8+
-- **网络**：支持 IPv6 且有 /64 子网
-- **权限**：Root 权限
-- **内存**：512MB+ RAM
-- **磁盘**：100MB+ 可用空间
+- **操作系统**: Ubuntu 20.04+ / Debian 10+ / CentOS 8+
+- **网络**: IPv6 支持 + /64 子网
+- **CPU**: 2核+ (推荐 4核+)
+- **内存**: 1GB+ (10000端口建议 2GB+)
+- **权限**: Root
 
 ### 🔧 快速安装
 
 ```bash
-# 下载安装脚本
+# 1. 下载安装脚本
 wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
 
-# 添加执行权限
+# 2. 添加执行权限
 chmod +x install.sh
 
-# 运行安装程序
+# 3. 运行安装
 sudo ./install.sh
 ```
 
-脚本将自动完成：
-1. 清理现有的代理服务
-2. 检测服务器的 IPv4 和 IPv6 配置
-3. 交互式配置向导
-4. 安装 Go（如果未安装）
-5. 编译并部署代理服务器
-6. 设置 systemd 服务
+### 📝 安装示例
 
-### 📖 使用说明
+```
+检测到 IPv4: 123.45.67.89
+确认使用此IP? [Y/n] ↵
 
-#### 基础配置
+检测到 IPv6: 2001:db8:1234:5678::/64
+启用 IPv6 随机轮换? [Y/n] ↵
 
-安装过程中会提示输入：
-- **代理端口**：默认 20000
-- **监控端口**：默认 20001
-- **用户名**：默认 "proxy"
-- **密码**：如果不输入将自动生成
-- **IPv6 轮换**：启用/禁用 IPv6 轮换
+创建多少个代理端口? [1000]: 10000
+起始端口号? [20000]: 20000
+监控端口 [10001]: ↵
+用户名 [proxy]: ↵
+密码 [回车自动生成]: ↵
+生成密码: a1b2c3d4e5f6
 
-#### 测试代理
+配置摘要:
+服务器 IP: 123.45.67.89
+代理数量: 10000 个
+端口范围: 20000 - 29999
+监控端口: 10001
+用户名: proxy
+密码: a1b2c3d4e5f6
+IPv6轮换: 启用 (2001:db8:1234:5678::/64)
 
-**SOCKS5 测试：**
-```bash
-curl -x socks5://用户名:密码@你的IP:20000 http://ipv6.ip.sb
+确认安装? [Y/n] ↵
+
+✓ 正在启动 10000 个代理端口...
+✓ 进度: 10000/10000 (100.0%)
+✓ 启动完成! 成功: 10000 | 失败: 0
 ```
 
-**HTTP 测试：**
+### 🧪 测试代理
+
+#### 测试单个端口
+
 ```bash
-curl -x http://用户名:密码@你的IP:20000 http://ipv6.ip.sb
+# SOCKS5
+curl -x socks5://proxy:a1b2c3d4e5f6@123.45.67.89:20000 http://ipv6.ip.sb
+
+# HTTP
+curl -x http://proxy:a1b2c3d4e5f6@123.45.67.89:20000 http://ipv6.ip.sb
+```
+
+#### 测试多个端口
+
+```bash
+# 测试前10个端口
+for port in {20000..20009}; do
+    echo "测试端口 $port:"
+    curl -s -x http://proxy:password@123.45.67.89:$port http://ipv6.ip.sb
+done
+```
+
+#### 验证 IPv6 轮换
+
+```bash
+# 同一端口,每次请求返回不同的 IPv6
+for i in {1..5}; do
+    curl -s -x http://proxy:password@123.45.67.89:20000 http://ipv6.ip.sb
+done
+```
+
+输出示例:
+```
+2001:db8:1234:5678:a3f2:8901:4567:abcd
+2001:db8:1234:5678:f821:2345:6789:0123
+2001:db8:1234:5678:1234:5678:9abc:def0
+2001:db8:1234:5678:8765:4321:fedc:ba98
+2001:db8:1234:5678:5a5a:b6b6:c7c7:d8d8
+```
+
+### 📊 监控服务
+
+#### 查看统计信息
+
+```bash
+curl http://localhost:10001/metrics
+```
+
+输出:
+```
+proxy_ports_total 10000           # 总端口数
+proxy_ports_success 10000         # 成功启动的端口
+proxy_ports_failed 0              # 失败的端口
+proxy_active_conns 1234           # 当前活跃连接
+proxy_total_conns 567890          # 总连接数
+proxy_success_conns 560000        # 成功连接
+proxy_failed_conns 7890           # 失败连接
+proxy_bytes_in 12500000000        # 入站流量(字节)
+proxy_bytes_out 45300000000       # 出站流量(字节)
 ```
 
 #### 服务管理
@@ -306,7 +140,7 @@ curl -x http://用户名:密码@你的IP:20000 http://ipv6.ip.sb
 # 查看服务状态
 systemctl status ipv6-proxy
 
-# 查看日志
+# 查看实时日志
 journalctl -u ipv6-proxy -f
 
 # 重启服务
@@ -316,159 +150,457 @@ systemctl restart ipv6-proxy
 systemctl stop ipv6-proxy
 ```
 
-#### 监控服务
+### 💻 代码示例
 
-```bash
-# 查看监控指标
-curl http://localhost:20001/metrics
+#### Python - 单代理
 
-# 健康检查
-curl http://localhost:20001/health
-```
-
-**监控输出示例：**
-```
-proxy_active 5        # 当前活跃连接数
-proxy_total 1234      # 总连接数
-proxy_success 1200    # 成功连接数
-proxy_failed 34       # 失败连接数
-```
-
-### 🔐 安全建议
-
-1. **修改默认密码**：始终使用强密码
-2. **防火墙规则**：限制代理端口访问
-   ```bash
-   ufw allow from 你的IP to any port 20000
-   ```
-3. **定期更新**：保持系统和 Go 运行时更新
-4. **监控使用**：定期检查日志，发现异常活动
-5. **使用 HTTPS**：尽可能使用 HTTPS 进行代理请求
-
-### 🏗️ 架构设计
-
-```
-客户端请求
-    ↓
-[SOCKS5/HTTP 处理器]
-    ↓
-[身份验证检查]
-    ↓
-[随机 IPv6 选择] (/64 地址池)
-    ↓
-[出站连接] (使用选定的 IPv6)
-    ↓
-[双向数据转发]
-    ↓
-目标服务器
-```
-
-### 📊 性能指标
-
-- **并发能力**：支持 10,000+ 并发连接
-- **延迟**：额外开销 <5ms
-- **吞吐量**：仅受网络带宽限制
-- **IPv6 池**：每个 /64 子网有 18 quintillion 个地址
-
-### 🛠️ 手动配置
-
-配置文件位置：`/etc/ipv6-proxy/config.txt`
-
-```bash
-PROXY_PORT=20000
-METRICS_PORT=20001
-USERNAME=proxy
-PASSWORD=your_password
-IPV6_ENABLED=true
-IPV6_PREFIX=2001:db8:1234:5678
-```
-
-修改后重启服务：
-```bash
-systemctl restart ipv6-proxy
-```
-
-### 🐛 故障排查
-
-**端口已被占用：**
-```bash
-# 脚本会自动处理，但如需手动操作：
-lsof -i :20000
-kill -9 <PID>
-```
-
-**IPv6 不工作：**
-```bash
-# 测试 IPv6 连接
-ping6 2001:4860:4860::8888
-
-# 检查 IPv6 地址
-ip -6 addr show
-```
-
-**服务无法启动：**
-```bash
-# 查看详细日志
-journalctl -u ipv6-proxy -n 50 --no-pager
-```
-
-### 📝 配置示例
-
-**示例 1：基础 HTTP 代理（带 IPv6）**
-```bash
-# 在你的应用中
-export http_proxy="http://用户名:密码@你的IP:20000"
-export https_proxy="http://用户名:密码@你的IP:20000"
-```
-
-**示例 2：curl 使用 SOCKS5**
-```bash
-curl --socks5 你的IP:20000 --proxy-user 用户名:密码 http://example.com
-```
-
-**示例 3：Python requests**
 ```python
 import requests
 
 proxies = {
-    'http': 'socks5://用户名:密码@你的IP:20000',
-    'https': 'socks5://用户名:密码@你的IP:20000'
+    'http': 'http://proxy:password@123.45.67.89:20000',
+    'https': 'http://proxy:password@123.45.67.89:20000'
 }
 
+# 每次请求自动使用不同的 IPv6
 response = requests.get('http://ipv6.ip.sb', proxies=proxies)
 print(response.text)
 ```
 
-### 🤝 贡献
+#### Python - 代理池轮询
 
-欢迎贡献！请随时提交 Pull Request。
+```python
+import requests
+import random
 
-### 📜 许可证
+# 代理池: 10000个端口
+PROXY_POOL = [
+    {'http': f'http://proxy:password@123.45.67.89:{port}'}
+    for port in range(20000, 30000)
+]
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+# 每次请求使用不同端口
+for i in range(100):
+    proxy = random.choice(PROXY_POOL)
+    response = requests.get('http://httpbin.org/ip', proxies=proxy)
+    print(f"请求 {i+1}: {response.json()}")
+```
 
-### ⚠️ 免责声明
+#### Python - 并发爬虫
 
-本软件仅供教育和合法用途使用。用户有责任遵守所有适用的法律法规。作者对滥用行为不承担任何责任。
+```python
+import requests
+from concurrent.futures import ThreadPoolExecutor
+import random
 
-### 📮 支持
+PROXY_POOL = [f'http://proxy:pass@ip:{p}' for p in range(20000, 30000)]
 
-- **问题反馈**：[GitHub Issues](https://github.com/kenanjun001/ipv6-rotating-proxy/issues)
-- **文档**：[Wiki](https://github.com/kenanjun001/ipv6-rotating-proxy/wiki)
+def fetch(url):
+    proxy = random.choice(PROXY_POOL)
+    response = requests.get(url, proxies={'http': proxy, 'https': proxy})
+    return response.text
+
+urls = ['http://example.com/page1', 'http://example.com/page2'] * 100
+
+# 200个并发请求
+with ThreadPoolExecutor(max_workers=200) as executor:
+    results = list(executor.map(fetch, urls))
+    
+print(f"完成 {len(results)} 个请求")
+```
+
+### ⚙️ 配置文件
+
+位置: `/etc/ipv6-proxy/config.txt`
+
+```bash
+START_PORT=20000              # 起始端口
+PORT_COUNT=10000              # 端口数量
+METRICS_PORT=10001            # 监控端口
+USERNAME=proxy                # 用户名
+PASSWORD=your_password        # 密码
+IPV6_ENABLED=true             # 启用IPv6轮换
+IPV6_PREFIX=2001:db8:1234:5678  # IPv6前缀
+```
+
+修改配置后重启服务:
+```bash
+systemctl restart ipv6-proxy
+```
+
+### 📈 性能参考
+
+| 端口数量 | 内存占用 | CPU(空闲) | 启动时间 | 并发能力 |
+|---------|---------|-----------|---------|---------|
+| 100 | ~20MB | <1% | <1秒 | 10万+ |
+| 1,000 | ~50MB | <2% | ~2秒 | 100万+ |
+| 10,000 | ~200MB | <5% | ~5秒 | 1000万+ |
+| 50,000 | ~800MB | <10% | ~15秒 | 5000万+ |
+
+### 🐛 故障排查
+
+#### 端口被占用
+
+如果端口被占用,Go程序会在日志中显示:
+```bash
+journalctl -u ipv6-proxy -f
+# 输出: 端口 20000 启动失败: address already in use
+```
+
+手动清理端口:
+```bash
+# 查看占用
+lsof -i :20000-29999
+
+# 批量清理
+lsof -ti :20000-29999 | xargs kill -9
+```
+
+#### IPv6 不工作
+
+```bash
+# 测试 IPv6 连通性
+ping6 -c 3 2001:4860:4860::8888
+
+# 检查 IPv6 地址
+ip -6 addr show
+
+# 测试特定 IPv6
+curl --interface 2001:db8::1 http://ipv6.ip.sb
+```
+
+#### 修改端口数量
+
+```bash
+# 编辑配置
+nano /etc/ipv6-proxy/config.txt
+
+# 修改这两行
+PORT_COUNT=5000
+START_PORT=20000
+
+# 重启服务
+systemctl restart ipv6-proxy
+```
+
+### 🔐 安全建议
+
+1. **强密码**: 使用至少 16 位随机字符
+2. **防火墙**: 限制允许的 IP 访问
+   ```bash
+   ufw allow from 你的IP/32 to any port 20000:29999 proto tcp
+   ```
+3. **定期更新**: 保持系统最新
+4. **监控日志**: 检测异常流量
+   ```bash
+   journalctl -u ipv6-proxy -f
+   ```
+
+### 💡 常见问题
+
+**Q: 为什么需要这么多端口?**  
+A: 每个端口可以独立分配给不同用户/应用,实现流量隔离和独立统计。
+
+**Q: 每个端口的 IP 是固定的吗?**  
+A: 不是。每个端口在每次请求时都会从 /64 子网随机选择一个 IPv6 地址。
+
+**Q: 最多支持多少端口?**  
+A: 理论上支持 1-65535,建议根据服务器配置选择 1000-50000。
+
+**Q: CPU 占用高怎么办?**  
+A: CPU 占用主要取决于请求量,不是端口数量。可以增加 CPU 核心或限流。
+
+### 📞 支持
+
+- **Telegram**: [@KN_001](https://t.me/KN_001)
+- **Telegram群组**: [https://t.me/Oraclesu](https://t.me/Oraclesu)
+- **问题反馈**: [GitHub Issues](https://github.com/kenanjun001/ipv6-rotating-proxy/issues)
+
+---
+
+## English
+
+### 🚀 Overview
+
+A one-click installation script for setting up an IPv6 rotating proxy server with SOCKS5 and HTTP CONNECT support. **Supports 1-100,000 proxy ports managed by a single process**.
+
+### ✨ Key Features
+
+- **🎯 Massive Scale**: Single Go process handles 1-100,000 ports
+- **⚡ IPv6 Rotation**: Each port uses different IPv6 per request
+- **🔐 Dual Protocol**: SOCKS5 and HTTP CONNECT support
+- **📊 Unified Monitoring**: Connection stats and traffic for all ports
+- **💪 High Performance**: Only ~200MB RAM for 10,000 ports
+- **🔧 Interactive Setup**: Customize port count and starting port
+- **🛡️ System Optimization**: Auto-tunes kernel parameters
+
+### 📋 System Requirements
+
+- **OS**: Ubuntu 20.04+ / Debian 10+ / CentOS 8+
+- **Network**: IPv6 with /64 subnet
+- **CPU**: 2+ cores (4+ recommended)
+- **Memory**: 1GB+ (2GB+ for 10,000 ports)
+- **Privileges**: Root access
+
+### 🔧 Quick Installation
+
+```bash
+# 1. Download installation script
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
+
+# 2. Make executable
+chmod +x install.sh
+
+# 3. Run installer
+sudo ./install.sh
+```
+
+### 📝 Installation Example
+
+```
+Detected IPv4: 123.45.67.89
+Confirm? [Y/n] ↵
+
+Detected IPv6: 2001:db8:1234:5678::/64
+Enable IPv6 rotation? [Y/n] ↵
+
+How many proxy ports? [1000]: 10000
+Starting port? [20000]: 20000
+Metrics port [10001]: ↵
+Username [proxy]: ↵
+Password [auto-generate]: ↵
+Generated password: a1b2c3d4e5f6
+
+Configuration Summary:
+Server IP: 123.45.67.89
+Proxy count: 10000
+Port range: 20000 - 29999
+Metrics port: 10001
+Username: proxy
+Password: a1b2c3d4e5f6
+IPv6 rotation: Enabled (2001:db8:1234:5678::/64)
+
+Confirm installation? [Y/n] ↵
+
+✓ Starting 10000 proxy ports...
+✓ Progress: 10000/10000 (100.0%)
+✓ Startup complete! Success: 10000 | Failed: 0
+```
+
+### 🧪 Testing
+
+#### Test Single Port
+
+```bash
+# SOCKS5
+curl -x socks5://proxy:password@123.45.67.89:20000 http://ipv6.ip.sb
+
+# HTTP
+curl -x http://proxy:password@123.45.67.89:20000 http://ipv6.ip.sb
+```
+
+#### Test Multiple Ports
+
+```bash
+# Test first 10 ports
+for port in {20000..20009}; do
+    echo "Testing port $port:"
+    curl -s -x http://proxy:password@123.45.67.89:$port http://ipv6.ip.sb
+done
+```
+
+#### Verify IPv6 Rotation
+
+```bash
+# Same port, different IPv6 each request
+for i in {1..5}; do
+    curl -s -x http://proxy:password@123.45.67.89:20000 http://ipv6.ip.sb
+done
+```
+
+Output:
+```
+2001:db8:1234:5678:a3f2:8901:4567:abcd
+2001:db8:1234:5678:f821:2345:6789:0123
+2001:db8:1234:5678:1234:5678:9abc:def0
+2001:db8:1234:5678:8765:4321:fedc:ba98
+2001:db8:1234:5678:5a5a:b6b6:c7c7:d8d8
+```
+
+### 📊 Monitoring
+
+#### View Statistics
+
+```bash
+curl http://localhost:10001/metrics
+```
+
+Output:
+```
+proxy_ports_total 10000           # Total ports
+proxy_ports_success 10000         # Successfully started
+proxy_ports_failed 0              # Failed to start
+proxy_active_conns 1234           # Active connections
+proxy_total_conns 567890          # Total connections
+proxy_success_conns 560000        # Successful connections
+proxy_failed_conns 7890           # Failed connections
+proxy_bytes_in 12500000000        # Inbound traffic (bytes)
+proxy_bytes_out 45300000000       # Outbound traffic (bytes)
+```
+
+#### Service Management
+
+```bash
+# Check status
+systemctl status ipv6-proxy
+
+# View live logs
+journalctl -u ipv6-proxy -f
+
+# Restart service
+systemctl restart ipv6-proxy
+
+# Stop service
+systemctl stop ipv6-proxy
+```
+
+### 💻 Code Examples
+
+#### Python - Single Proxy
+
+```python
+import requests
+
+proxies = {
+    'http': 'http://proxy:password@123.45.67.89:20000',
+    'https': 'http://proxy:password@123.45.67.89:20000'
+}
+
+# Different IPv6 each request
+response = requests.get('http://ipv6.ip.sb', proxies=proxies)
+print(response.text)
+```
+
+#### Python - Proxy Pool
+
+```python
+import requests
+import random
+
+# Pool of 10,000 ports
+PROXY_POOL = [
+    {'http': f'http://proxy:password@123.45.67.89:{port}'}
+    for port in range(20000, 30000)
+]
+
+# Use different port each request
+for i in range(100):
+    proxy = random.choice(PROXY_POOL)
+    response = requests.get('http://httpbin.org/ip', proxies=proxy)
+    print(f"Request {i+1}: {response.json()}")
+```
+
+### ⚙️ Configuration
+
+Location: `/etc/ipv6-proxy/config.txt`
+
+```bash
+START_PORT=20000              # Starting port
+PORT_COUNT=10000              # Number of ports
+METRICS_PORT=10001            # Metrics port
+USERNAME=proxy                # Username
+PASSWORD=your_password        # Password
+IPV6_ENABLED=true             # Enable IPv6 rotation
+IPV6_PREFIX=2001:db8:1234:5678  # IPv6 prefix
+```
+
+Restart after changes:
+```bash
+systemctl restart ipv6-proxy
+```
+
+### 📈 Performance
+
+| Port Count | Memory | CPU (idle) | Startup | Concurrency |
+|-----------|--------|------------|---------|-------------|
+| 100 | ~20MB | <1% | <1s | 100k+ |
+| 1,000 | ~50MB | <2% | ~2s | 1M+ |
+| 10,000 | ~200MB | <5% | ~5s | 10M+ |
+| 50,000 | ~800MB | <10% | ~15s | 50M+ |
+
+### 🐛 Troubleshooting
+
+#### Port Already in Use
+
+Check logs:
+```bash
+journalctl -u ipv6-proxy -f
+# Output: Port 20000 startup failed: address already in use
+```
+
+Manual cleanup:
+```bash
+# Check usage
+lsof -i :20000-29999
+
+# Batch cleanup
+lsof -ti :20000-29999 | xargs kill -9
+```
+
+#### IPv6 Not Working
+
+```bash
+# Test connectivity
+ping6 -c 3 2001:4860:4860::8888
+
+# Check addresses
+ip -6 addr show
+
+# Test specific IPv6
+curl --interface 2001:db8::1 http://ipv6.ip.sb
+```
+
+### 🔐 Security
+
+1. **Strong Password**: Use 16+ random characters
+2. **Firewall**: Restrict IP access
+   ```bash
+   ufw allow from YOUR_IP/32 to any port 20000:29999 proto tcp
+   ```
+3. **Regular Updates**: Keep system updated
+4. **Monitor Logs**: Check for anomalies
+   ```bash
+   journalctl -u ipv6-proxy -f
+   ```
+
+### 💡 FAQ
+
+**Q: Why so many ports?**  
+A: Each port can be assigned to different users/apps for traffic isolation.
+
+**Q: Is the IP fixed per port?**  
+A: No. Each port randomly selects an IPv6 from /64 subnet per request.
+
+**Q: Maximum supported ports?**  
+A: Theoretically 1-65535, recommended 1000-50000 based on hardware.
+
+**Q: High CPU usage?**  
+A: CPU depends on request volume, not port count. Scale up or rate-limit.
+
+### 📞 Support
+
+- **Issues**: [GitHub Issues](https://github.com/kenanjun001/ipv6-rotating-proxy/issues)
+- **Docs**: [Wiki](https://github.com/kenanjun001/ipv6-rotating-proxy/wiki)
 
 ---
 
 ### 🌟 Star History
 
-如果这个项目对你有帮助，请给个 Star ⭐️
+If this project helps you, please give it a star ⭐
 
-### 📈 Roadmap
+### 📜 License
 
-- [ ] 支持 Docker 部署
-- [ ] Web 管理面板
-- [ ] 多服务器负载均衡
-- [ ] 流量统计可视化
-- [ ] API 管理接口
+MIT License - see [LICENSE](LICENSE) file for details
 
 ---
 
