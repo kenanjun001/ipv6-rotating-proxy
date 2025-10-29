@@ -67,13 +67,18 @@ IPV6_INTERFACE=""
 if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
     # 方法1: 使用 ip 命令（推荐）
     if command -v ip &>/dev/null; then
-        # 获取全局IPv6地址
-        IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[0-9a-f:]+' | head -1)
-        
-        if [ -n "$IPV6_ADDR" ]; then
-            # 获取该地址所在的接口
-            IPV6_INTERFACE=$(ip -6 addr show | grep -B 2 "$IPV6_ADDR" | head -1 | awk '{print $2}' | tr -d ':')
-            IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+        # 直接从接口定义行获取接口名
+        IFACE_LINE=$(ip -6 addr show scope global 2>/dev/null | grep -E "^[0-9]+:" | head -1)
+        if [ -n "$IFACE_LINE" ]; then
+            # 提取接口名：格式是 "2: eth0: <FLAGS>"
+            IPV6_INTERFACE=$(echo "$IFACE_LINE" | awk '{print $2}' | tr -d ':')
+            
+            # 获取该接口的全局IPv6地址（排除fe80）
+            IPV6_ADDR=$(ip -6 addr show "$IPV6_INTERFACE" scope global 2>/dev/null | grep "inet6" | grep -v "fe80" | head -1 | awk '{print $2}' | cut -d'/' -f1)
+            
+            if [ -n "$IPV6_ADDR" ]; then
+                IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+            fi
         fi
     fi
     
@@ -851,8 +856,6 @@ func metricsServer() {
 }
 
 func autoDetectIPv6Interface() (string, string, error) {
-	// 尝试多种方法检测IPv6接口
-	
 	// 方法1: 读取 /proc/net/if_inet6
 	data, err := os.ReadFile("/proc/net/if_inet6")
 	if err == nil {
@@ -865,7 +868,6 @@ func autoDetectIPv6Interface() (string, string, error) {
 					continue
 				}
 				iface := fields[5]
-				// 解析IPv6地址
 				addr := fields[0]
 				if len(addr) == 32 {
 					prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
@@ -882,10 +884,10 @@ func autoDetectIPv6Interface() (string, string, error) {
 		if err == nil {
 			lines := strings.Split(string(data), "\n")
 			for _, line := range lines {
-				if strings.Contains(line, iface) && !strings.HasPrefix(strings.Fields(line)[0], "fe80") {
-					fields := strings.Fields(line)
-					if len(fields) >= 6 {
-						addr := fields[0]
+				fields := strings.Fields(line)
+				if len(fields) >= 6 && fields[5] == iface {
+					addr := fields[0]
+					if !strings.HasPrefix(addr, "fe80") && !strings.HasPrefix(addr, "00000000") {
 						if len(addr) == 32 {
 							prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
 							return iface, prefix, nil
