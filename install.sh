@@ -422,20 +422,28 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		}
 	}
-	d.Timeout = 10 * time.Second // 连接超时缩短到10秒
+	d.Timeout = 30 * time.Second // 连接超时设为30秒
 	
-	// 快速重试: 最多2次,无延迟
+	// 指数退避重试: 最多3次, 延迟 0ms, 100ms, 200ms
 	var remote net.Conn
 	var err error
+	maxRetries := 3
 	
-	for retry := 0; retry < 2; retry++ {
+	for retry := 0; retry < maxRetries; retry++ {
 		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 		if err == nil {
 			break // 连接成功
 		}
+		
+		// 如果不是最后一次重试,等待后再试
+		if retry < maxRetries-1 {
+			// 指数退避: 100ms * 2^retry = 100ms, 200ms
+			backoff := time.Duration(100*(1<<uint(retry))) * time.Millisecond
+			time.Sleep(backoff)
+		}
 	}
 	
-	// 两次都失败
+	// 所有重试都失败
 	if err != nil {
 		atomic.AddInt64(&failedConns, 1)
 		if socks {
