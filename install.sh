@@ -16,9 +16,9 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 clear
 echo ""
 echo "========================================="
-echo "  IPv6 Rotating Proxy - 多端口版本"
-echo "  支持 1-100000 个代理端口"
-echo "  修复版：正确配置 IPv6 子网"
+echo "  IPv6 Rotating Proxy - 修复版"
+echo "  ✅ 修复 IPv6 路由问题"
+echo "  ✅ 修复 SOCKS5 认证 bug"
 echo "========================================="
 echo ""
 
@@ -159,7 +159,7 @@ read -p "确认安装? [Y/n] " confirm
 if $USE_IPV6; then
     print_info "配置 IPv6 /64 子网路由..."
     
-    # 方法1: 添加本地路由（推荐）
+    # 方法1: 添加本地路由（核心修复）
     ip -6 route add local ${IPV6_PREFIX}::/64 dev lo 2>/dev/null || true
     
     # 方法2: 配置 NDP 代理
@@ -183,7 +183,7 @@ sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
 ROUTESCRIPT
     chmod +x /etc/ipv6-proxy-route.sh
     
-    # 添加到 rc.local 或使用 systemd
+    # 添加到 rc.local
     if [ -f /etc/rc.local ]; then
         if ! grep -q "ipv6-proxy-route.sh" /etc/rc.local; then
             sed -i '/^exit 0/i /etc/ipv6-proxy-route.sh' /etc/rc.local
@@ -194,8 +194,8 @@ ROUTESCRIPT
     echo ""
 fi
 
-# ==================== 第三步:系统优化(无限制模式) ====================
-print_info "第 3 步:优化系统参数(无限制模式)..."
+# ==================== 第三步:系统优化 ====================
+print_info "第 3 步:优化系统参数..."
 
 cat > /etc/security/limits.d/ipv6-proxy.conf << EOF
 * soft nofile 10000000
@@ -229,7 +229,7 @@ net.ipv6.ip_nonlocal_bind = 1
 EOF
 
 sysctl -p /etc/sysctl.d/ipv6-proxy.conf >/dev/null 2>&1 || true
-print_success "系统参数优化完成(支持百万级并发)"
+print_success "系统参数优化完成"
 
 # ==================== 第四步:安装 Go ====================
 print_info "第 4 步:检查 Go 环境..."
@@ -383,46 +383,70 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	}
 }
 
+// ✅ 修复后的 SOCKS5 处理函数
 func handleSOCKS5(c net.Conn, ipv6 string) error {
 	buf := make([]byte, 512)
+	
+	// 1. 读取客户端支持的认证方法
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	// buf[0] = SOCKS版本(5), buf[1] = 方法数量
+	nmethods := int(buf[1])
+	if _, err := io.ReadFull(c, buf[:nmethods]); err != nil {
 		return err
 	}
+	
+	// 2. 告诉客户端使用用户名密码认证(方法2)
 	c.Write([]byte{5, 2})
+	
+	// 3. 读取认证信息 - ✅ 修复：先保存长度再读取
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	// buf[0] = 认证版本(1), buf[1] = 用户名长度
+	ulen := int(buf[1])  // ✅ 修复：保存用户名长度
+	
+	if _, err := io.ReadFull(c, buf[:ulen]); err != nil {
 		return err
 	}
-	user := string(buf[:int(buf[1])])
+	user := string(buf[:ulen])  // ✅ 修复：使用保存的长度
+	
+	// 4. 读取密码长度和密码
 	if _, err := io.ReadFull(c, buf[:1]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[0])]); err != nil {
+	plen := int(buf[0])  // ✅ 修复：保存密码长度
+	
+	if _, err := io.ReadFull(c, buf[:plen]); err != nil {
 		return err
 	}
-	pass := string(buf[:int(buf[0])])
+	pass := string(buf[:plen])  // ✅ 修复：使用保存的长度
+	
+	// 5. 验证用户名密码
 	if user != cfg.Username || pass != cfg.Password {
-		c.Write([]byte{1, 1})
-		return fmt.Errorf("auth failed")
+		c.Write([]byte{1, 1})  // 认证失败
+		return fmt.Errorf("auth failed: user=%s", user)
 	}
-	c.Write([]byte{1, 0})
+	c.Write([]byte{1, 0})  // 认证成功
+	
+	// 6. 读取连接请求
 	if _, err := io.ReadFull(c, buf[:4]); err != nil {
 		return err
 	}
+	// buf[0]=VER, buf[1]=CMD, buf[2]=RSV, buf[3]=ATYP
+	
 	var host string
 	var port uint16
-	if buf[3] == 1 {
+	
+	// 7. 根据地址类型解析目标地址
+	if buf[3] == 1 {  // IPv4
 		if _, err := io.ReadFull(c, buf[:6]); err != nil {
 			return err
 		}
 		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
 		port = binary.BigEndian.Uint16(buf[4:6])
-	} else if buf[3] == 3 {
+	} else if buf[3] == 3 {  // 域名
 		if _, err := io.ReadFull(c, buf[:1]); err != nil {
 			return err
 		}
@@ -432,7 +456,25 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
 		}
 		host = string(buf[:dlen])
 		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
+	} else if buf[3] == 4 {  // IPv6
+		if _, err := io.ReadFull(c, buf[:18]); err != nil {
+			return err
+		}
+		host = fmt.Sprintf("[%x:%x:%x:%x:%x:%x:%x:%x]",
+			binary.BigEndian.Uint16(buf[0:2]),
+			binary.BigEndian.Uint16(buf[2:4]),
+			binary.BigEndian.Uint16(buf[4:6]),
+			binary.BigEndian.Uint16(buf[6:8]),
+			binary.BigEndian.Uint16(buf[8:10]),
+			binary.BigEndian.Uint16(buf[10:12]),
+			binary.BigEndian.Uint16(buf[12:14]),
+			binary.BigEndian.Uint16(buf[14:16]))
+		port = binary.BigEndian.Uint16(buf[16:18])
+	} else {
+		c.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})  // 不支持的地址类型
+		return fmt.Errorf("unsupported address type: %d", buf[3])
 	}
+	
 	return connectAndForward(c, host, port, ipv6, true)
 }
 
@@ -477,9 +519,8 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
 func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks bool) error {
 	var d net.Dialer
 	
-	// 关键修复: 使用随机 IPv6 地址作为源地址
+	// ✅ IPv6 路由修复：使用随机 IPv6 地址作为源地址
 	if cfg.IPv6Enabled && ipv6 != "" {
-		// 解析 IPv6 地址
 		if addr, err := net.ResolveIPAddr("ip6", ipv6); err == nil {
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		} else {
@@ -490,7 +531,6 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 	d.Timeout = 30 * time.Second
 	d.Control = func(network, address string, c syscall.RawConn) error {
 		return c.Control(func(fd uintptr) {
-			// 设置 SO_REUSEADDR 和 SO_REUSEPORT
 			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
 			syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0x0F, 1) // SO_REUSEPORT
 		})
@@ -634,7 +674,7 @@ func main() {
 	startPort, _ := strconv.Atoi(cfg.StartPort)
 	portCount, _ := strconv.Atoi(cfg.PortCount)
 	endPort := startPort + portCount - 1
-	log.Printf("IPv6 Rotating Proxy | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
+	log.Printf("IPv6 Rotating Proxy (修复版) | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
 	
 	if cfg.IPv6Enabled {
 		log.Printf("IPv6 配置: 前缀=%s 接口=%s", cfg.IPv6Prefix, cfg.IPv6Interface)
@@ -690,7 +730,7 @@ print_success "编译完成"
 # ==================== 创建服务 ====================
 cat > /etc/systemd/system/ipv6-proxy.service << EOF
 [Unit]
-Description=IPv6 Rotating Proxy (Multi-Port)
+Description=IPv6 Rotating Proxy (Multi-Port Fixed)
 After=network.target
 
 [Service]
@@ -742,6 +782,10 @@ echo "========================================="
 print_success "安装完成!"
 echo "========================================="
 echo ""
+echo "✅ 已修复:"
+echo "   - IPv6 /64 子网路由配置"
+echo "   - SOCKS5 认证 bug"
+echo ""
 echo "服务器IP:  $IPV4"
 echo "代理数量:  $PORT_COUNT 个"
 echo "端口范围:  $START_PORT - $END_PORT"
@@ -755,16 +799,23 @@ if $USE_IPV6; then
     echo ""
 fi
 echo "测试命令:"
-echo "# 测试 IPv4:"
+echo ""
+echo "# HTTP 代理测试:"
 echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ip.sb"
 echo ""
+echo "# SOCKS5 代理测试:"
+echo "curl -x socks5://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ip.sb"
+echo ""
 if $USE_IPV6; then
-    echo "# 测试 IPv6:"
+    echo "# IPv6 轮换测试 (多次运行查看不同IP):"
     echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
     echo ""
 fi
-echo "监控: curl http://localhost:$METRICS_PORT/metrics"
-echo "日志: journalctl -u ipv6-proxy -f"
+echo "# 监控:"
+echo "curl http://localhost:$METRICS_PORT/metrics"
+echo ""
+echo "# 日志:"
+echo "journalctl -u ipv6-proxy -f"
 echo "========================================="
 
 systemctl status ipv6-proxy --no-pager | head -10
