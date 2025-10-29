@@ -27,19 +27,96 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==================== 清理 ====================
-print_info "清理..."
+print_info "第 1 步：检查现有服务和进程..."
+echo ""
 
-for service in ipv6-proxy; do
-    systemctl stop $service 2>/dev/null || true
-    systemctl disable $service 2>/dev/null || true
-    rm -f /etc/systemd/system/$service.service 2>/dev/null || true
+# 检查服务
+print_info "检查 systemd 服务："
+if systemctl list-units --type=service --all | grep -q "ipv6-proxy"; then
+    systemctl status ipv6-proxy --no-pager 2>/dev/null | head -3 || true
+else
+    echo "  无 ipv6-proxy 服务"
+fi
+
+# 检查进程
+print_info "检查运行的进程："
+if pgrep -f "ipv6-proxy" >/dev/null; then
+    ps aux | grep -E "ipv6-proxy" | grep -v grep
+else
+    echo "  无相关进程"
+fi
+
+# 检查端口
+print_info "检查端口占用："
+for port in 20000 20001; do
+    if lsof -i :$port >/dev/null 2>&1; then
+        echo "  $port: $(lsof -ti :$port 2>/dev/null | wc -l) 个进程占用"
+    else
+        echo "  $port: 空闲"
+    fi
 done
 
-pkill -9 -f "ipv6-proxy" 2>/dev/null || true
-fuser -k 20000/tcp 2>/dev/null || true
-fuser -k 20001/tcp 2>/dev/null || true
-systemctl daemon-reload
-sleep 1
+echo ""
+read -p "是否清理? [Y/n] " do_clean
+if [[ $do_clean =~ ^[Nn]$ ]]; then
+    print_warning "跳过清理"
+else
+    print_info "开始清理..."
+    
+    # 停止服务
+    for service in ipv6-proxy go-proxy dynamic-proxy python-proxy; do
+        if systemctl list-unit-files | grep -q "^$service.service"; then
+            systemctl stop $service 2>/dev/null && print_success "停止服务: $service" || true
+            systemctl disable $service 2>/dev/null && print_success "禁用服务: $service" || true
+            rm -f /etc/systemd/system/$service.service && print_success "删除服务文件: $service" || true
+        fi
+    done
+    
+    # 杀进程
+    print_info "终止进程..."
+    if pkill -9 -f "ipv6-proxy" 2>/dev/null; then
+        print_success "已终止 ipv6-proxy 进程"
+    fi
+    if pkill -9 -f "proxy-server" 2>/dev/null; then
+        print_success "已终止 proxy-server 进程"
+    fi
+    
+    # 释放端口
+    print_info "释放端口..."
+    for port in 20000 20001; do
+        if lsof -ti :$port >/dev/null 2>&1; then
+            fuser -k $port/tcp 2>/dev/null && print_success "释放端口: $port" || true
+        fi
+    done
+    
+    systemctl daemon-reload
+    sleep 2
+    
+    # 验证
+    print_info "验证清理结果..."
+    if pgrep -f "ipv6-proxy" >/dev/null || lsof -i :20000 >/dev/null 2>&1 || lsof -i :20001 >/dev/null 2>&1; then
+        print_warning "仍有残留，再次强制清理..."
+        pkill -9 -f "proxy" 2>/dev/null || true
+        fuser -k -9 20000/tcp 2>/dev/null || true
+        fuser -k -9 20001/tcp 2>/dev/null || true
+        sleep 2
+    fi
+    
+    # 最终检查
+    if pgrep -f "ipv6-proxy" >/dev/null || lsof -i :20000 >/dev/null 2>&1; then
+        print_error "清理失败！请手动清理后重试"
+        echo ""
+        echo "手动清理命令："
+        echo "  pkill -9 -f ipv6-proxy"
+        echo "  fuser -k -9 20000/tcp"
+        echo "  systemctl stop ipv6-proxy"
+        exit 1
+    else
+        print_success "清理完成！"
+    fi
+fi
+
+echo ""
 
 # ==================== 配置 ====================
 print_info "配置参数..."
