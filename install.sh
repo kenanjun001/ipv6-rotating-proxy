@@ -287,12 +287,8 @@ func acquireIPv6() string {
         }
     }
     
-    // 降级：直接返回随机IP（必须也增加计数）
-    ip := randomIPv6()
-    val, _ := ipConcurrency.LoadOrStore(ip, new(int32))
-    atomic.AddInt32(val.(*int32), 1)
-    atomic.AddInt64(&ipRetries, 100)
-    return ip
+    // 降级：直接返回随机IP
+    return randomIPv6()
 }
 
 // 释放IP
@@ -358,8 +354,6 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
         io.ReadFull(c, buf[:dlen+2])
         host = string(buf[:dlen])
         port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
-    } else {
-        return fmt.Errorf("unsupported address type")
     }
     return connectAndForward(c, host, port, ipv6, true)
 }
@@ -390,9 +384,6 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
         return fmt.Errorf("method")
     }
     hp := strings.Split(parts[1], ":")
-    if len(hp) < 2 {
-        return fmt.Errorf("invalid host:port format")
-    }
     var port uint16
     fmt.Sscanf(hp[1], "%d", &port)
     return connectAndForward(c, hp[0], port, ipv6, false)
