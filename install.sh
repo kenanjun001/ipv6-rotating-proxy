@@ -26,29 +26,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# ==================== 快速清理端口 ====================
-cleanup_ports() {
-    local start_port=$1
-    local port_count=$2
-    local end_port=$((start_port + port_count - 1))
-    
-    print_info "检查端口范围: $start_port - $end_port"
-    
-    # 一次性查询所有占用的端口,避免循环
-    local occupied_pids=$(lsof -ti :$start_port-$end_port 2>/dev/null | sort -u)
-    
-    if [ -z "$occupied_pids" ]; then
-        print_success "端口范围空闲,无需清理"
-        return 0
-    fi
-    
-    # 批量终止进程
-    echo "$occupied_pids" | xargs -r kill -9 2>/dev/null
-    local cleaned=$(echo "$occupied_pids" | wc -w)
-    print_success "已清理 $cleaned 个进程"
-    sleep 1
-}
-
 # ==================== 第一步:清理现有服务 ====================
 print_info "第 1 步:清理现有代理服务..."
 echo ""
@@ -159,38 +136,39 @@ echo ""
 read -p "确认安装? [Y/n] " confirm
 [[ $confirm =~ ^[Nn]$ ]] && exit 0
 
-# 清理端口占用
-echo ""
-print_info "检查并清理端口占用..."
-cleanup_ports $START_PORT $PORT_COUNT
+# 跳过端口清理 (由用户自行处理或程序自动处理)
 
-# ==================== 第三步:系统优化 ====================
-print_info "第 3 步:优化系统参数..."
-
-REQUIRED_FDS=$((PORT_COUNT * 100 + 10000))
-[ $REQUIRED_FDS -lt 100000 ] && REQUIRED_FDS=100000
+# ==================== 第三步:系统优化(无限制模式) ====================
+print_info "第 3 步:优化系统参数(无限制模式)..."
 
 cat > /etc/security/limits.d/ipv6-proxy.conf << EOF
-* soft nofile $REQUIRED_FDS
-* hard nofile $REQUIRED_FDS
-* soft nproc 100000
-* hard nproc 100000
+* soft nofile 10000000
+* hard nofile 10000000
+* soft nproc 10000000
+* hard nproc 10000000
+root soft nofile 10000000
+root hard nofile 10000000
+root soft nproc 10000000
+root hard nproc 10000000
 EOF
 
 cat > /etc/sysctl.d/ipv6-proxy.conf << EOF
+fs.file-max = 10000000
+fs.nr_open = 10000000
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 600
-net.netfilter.nf_conntrack_max = 2000000
-fs.file-max = $((REQUIRED_FDS * 2))
+net.ipv4.tcp_max_tw_buckets = 5000000
+net.netfilter.nf_conntrack_max = 10000000
+net.nf_conntrack_max = 10000000
 EOF
 
 sysctl -p /etc/sysctl.d/ipv6-proxy.conf >/dev/null 2>&1 || true
-print_success "系统参数优化完成"
+print_success "系统参数优化完成(支持百万级并发)"
 
 # ==================== 第四步:安装 Go ====================
 print_info "第 4 步:检查 Go 环境..."
@@ -558,8 +536,8 @@ WorkingDirectory=/opt/ipv6-proxy
 ExecStart=/opt/ipv6-proxy/ipv6-proxy
 Restart=always
 RestartSec=5
-LimitNOFILE=$REQUIRED_FDS
-LimitNPROC=100000
+LimitNOFILE=infinity
+LimitNPROC=infinity
 
 [Install]
 WantedBy=multi-user.target
