@@ -274,33 +274,7 @@ NDPPD_SERVICE
     if systemctl is-active --quiet ndppd; then
         print_success "ndppd 启动成功"
     else
-        print_warning "ndppd 启动失败，显示错误信息:"
-        echo ""
-        journalctl -u ndppd -n 20 --no-pager 2>/dev/null || echo "无法获取日志"
-        echo ""
-        print_warning "可能的原因："
-        echo "  1. 接口名错误: $IPV6_INTERFACE"
-        echo "  2. IPv6 前缀错误: $IPV6_PREFIX"
-        echo ""
-        print_info "请手动检查接口名："
-        
-        # 显示所有网络接口
-        echo "可用的网络接口："
-        if command -v ip &>/dev/null; then
-            ip link show | grep -E "^[0-9]+:" | awk '{print "  - " $2}' | tr -d ':'
-        elif command -v ifconfig &>/dev/null; then
-            ifconfig -a | grep -E "^[a-z]" | awk '{print "  - " $1}' | tr -d ':'
-        else
-            ls /sys/class/net/ | sed 's/^/  - /'
-        fi
-        
-        echo ""
-        read -p "是否继续安装（ndppd 可稍后手动修复）? [Y/n] " continue_install
-        if [[ $continue_install =~ ^[Nn]$ ]]; then
-            print_error "安装已取消"
-            exit 1
-        fi
-        print_warning "继续安装，但 IPv6 可能无法正常工作"
+        print_warning "ndppd 启动失败（将由代理程序自动修复）"
     fi
 fi
 
@@ -409,6 +383,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -875,6 +850,174 @@ func metricsServer() {
 	http.ListenAndServe(":"+cfg.MetricsPort, mux)
 }
 
+func autoDetectIPv6Interface() (string, string, error) {
+	// 尝试多种方法检测IPv6接口
+	
+	// 方法1: 读取 /proc/net/if_inet6
+	data, err := os.ReadFile("/proc/net/if_inet6")
+	if err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			if len(fields) >= 6 {
+				// 跳过本地和链路本地地址
+				if strings.HasPrefix(fields[0], "00000000") || strings.HasPrefix(fields[0], "fe80") {
+					continue
+				}
+				iface := fields[5]
+				// 解析IPv6地址
+				addr := fields[0]
+				if len(addr) == 32 {
+					prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
+					return iface, prefix, nil
+				}
+			}
+		}
+	}
+	
+	// 方法2: 尝试常见接口
+	commonIfaces := []string{"eth0", "ens3", "ens5", "enp0s3", "enp1s0", "venet0"}
+	for _, iface := range commonIfaces {
+		data, err := os.ReadFile("/proc/net/if_inet6")
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				if strings.Contains(line, iface) && !strings.HasPrefix(strings.Fields(line)[0], "fe80") {
+					fields := strings.Fields(line)
+					if len(fields) >= 6 {
+						addr := fields[0]
+						if len(addr) == 32 {
+							prefix := fmt.Sprintf("%s:%s:%s:%s", addr[0:4], addr[4:8], addr[8:12], addr[12:16])
+							return iface, prefix, nil
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return "", "", fmt.Errorf("无法检测IPv6接口")
+}
+
+func fixNdppd(iface, prefix string) error {
+	// 更新 ndppd 配置文件
+	ndppdConf := fmt.Sprintf(`route-ttl 30000
+
+proxy %s {
+    router no
+    timeout 500
+    ttl 30000
+    
+    rule %s::/64 {
+        auto
+    }
+}
+`, iface, prefix)
+	
+	err := os.WriteFile("/etc/ndppd/ndppd.conf", []byte(ndppdConf), 0644)
+	if err != nil {
+		return fmt.Errorf("更新ndppd配置失败: %v", err)
+	}
+	
+	log.Printf("✓ ndppd 配置已更新: 接口=%s 前缀=%s::/64", iface, prefix)
+	
+	// 重启 ndppd 服务
+	cmd := exec.Command("systemctl", "restart", "ndppd")
+	if err := cmd.Run(); err != nil {
+		log.Printf("警告: 重启ndppd失败: %v", err)
+		return err
+	}
+	
+	time.Sleep(1 * time.Second)
+	
+	// 检查服务状态
+	cmd = exec.Command("systemctl", "is-active", "ndppd")
+	output, _ := cmd.Output()
+	if strings.TrimSpace(string(output)) == "active" {
+		log.Printf("✓ ndppd 服务已成功重启")
+		return nil
+	}
+	
+	log.Printf("警告: ndppd 可能未正常运行")
+	return nil
+}
+
+func fixIPv6Config() error {
+	if !cfg.IPv6Enabled {
+		return nil
+	}
+	
+	// 检查配置是否有效
+	needFix := cfg.IPv6Interface == "" || cfg.IPv6Interface == "global" || cfg.IPv6Interface == "lo"
+	
+	if needFix {
+		log.Printf("⚠ 检测到无效的接口配置: '%s'", cfg.IPv6Interface)
+		log.Printf("→ 开始自动修复...")
+		
+		iface, prefix, err := autoDetectIPv6Interface()
+		if err != nil {
+			return fmt.Errorf("自动检测失败: %v", err)
+		}
+		
+		log.Printf("✓ 检测到正确配置: 接口=%s 前缀=%s", iface, prefix)
+		
+		// 更新内存中的配置
+		cfg.IPv6Interface = iface
+		if cfg.IPv6Prefix == "" || cfg.IPv6Prefix != prefix {
+			cfg.IPv6Prefix = prefix
+		}
+		
+		// 保存到配置文件
+		configLines := []string{
+			"START_PORT=" + cfg.StartPort,
+			"PORT_COUNT=" + cfg.PortCount,
+			"METRICS_PORT=" + cfg.MetricsPort,
+			"USERNAME=" + cfg.Username,
+			"PASSWORD=" + cfg.Password,
+			"IPV6_ENABLED=true",
+			"IPV6_PREFIX=" + cfg.IPv6Prefix,
+			"IPV6_INTERFACE=" + cfg.IPv6Interface,
+		}
+		
+		err = os.WriteFile("/etc/ipv6-proxy/config.txt", []byte(strings.Join(configLines, "\n")), 0644)
+		if err != nil {
+			log.Printf("警告: 无法保存配置文件: %v", err)
+		} else {
+			log.Printf("✓ 配置文件已自动修复")
+		}
+		
+		// 修复 ndppd
+		if err := fixNdppd(iface, prefix); err != nil {
+			log.Printf("警告: ndppd修复失败: %v", err)
+		}
+		
+		// 更新路由脚本
+		routeScript := fmt.Sprintf(`#!/bin/bash
+ip -6 route add local %s::/64 dev lo 2>/dev/null || true
+sysctl -w net.ipv6.conf.%s.proxy_ndp=1 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+sysctl -w net.ipv6.conf.%s.accept_ra=0 >/dev/null 2>&1
+sysctl -w net.ipv6.ip_nonlocal_bind=1 >/dev/null 2>&1
+`, prefix, iface, iface)
+		
+		if err := os.WriteFile("/etc/ipv6-proxy-route.sh", []byte(routeScript), 0755); err != nil {
+			log.Printf("警告: 无法更新路由脚本: %v", err)
+		} else {
+			// 执行路由配置
+			cmd := exec.Command("/etc/ipv6-proxy-route.sh")
+			if err := cmd.Run(); err != nil {
+				log.Printf("警告: 执行路由配置失败: %v", err)
+			} else {
+				log.Printf("✓ IPv6 路由已配置")
+			}
+		}
+		
+		log.Printf("✓ IPv6 配置自动修复完成!")
+	}
+	
+	return nil
+}
+
 func main() {
 	if err := loadConfig(); err != nil {
 		log.Fatalf("加载配置失败: %v", err)
@@ -882,6 +1025,11 @@ func main() {
 	
 	rand.Seed(time.Now().UnixNano())
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	
+	// 自动修复 IPv6 配置
+	if err := fixIPv6Config(); err != nil {
+		log.Printf("警告: IPv6配置修复失败: %v", err)
+	}
 	
 	ipv6Manager = NewIPv6Manager(cfg.IPv6Prefix)
 	
@@ -891,8 +1039,9 @@ func main() {
 	
 	log.Printf("IPv6 Rotating Proxy | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
 	if cfg.IPv6Enabled {
-		log.Printf("IPv6配置: 前缀=%s 每IP限制=5并发", cfg.IPv6Prefix)
+		log.Printf("IPv6配置: 接口=%s 前缀=%s 每IP限制=5并发", cfg.IPv6Interface, cfg.IPv6Prefix)
 	}
+	
 	
 	go statsRoutine()
 	go metricsServer()
