@@ -65,18 +65,61 @@ IPV6_PREFIX=""
 IPV6_INTERFACE=""
 
 if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
-    IPV6_INFO=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -1)
-    if [ -n "$IPV6_INFO" ]; then
-        IPV6_ADDR=$(echo "$IPV6_INFO" | awk '{print $2}' | cut -d'/' -f1)
-        IPV6_INTERFACE=$(echo "$IPV6_INFO" | awk '{print $NF}')
-        IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+    # 方法1: 使用 ip 命令（推荐）
+    if command -v ip &>/dev/null; then
+        # 获取全局IPv6地址
+        IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[0-9a-f:]+' | head -1)
         
+        if [ -n "$IPV6_ADDR" ]; then
+            # 获取该地址所在的接口
+            IPV6_INTERFACE=$(ip -6 addr show | grep -B 2 "$IPV6_ADDR" | head -1 | awk '{print $2}' | tr -d ':')
+            IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+        fi
+    fi
+    
+    # 方法2: 使用 ifconfig（备用）
+    if [ -z "$IPV6_INTERFACE" ] && command -v ifconfig &>/dev/null; then
+        # 查找有全局IPv6的接口
+        for iface in $(ifconfig -a | grep -oP '^[a-z0-9]+(?=:)'); do
+            IPV6_TEST=$(ifconfig "$iface" 2>/dev/null | grep "inet6" | grep -v "fe80" | grep -v "::1" | head -1)
+            if [ -n "$IPV6_TEST" ]; then
+                IPV6_INTERFACE="$iface"
+                IPV6_ADDR=$(echo "$IPV6_TEST" | awk '{print $2}' | cut -d'/' -f1)
+                IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+                break
+            fi
+        done
+    fi
+    
+    # 方法3: 尝试常见接口名
+    if [ -z "$IPV6_INTERFACE" ]; then
+        for iface in eth0 ens3 ens5 enp0s3 venet0:0 venet0; do
+            if ip -6 addr show "$iface" 2>/dev/null | grep -q "inet6.*scope global"; then
+                IPV6_INTERFACE="$iface"
+                IPV6_ADDR=$(ip -6 addr show "$iface" | grep "inet6.*scope global" | awk '{print $2}' | cut -d'/' -f1 | head -1)
+                IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
+                break
+            fi
+        done
+    fi
+    
+    if [ -n "$IPV6_INTERFACE" ] && [ -n "$IPV6_PREFIX" ]; then
         print_success "检测到 IPv6: $IPV6_PREFIX::/64"
         print_info "接口: $IPV6_INTERFACE"
         
         read -p "启用 IPv6 轮换? [Y/n] " use_ipv6
         if [[ ! $use_ipv6 =~ ^[Nn]$ ]]; then
             USE_IPV6=true
+        fi
+    else
+        print_warning "无法自动检测 IPv6 配置"
+        read -p "是否手动输入？ [y/N] " manual_ipv6
+        if [[ $manual_ipv6 =~ ^[Yy]$ ]]; then
+            read -p "请输入 IPv6 前缀 (如 2602:294:1:bf21): " IPV6_PREFIX
+            read -p "请输入网卡接口 (如 eth0): " IPV6_INTERFACE
+            if [ -n "$IPV6_PREFIX" ] && [ -n "$IPV6_INTERFACE" ]; then
+                USE_IPV6=true
+            fi
         fi
     fi
 fi
@@ -141,10 +184,21 @@ print_info "安装依赖..."
 
 if command -v apt-get &> /dev/null; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq build-essential libboost-all-dev g++ cmake git curl wget >/dev/null 2>&1
+    print_info "更新软件包列表..."
+    apt-get update -qq 2>&1 | grep -E "^(Hit|Get|Fetched)" || true
+    
+    print_info "安装编译工具..."
+    apt-get install -y build-essential 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - build-essential"
+    
+    print_info "安装 Boost 库..."
+    apt-get install -y libboost-all-dev 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - libboost-all-dev"
+    
+    print_info "安装其他依赖..."
+    apt-get install -y g++ cmake git curl wget 2>&1 | grep -E "^(Setting|Processing|Unpacking)" || echo "  - g++ cmake git curl wget"
+    
 elif command -v yum &> /dev/null; then
-    yum install -y -q gcc-c++ boost-devel cmake git curl wget >/dev/null 2>&1
+    print_info "安装编译工具..."
+    yum install -y gcc-c++ boost-devel cmake git curl wget 2>&1 | grep -E "^(Installing|Updating)" || echo "  - 依赖包安装中..."
 fi
 
 print_success "依赖完成"
@@ -163,7 +217,13 @@ if $USE_IPV6; then
     fi
     
     cd ndppd
-    make -j$(nproc) >/dev/null 2>&1
+    print_info "编译 ndppd (可能需要1-2分钟)..."
+    if make -j$(nproc) 2>&1 | grep -E "^\[|%|Building|Compiling" || make -j$(nproc) >/dev/null 2>&1; then
+        print_success "编译成功"
+    else
+        print_error "编译失败"
+        exit 1
+    fi
     
     if [ -f "ndppd" ]; then
         cp ndppd /usr/local/sbin/
@@ -214,7 +274,33 @@ NDPPD_SERVICE
     if systemctl is-active --quiet ndppd; then
         print_success "ndppd 启动成功"
     else
-        print_warning "ndppd 启动失败"
+        print_warning "ndppd 启动失败，显示错误信息:"
+        echo ""
+        journalctl -u ndppd -n 20 --no-pager 2>/dev/null || echo "无法获取日志"
+        echo ""
+        print_warning "可能的原因："
+        echo "  1. 接口名错误: $IPV6_INTERFACE"
+        echo "  2. IPv6 前缀错误: $IPV6_PREFIX"
+        echo ""
+        print_info "请手动检查接口名："
+        
+        # 显示所有网络接口
+        echo "可用的网络接口："
+        if command -v ip &>/dev/null; then
+            ip link show | grep -E "^[0-9]+:" | awk '{print "  - " $2}' | tr -d ':'
+        elif command -v ifconfig &>/dev/null; then
+            ifconfig -a | grep -E "^[a-z]" | awk '{print "  - " $1}' | tr -d ':'
+        else
+            ls /sys/class/net/ | sed 's/^/  - /'
+        fi
+        
+        echo ""
+        read -p "是否继续安装（ndppd 可稍后手动修复）? [Y/n] " continue_install
+        if [[ $continue_install =~ ^[Nn]$ ]]; then
+            print_error "安装已取消"
+            exit 1
+        fi
+        print_warning "继续安装，但 IPv6 可能无法正常工作"
     fi
 fi
 
