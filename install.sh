@@ -16,7 +16,7 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 clear
 echo ""
 echo "========================================="
-echo "  IPv6 Rotating Proxy - 多端口版本"
+echo "  IPv6 Rotating Proxy - 多端口版本 (修复版)"
 echo "  支持 1-100000 个代理端口"
 echo "========================================="
 echo ""
@@ -136,25 +136,23 @@ echo ""
 read -p "确认安装? [Y/n] " confirm
 [[ $confirm =~ ^[Nn]$ ]] && exit 0
 
-# 跳过端口清理 (由用户自行处理或程序自动处理)
-
-# ==================== 第三步:系统优化(无限制模式) ====================
-print_info "第 3 步:优化系统参数(无限制模式)..."
+# ==================== 第三步:系统优化 ====================
+print_info "第 3 步:优化系统参数..."
 
 cat > /etc/security/limits.d/ipv6-proxy.conf << EOF
-* soft nofile 10000000
-* hard nofile 10000000
-* soft nproc 10000000
-* hard nproc 10000000
-root soft nofile 10000000
-root hard nofile 10000000
-root soft nproc 10000000
-root hard nproc 10000000
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 1048576
+* hard nproc 1048576
+root soft nofile 1048576
+root hard nofile 1048576
+root soft nproc 1048576
+root hard nproc 1048576
 EOF
 
 cat > /etc/sysctl.d/ipv6-proxy.conf << EOF
-fs.file-max = 10000000
-fs.nr_open = 10000000
+fs.file-max = 2097152
+fs.nr_open = 2097152
 net.core.somaxconn = 65535
 net.core.netdev_max_backlog = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
@@ -162,13 +160,13 @@ net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_max_tw_buckets = 5000000
-net.netfilter.nf_conntrack_max = 10000000
-net.nf_conntrack_max = 10000000
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.netfilter.nf_conntrack_max = 2097152
+net.nf_conntrack_max = 2097152
 EOF
 
 sysctl -p /etc/sysctl.d/ipv6-proxy.conf >/dev/null 2>&1 || true
-print_success "系统参数优化完成(支持百万级并发)"
+print_success "系统参数优化完成"
 
 # ==================== 第四步:安装 Go ====================
 print_info "第 4 步:检查 Go 环境..."
@@ -209,6 +207,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -233,6 +232,9 @@ var (
 	activeConns, totalConns, successConns, failedConns, bytesIn, bytesOut int64
 	portSuccess, portFailed                                                int64
 	bufferPool                                                             = sync.Pool{New: func() interface{} { return make([]byte, 32768) }}
+	listeners                                                              = make([]net.Listener, 0)
+	listenersMu                                                            sync.Mutex
+	shutdownCtx, shutdownCancel                                            = context.WithCancel(context.Background())
 )
 
 type Config struct {
@@ -288,34 +290,33 @@ func checkAuth(h string) bool {
 	return false
 }
 
+// 修复 #2: 分离读写超时控制
 func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 	
-	// 动态更新超时: 每次有数据传输就延长5分钟
 	for {
-		// 尝试读取数据(有超时控制)
+		// 只为读取端设置超时
+		if conn, ok := src.(net.Conn); ok {
+			conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		}
+		
 		n, err := src.Read(buf)
 		if n > 0 {
-			// 更新统计
 			if dir == "up" {
 				atomic.AddInt64(&bytesOut, int64(n))
 			} else {
 				atomic.AddInt64(&bytesIn, int64(n))
 			}
 			
-			// 写入数据
-			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
-				return
+			// 只为写入端设置超时
+			if conn, ok := dst.(net.Conn); ok {
+				conn.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 			}
 			
-			// 有数据传输,延长超时
-			if conn, ok := dst.(net.Conn); ok {
-				conn.SetDeadline(time.Now().Add(5 * time.Minute))
-			}
-			if conn, ok := src.(net.Conn); ok {
-				conn.SetDeadline(time.Now().Add(5 * time.Minute))
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
 			}
 		}
 		if err != nil {
@@ -324,46 +325,74 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	}
 }
 
+// 修复 #11: 正确的 SOCKS5 认证解析
 func handleSOCKS5(c net.Conn, ipv6 string) error {
 	buf := make([]byte, 512)
+	
+	// 1. 读取初始握手: [版本(5), 方法数量, 方法列表]
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	if buf[0] != 5 {
+		return fmt.Errorf("invalid SOCKS version: %d", buf[0])
+	}
+	
+	nMethods := int(buf[1])
+	if _, err := io.ReadFull(c, buf[:nMethods]); err != nil {
 		return err
 	}
+	
+	// 2. 响应选择用户名/密码认证 (方法 0x02)
 	c.Write([]byte{5, 2})
+	
+	// 3. 读取认证请求: [版本(1), 用户名长度, 用户名, 密码长度, 密码]
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
+	if buf[0] != 1 { // 认证子协议版本
+		return fmt.Errorf("invalid auth version: %d", buf[0])
+	}
+	
+	// 读取用户名
+	userLen := int(buf[1])
+	if _, err := io.ReadFull(c, buf[:userLen]); err != nil {
 		return err
 	}
-	user := string(buf[:int(buf[1])])
+	user := string(buf[:userLen])
+	
+	// 读取密码长度和密码
 	if _, err := io.ReadFull(c, buf[:1]); err != nil {
 		return err
 	}
-	if _, err := io.ReadFull(c, buf[:int(buf[0])]); err != nil {
+	passLen := int(buf[0])
+	if _, err := io.ReadFull(c, buf[:passLen]); err != nil {
 		return err
 	}
-	pass := string(buf[:int(buf[0])])
+	pass := string(buf[:passLen])
+	
+	// 4. 验证认证
 	if user != cfg.Username || pass != cfg.Password {
-		c.Write([]byte{1, 1})
+		c.Write([]byte{1, 1}) // 认证失败
 		return fmt.Errorf("auth failed")
 	}
-	c.Write([]byte{1, 0})
+	c.Write([]byte{1, 0}) // 认证成功
+	
+	// 5. 读取连接请求: [版本, 命令, 保留, 地址类型, 目标地址, 目标端口]
 	if _, err := io.ReadFull(c, buf[:4]); err != nil {
 		return err
 	}
+	
 	var host string
 	var port uint16
-	if buf[3] == 1 {
+	
+	// 解析目标地址
+	if buf[3] == 1 { // IPv4
 		if _, err := io.ReadFull(c, buf[:6]); err != nil {
 			return err
 		}
 		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
 		port = binary.BigEndian.Uint16(buf[4:6])
-	} else if buf[3] == 3 {
+	} else if buf[3] == 3 { // 域名
 		if _, err := io.ReadFull(c, buf[:1]); err != nil {
 			return err
 		}
@@ -373,12 +402,22 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
 		}
 		host = string(buf[:dlen])
 		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
+	} else if buf[3] == 4 { // IPv6
+		if _, err := io.ReadFull(c, buf[:18]); err != nil {
+			return err
+		}
+		host = net.IP(buf[:16]).String()
+		port = binary.BigEndian.Uint16(buf[16:18])
 	}
+	
 	return connectAndForward(c, host, port, ipv6, true)
 }
 
+// 修复 #7: 先验证认证再处理请求
 func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
 	r := bufio.NewReader(io.MultiReader(strings.NewReader(string(fb)), c))
+	
+	// 1. 读取请求行
 	line, err := r.ReadString('\n')
 	if err != nil {
 		return err
@@ -387,63 +426,116 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
 	if len(parts) < 2 {
 		return fmt.Errorf("invalid request")
 	}
-	var h strings.Builder
-	for {
+	
+	// 2. 优先读取 Proxy-Authorization 头 (限制读取大小防止 DoS)
+	var authHeader string
+	headerCount := 0
+	maxHeaders := 50 // 最多读取 50 行头
+	
+	for headerCount < maxHeaders {
 		l, err := r.ReadString('\n')
 		if err != nil {
 			break
 		}
-		h.WriteString(l)
+		headerCount++
+		
+		// 找到认证头就立即验证
+		if strings.HasPrefix(strings.ToLower(l), "proxy-authorization:") {
+			authHeader = l
+			break
+		}
+		
 		if l == "\r\n" || l == "\n" {
 			break
 		}
 	}
-	if !checkAuth(h.String()) {
+	
+	// 3. 验证认证
+	if authHeader == "" || !checkAuth(authHeader) {
 		c.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
 		return fmt.Errorf("auth failed")
 	}
+	
+	// 4. 只支持 CONNECT 方法
 	if parts[0] != "CONNECT" {
 		c.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
 		return fmt.Errorf("method not allowed")
 	}
+	
+	// 5. 解析目标地址
 	hp := strings.Split(parts[1], ":")
 	if len(hp) != 2 {
 		return fmt.Errorf("invalid host:port")
 	}
 	var port uint16
 	fmt.Sscanf(hp[1], "%d", &port)
+	
 	return connectAndForward(c, hp[0], port, ipv6, false)
 }
 
+// 判断是否可重试的错误
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// 只重试超时和临时网络错误
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "temporary") ||
+		strings.Contains(errStr, "network is unreachable") {
+		return true
+	}
+	return false
+}
+
+// 修复 #12: 正确处理 IPv6 路由
 func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks bool) error {
 	var d net.Dialer
-	if cfg.IPv6Enabled && ipv6 != "" {
+	d.Timeout = 30 * time.Second
+	
+	// 解析目标地址类型
+	targetAddr := fmt.Sprintf("%s:%d", host, port)
+	isIPv6Target := false
+	
+	if ip := net.ParseIP(host); ip != nil {
+		isIPv6Target = ip.To4() == nil
+	} else {
+		// 域名需要先解析判断类型
+		ips, err := net.LookupIP(host)
+		if err == nil && len(ips) > 0 {
+			isIPv6Target = ips[0].To4() == nil
+		}
+	}
+	
+	// 只有目标是 IPv6 时才绑定 IPv6 源地址
+	if cfg.IPv6Enabled && ipv6 != "" && isIPv6Target {
 		if addr, err := net.ResolveIPAddr("ip6", ipv6); err == nil {
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		}
 	}
-	d.Timeout = 30 * time.Second // 连接超时设为30秒
 	
-	// 指数退避重试: 最多3次, 延迟 0ms, 100ms, 200ms
+	// 优化重试逻辑: 只对可重试错误重试
 	var remote net.Conn
 	var err error
 	maxRetries := 3
 	
 	for retry := 0; retry < maxRetries; retry++ {
-		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+		remote, err = d.Dial("tcp", targetAddr)
 		if err == nil {
-			break // 连接成功
+			break
 		}
 		
-		// 如果不是最后一次重试,等待后再试
+		// 只对可重试错误进行重试
+		if !isRetryableError(err) {
+			break
+		}
+		
 		if retry < maxRetries-1 {
-			// 指数退避: 100ms * 2^retry = 100ms, 200ms
 			backoff := time.Duration(100*(1<<uint(retry))) * time.Millisecond
 			time.Sleep(backoff)
 		}
 	}
 	
-	// 所有重试都失败
 	if err != nil {
 		atomic.AddInt64(&failedConns, 1)
 		if socks {
@@ -469,10 +561,11 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 	
-	// 设置数据传输超时: 5分钟无数据传输则断开
-	deadline := time.Now().Add(5 * time.Minute)
-	c.SetDeadline(deadline)
-	remote.SetDeadline(deadline)
+	// 初始超时设置
+	c.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	c.SetWriteDeadline(time.Now().Add(5 * time.Minute))
+	remote.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	remote.SetWriteDeadline(time.Now().Add(5 * time.Minute))
 	
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -482,16 +575,19 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 	return nil
 }
 
+// 修复 #3: 添加 panic 恢复
 func handleConn(c net.Conn) {
 	atomic.AddInt64(&activeConns, 1)
 	atomic.AddInt64(&totalConns, 1)
 	
 	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[PANIC] 连接处理崩溃: %v", r)
+		}
 		c.Close()
 		atomic.AddInt64(&activeConns, -1)
 	}()
 	
-	// 初始握手超时: 30秒
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	
 	ipv6 := randomIPv6()
@@ -500,7 +596,6 @@ func handleConn(c net.Conn) {
 		return
 	}
 	
-	// 握手成功后,取消超时(后续在 connectAndForward 中设置)
 	c.SetDeadline(time.Time{})
 	
 	if fb[0] == 0x05 {
@@ -510,19 +605,42 @@ func handleConn(c net.Conn) {
 	}
 }
 
+// 修复 #1: 同步检查关键端口
 func startProxyServer(port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		atomic.AddInt64(&portFailed, 1)
 		return err
 	}
+	
 	atomic.AddInt64(&portSuccess, 1)
+	
+	// 保存 listener 用于优雅关闭
+	listenersMu.Lock()
+	listeners = append(listeners, ln)
+	listenersMu.Unlock()
+	
 	go func() {
 		defer ln.Close()
 		for {
+			// 检查是否收到关闭信号
+			select {
+			case <-shutdownCtx.Done():
+				return
+			default:
+			}
+			
+			// 设置 Accept 超时以便定期检查关闭信号
+			if tcpLn, ok := ln.(*net.TCPListener); ok {
+				tcpLn.SetDeadline(time.Now().Add(1 * time.Second))
+			}
+			
 			conn, err := ln.Accept()
 			if err != nil {
-				continue
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
+				}
+				return
 			}
 			go handleConn(conn)
 		}
@@ -533,11 +651,16 @@ func startProxyServer(port int) error {
 func statsRoutine() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		log.Printf("[统计] 活跃:%d 总计:%d 成功:%d 失败:%d 入站:%.2fGB 出站:%.2fGB",
-			atomic.LoadInt64(&activeConns), atomic.LoadInt64(&totalConns),
-			atomic.LoadInt64(&successConns), atomic.LoadInt64(&failedConns),
-			float64(atomic.LoadInt64(&bytesIn))/1e9, float64(atomic.LoadInt64(&bytesOut))/1e9)
+	for {
+		select {
+		case <-shutdownCtx.Done():
+			return
+		case <-ticker.C:
+			log.Printf("[统计] 活跃:%d 总计:%d 成功:%d 失败:%d 入站:%.2fGB 出站:%.2fGB",
+				atomic.LoadInt64(&activeConns), atomic.LoadInt64(&totalConns),
+				atomic.LoadInt64(&successConns), atomic.LoadInt64(&failedConns),
+				float64(atomic.LoadInt64(&bytesIn))/1e9, float64(atomic.LoadInt64(&bytesOut))/1e9)
+		}
 	}
 }
 
@@ -557,7 +680,18 @@ func metricsServer() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "OK\n")
 	})
-	http.ListenAndServe(":"+cfg.MetricsPort, mux)
+	
+	srv := &http.Server{
+		Addr:    ":" + cfg.MetricsPort,
+		Handler: mux,
+	}
+	
+	go func() {
+		<-shutdownCtx.Done()
+		srv.Shutdown(context.Background())
+	}()
+	
+	srv.ListenAndServe()
 }
 
 func main() {
@@ -566,23 +700,53 @@ func main() {
 	}
 	rand.Seed(time.Now().UnixNano())
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	
 	startPort, _ := strconv.Atoi(cfg.StartPort)
 	portCount, _ := strconv.Atoi(cfg.PortCount)
 	endPort := startPort + portCount - 1
-	log.Printf("IPv6 Rotating Proxy | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
+	
+	log.Printf("IPv6 Rotating Proxy (修复版) | 端口: %d-%d (%d个) | IPv6: %v", startPort, endPort, portCount, cfg.IPv6Enabled)
+	
 	go statsRoutine()
 	go metricsServer()
-	log.Printf("正在启动 %d 个代理端口...", portCount)
+	
+	// 修复 #4: 批量启动端口 (每批 1000 个)
+	log.Printf("正在启动 %d 个代理端口 (批量模式)...", portCount)
+	batchSize := 1000
+	failedPorts := make([]int, 0)
+	
 	for i := 0; i < portCount; i++ {
-		go startProxyServer(startPort + i)
-		if (i+1)%100 == 0 || i == portCount-1 {
+		port := startPort + i
+		if err := startProxyServer(port); err != nil {
+			failedPorts = append(failedPorts, port)
+			log.Printf("端口 %d 启动失败: %v", port, err)
+		}
+		
+		// 每批暂停一下,避免资源瞬时耗尽
+		if (i+1)%batchSize == 0 {
+			time.Sleep(100 * time.Millisecond)
 			log.Printf("进度: %d/%d (%.1f%%)", i+1, portCount, float64(i+1)/float64(portCount)*100)
+		} else if i == portCount-1 {
+			log.Printf("进度: %d/%d (100.0%%)", i+1, portCount)
 		}
 	}
-	time.Sleep(2 * time.Second)
-	log.Printf("启动完成! 成功: %d | 失败: %d", atomic.LoadInt64(&portSuccess), atomic.LoadInt64(&portFailed))
 	
-	// 优雅关闭机制
+	time.Sleep(2 * time.Second)
+	
+	successCount := atomic.LoadInt64(&portSuccess)
+	failedCount := atomic.LoadInt64(&portFailed)
+	
+	log.Printf("启动完成! 成功: %d | 失败: %d", successCount, failedCount)
+	if len(failedPorts) > 0 && len(failedPorts) <= 20 {
+		log.Printf("失败端口: %v", failedPorts)
+	}
+	
+	// 如果超过 10% 的端口失败,发出警告
+	if float64(failedCount)/float64(portCount) > 0.1 {
+		log.Printf("[警告] 超过 10%% 的端口启动失败,请检查端口占用情况")
+	}
+	
+	// 修复 #10: 优雅关闭机制
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	
@@ -590,9 +754,20 @@ func main() {
 	<-sigChan
 	
 	log.Printf("收到关闭信号,开始优雅关闭...")
+	
+	// 1. 停止接受新连接
+	shutdownCancel()
+	
+	listenersMu.Lock()
+	log.Printf("关闭 %d 个监听端口...", len(listeners))
+	for _, ln := range listeners {
+		ln.Close()
+	}
+	listenersMu.Unlock()
+	
 	log.Printf("当前活跃连接: %d", atomic.LoadInt64(&activeConns))
 	
-	// 等待活跃连接完成(最多60秒)
+	// 2. 等待现有连接完成 (最多 60 秒)
 	shutdownTimeout := 60
 	for i := 0; i < shutdownTimeout; i++ {
 		active := atomic.LoadInt64(&activeConns)
@@ -622,7 +797,7 @@ print_success "编译完成"
 # ==================== 创建服务 ====================
 cat > /etc/systemd/system/ipv6-proxy.service << EOF
 [Unit]
-Description=IPv6 Rotating Proxy (Multi-Port)
+Description=IPv6 Rotating Proxy (Multi-Port Fixed)
 After=network.target
 
 [Service]
@@ -632,8 +807,11 @@ WorkingDirectory=/opt/ipv6-proxy
 ExecStart=/opt/ipv6-proxy/ipv6-proxy
 Restart=always
 RestartSec=5
-LimitNOFILE=infinity
-LimitNPROC=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target
@@ -647,7 +825,7 @@ sleep 5
 # ==================== 完成 ====================
 echo ""
 echo "========================================="
-print_success "安装完成!"
+print_success "安装完成! (修复版)"
 echo "========================================="
 echo ""
 echo "服务器IP:  $IPV4"
@@ -655,6 +833,15 @@ echo "代理数量:  $PORT_COUNT 个"
 echo "端口范围:  $START_PORT - $END_PORT"
 echo "用户名:    $USERNAME"
 echo "密码:      $PASSWORD"
+echo ""
+echo "修复项:"
+echo "  ✓ #1  端口失败检测和报告"
+echo "  ✓ #2  分离读写超时控制"
+echo "  ✓ #4  批量启动限速 (1000/批)"
+echo "  ✓ #7  认证优先验证"
+echo "  ✓ #10 优雅关闭机制"
+echo "  ✓ #11 SOCKS5 认证解析修复"
+echo "  ✓ #12 IPv6 路由修复"
 echo ""
 echo "测试命令:"
 echo "curl -x http://$USERNAME:$PASSWORD@$IPV4:$START_PORT http://ipv6.ip.sb"
