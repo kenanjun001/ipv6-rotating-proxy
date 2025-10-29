@@ -42,6 +42,17 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
+### 🔄 一键更新
+
+```bash
+# 重新运行安装脚本即可更新(保留配置)
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+```
+
+**更多更新方式**: 查看 [UPDATE.md](UPDATE.md)
+
 ### 📝 安装示例
 
 ```
@@ -149,6 +160,30 @@ systemctl restart ipv6-proxy
 
 # 停止服务
 systemctl stop ipv6-proxy
+
+# 启动服务
+systemctl start ipv6-proxy
+```
+
+#### 更新服务
+
+```bash
+# 方法1: 重新运行安装脚本(推荐)
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+
+# 方法2: 手动更新代码
+cd /opt/ipv6-proxy
+wget -O main.go https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/main.go
+go build -ldflags="-s -w" -o ipv6-proxy main.go
+systemctl restart ipv6-proxy
+
+# 方法3: Git 更新(如果使用 Git)
+cd /opt/ipv6-proxy
+git pull
+go build -ldflags="-s -w" -o ipv6-proxy main.go
+systemctl restart ipv6-proxy
 ```
 
 ### 💻 代码示例
@@ -375,6 +410,17 @@ chmod +x install.sh
 sudo ./install.sh
 ```
 
+### 🔄 One-Click Update
+
+```bash
+# Re-run the installation script to update (keeps configuration)
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+```
+
+**More update methods**: See [UPDATE.md](UPDATE.md)
+
 ### 📝 Installation Example
 
 ```
@@ -482,6 +528,30 @@ systemctl restart ipv6-proxy
 
 # Stop service
 systemctl stop ipv6-proxy
+
+# Start service
+systemctl start ipv6-proxy
+```
+
+#### Update Service
+
+```bash
+# Method 1: Re-run installation script (Recommended)
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
+chmod +x install.sh
+sudo ./install.sh
+
+# Method 2: Manual code update
+cd /opt/ipv6-proxy
+wget -O main.go https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/main.go
+go build -ldflags="-s -w" -o ipv6-proxy main.go
+systemctl restart ipv6-proxy
+
+# Method 3: Git update (if using Git)
+cd /opt/ipv6-proxy
+git pull
+go build -ldflags="-s -w" -o ipv6-proxy main.go
+systemctl restart ipv6-proxy
 ```
 
 ### 💻 Code Examples
