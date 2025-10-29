@@ -136,6 +136,8 @@ echo ""
 read -p "确认安装? [Y/n] " confirm
 [[ $confirm =~ ^[Nn]$ ]] && exit 0
 
+# 跳过端口清理 (由用户自行处理或程序自动处理)
+
 # ==================== 第三步:系统优化(无限制模式) ====================
 print_info "第 3 步:优化系统参数(无限制模式)..."
 
@@ -291,19 +293,24 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 	buf := bufferPool.Get().([]byte)
 	defer bufferPool.Put(buf)
 	
+	// 动态更新超时: 每次有数据传输就延长5分钟
 	for {
+		// 尝试读取数据(有超时控制)
 		n, err := src.Read(buf)
 		if n > 0 {
+			// 更新统计
 			if dir == "up" {
 				atomic.AddInt64(&bytesOut, int64(n))
 			} else {
 				atomic.AddInt64(&bytesIn, int64(n))
 			}
 			
+			// 写入数据
 			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
 				return
 			}
 			
+			// 有数据传输,延长超时
 			if conn, ok := dst.(net.Conn); ok {
 				conn.SetDeadline(time.Now().Add(5 * time.Minute))
 			}
@@ -319,59 +326,35 @@ func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
 
 func handleSOCKS5(c net.Conn, ipv6 string) error {
 	buf := make([]byte, 512)
-	
-	// 读取客户端握手: [版本, 方法数量, 方法列表]
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if buf[0] != 5 {
-		return fmt.Errorf("invalid socks version")
-	}
-	nMethods := int(buf[1])
-	if _, err := io.ReadFull(c, buf[:nMethods]); err != nil {
+	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
 		return err
 	}
-	
-	// 服务端选择用户名密码认证(方法2)
 	c.Write([]byte{5, 2})
-	
-	// 读取认证请求: [版本(1), 用户名长度, 用户名, 密码长度, 密码]
 	if _, err := io.ReadFull(c, buf[:2]); err != nil {
 		return err
 	}
-	if buf[0] != 1 {
-		return fmt.Errorf("invalid auth version")
-	}
-	
-	// 读取用户名
-	userLen := int(buf[1])
-	if _, err := io.ReadFull(c, buf[:userLen]); err != nil {
+	if _, err := io.ReadFull(c, buf[:int(buf[1])]); err != nil {
 		return err
 	}
-	user := string(buf[:userLen])
-	
-	// 读取密码长度和密码
+	user := string(buf[:int(buf[1])])
 	if _, err := io.ReadFull(c, buf[:1]); err != nil {
 		return err
 	}
-	passLen := int(buf[0])
-	if _, err := io.ReadFull(c, buf[:passLen]); err != nil {
+	if _, err := io.ReadFull(c, buf[:int(buf[0])]); err != nil {
 		return err
 	}
-	pass := string(buf[:passLen])
-	
-	// 验证认证
+	pass := string(buf[:int(buf[0])])
 	if user != cfg.Username || pass != cfg.Password {
 		c.Write([]byte{1, 1})
 		return fmt.Errorf("auth failed")
 	}
 	c.Write([]byte{1, 0})
-	
-	// 读取连接请求
 	if _, err := io.ReadFull(c, buf[:4]); err != nil {
 		return err
 	}
-	
 	var host string
 	var port uint16
 	if buf[3] == 1 {
@@ -439,8 +422,9 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 			d.LocalAddr = &net.TCPAddr{IP: addr.IP}
 		}
 	}
-	d.Timeout = 30 * time.Second
+	d.Timeout = 30 * time.Second // 连接超时设为30秒
 	
+	// 指数退避重试: 最多3次, 延迟 0ms, 100ms, 200ms
 	var remote net.Conn
 	var err error
 	maxRetries := 3
@@ -448,15 +432,18 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 	for retry := 0; retry < maxRetries; retry++ {
 		remote, err = d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 		if err == nil {
-			break
+			break // 连接成功
 		}
 		
+		// 如果不是最后一次重试,等待后再试
 		if retry < maxRetries-1 {
+			// 指数退避: 100ms * 2^retry = 100ms, 200ms
 			backoff := time.Duration(100*(1<<uint(retry))) * time.Millisecond
 			time.Sleep(backoff)
 		}
 	}
 	
+	// 所有重试都失败
 	if err != nil {
 		atomic.AddInt64(&failedConns, 1)
 		if socks {
@@ -482,6 +469,7 @@ func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks 
 		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 	
+	// 设置数据传输超时: 5分钟无数据传输则断开
 	deadline := time.Now().Add(5 * time.Minute)
 	c.SetDeadline(deadline)
 	remote.SetDeadline(deadline)
@@ -503,6 +491,7 @@ func handleConn(c net.Conn) {
 		atomic.AddInt64(&activeConns, -1)
 	}()
 	
+	// 初始握手超时: 30秒
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	
 	ipv6 := randomIPv6()
@@ -511,6 +500,7 @@ func handleConn(c net.Conn) {
 		return
 	}
 	
+	// 握手成功后,取消超时(后续在 connectAndForward 中设置)
 	c.SetDeadline(time.Time{})
 	
 	if fb[0] == 0x05 {
@@ -592,6 +582,7 @@ func main() {
 	time.Sleep(2 * time.Second)
 	log.Printf("启动完成! 成功: %d | 失败: %d", atomic.LoadInt64(&portSuccess), atomic.LoadInt64(&portFailed))
 	
+	// 优雅关闭机制
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	
@@ -601,6 +592,7 @@ func main() {
 	log.Printf("收到关闭信号,开始优雅关闭...")
 	log.Printf("当前活跃连接: %d", atomic.LoadInt64(&activeConns))
 	
+	// 等待活跃连接完成(最多60秒)
 	shutdownTimeout := 60
 	for i := 0; i < shutdownTimeout; i++ {
 		active := atomic.LoadInt64(&activeConns)
