@@ -194,7 +194,7 @@ CONFIG
 print_success "配置文件: /etc/ipv6-proxy/config.txt"
 
 # 创建程序
-print_info "创建代理程序（修复SOCKS5协议）..."
+print_info "创建代理程序（支持并发限制）..."
 
 cat > main.go << 'GOCODE'
 package main
@@ -219,9 +219,9 @@ import (
 
 var (
     cfg Config
-    ipConcurrency sync.Map
+    ipConcurrency sync.Map // map[string]*int32 记录每个IP的并发数
     activeConns, totalConns, successConns, failedConns, bytesIn, bytesOut int64
-    ipRetries int64
+    ipRetries int64 // IP重试统计
     bufferPool = sync.Pool{New: func() interface{} { return make([]byte, 65536) }}
 )
 
@@ -233,7 +233,7 @@ type Config struct {
 
 func loadConfig() {
     data, _ := os.ReadFile("/etc/ipv6-proxy/config.txt")
-    cfg.MaxPerIP = 5
+    cfg.MaxPerIP = 5 // 默认值
     for _, line := range strings.Split(string(data), "\n") {
         parts := strings.SplitN(line, "=", 2)
         if len(parts) == 2 {
@@ -266,12 +266,13 @@ func randomIPv6() string {
         rand.Int31n(0x10000), rand.Int31n(0x10000), rand.Int31n(0x10000), rand.Int31n(0x10000))
 }
 
+// 获取可用IP（带并发检查）
 func acquireIPv6() string {
     if !cfg.IPv6Enabled {
         return ""
     }
     
-    for i := 0; i < 100; i++ {
+    for i := 0; i < 100; i++ { // 最多重试100次
         ip := randomIPv6()
         val, _ := ipConcurrency.LoadOrStore(ip, new(int32))
         counter := val.(*int32)
@@ -286,13 +287,11 @@ func acquireIPv6() string {
         }
     }
     
-    ip := randomIPv6()
-    val, _ := ipConcurrency.LoadOrStore(ip, new(int32))
-    atomic.AddInt32(val.(*int32), 1)
-    atomic.AddInt64(&ipRetries, 100)
-    return ip
+    // 降级：直接返回随机IP
+    return randomIPv6()
 }
 
+// 释放IP
 func releaseIPv6(ip string) {
     if ip == "" {
         return
@@ -328,101 +327,34 @@ func handleSOCKS5(c net.Conn, ipv6 string) error {
     defer releaseIPv6(ipv6)
     
     buf := make([]byte, 512)
-    
-    // 1. 版本协商
-    if _, err := io.ReadFull(c, buf[:2]); err != nil {
-        return err
-    }
-    ver, nmethods := buf[0], buf[1]
-    if ver != 5 {
-        return fmt.Errorf("unsupported version: %d", ver)
-    }
-    
-    // 读取客户端支持的认证方法
-    if _, err := io.ReadFull(c, buf[:nmethods]); err != nil {
-        return err
-    }
-    
-    // 回复使用用户名密码认证(方法2)
+    io.ReadFull(c, buf[:2])
+    io.ReadFull(c, buf[:int(buf[1])])
     c.Write([]byte{5, 2})
-    
-    // 2. 用户名密码认证
-    if _, err := io.ReadFull(c, buf[:2]); err != nil {
-        return err
-    }
-    if buf[0] != 1 {
-        return fmt.Errorf("invalid auth version")
-    }
-    
-    // 读取用户名
-    ulen := int(buf[1])
-    if _, err := io.ReadFull(c, buf[:ulen]); err != nil {
-        return err
-    }
-    user := string(buf[:ulen])
-    
-    // 读取密码
-    if _, err := io.ReadFull(c, buf[:1]); err != nil {
-        return err
-    }
-    plen := int(buf[0])
-    if _, err := io.ReadFull(c, buf[:plen]); err != nil {
-        return err
-    }
-    pass := string(buf[:plen])
-    
-    // 验证认证
+    io.ReadFull(c, buf[:2])
+    io.ReadFull(c, buf[:int(buf[1])])
+    user := string(buf[:int(buf[1])])
+    io.ReadFull(c, buf[:1])
+    io.ReadFull(c, buf[:int(buf[0])])
+    pass := string(buf[:int(buf[0])])
     if user != cfg.Username || pass != cfg.Password {
         c.Write([]byte{1, 1})
-        return fmt.Errorf("auth failed")
+        return fmt.Errorf("auth")
     }
     c.Write([]byte{1, 0})
-    
-    // 3. 请求
-    if _, err := io.ReadFull(c, buf[:4]); err != nil {
-        return err
-    }
-    
-    if buf[1] != 1 {
-        c.Write([]byte{5, 7, 0, 1, 0, 0, 0, 0, 0, 0})
-        return fmt.Errorf("only CONNECT supported")
-    }
-    
+    io.ReadFull(c, buf[:4])
     var host string
     var port uint16
-    
-    switch buf[3] {
-    case 1: // IPv4
-        if _, err := io.ReadFull(c, buf[:6]); err != nil {
-            return err
-        }
+    if buf[3] == 1 {
+        io.ReadFull(c, buf[:6])
         host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
         port = binary.BigEndian.Uint16(buf[4:6])
-    case 3: // 域名
-        if _, err := io.ReadFull(c, buf[:1]); err != nil {
-            return err
-        }
+    } else if buf[3] == 3 {
+        io.ReadFull(c, buf[:1])
         dlen := int(buf[0])
-        if _, err := io.ReadFull(c, buf[:dlen+2]); err != nil {
-            return err
-        }
+        io.ReadFull(c, buf[:dlen+2])
         host = string(buf[:dlen])
         port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
-    case 4: // IPv6
-        if _, err := io.ReadFull(c, buf[:18]); err != nil {
-            return err
-        }
-        host = fmt.Sprintf("[%x:%x:%x:%x:%x:%x:%x:%x]",
-            binary.BigEndian.Uint16(buf[0:2]), binary.BigEndian.Uint16(buf[2:4]),
-            binary.BigEndian.Uint16(buf[4:6]), binary.BigEndian.Uint16(buf[6:8]),
-            binary.BigEndian.Uint16(buf[8:10]), binary.BigEndian.Uint16(buf[10:12]),
-            binary.BigEndian.Uint16(buf[12:14]), binary.BigEndian.Uint16(buf[14:16]))
-        port = binary.BigEndian.Uint16(buf[16:18])
-    default:
-        c.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
-        return fmt.Errorf("unsupported address type: %d", buf[3])
     }
-    
     return connectAndForward(c, host, port, ipv6, true)
 }
 
@@ -452,9 +384,6 @@ func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
         return fmt.Errorf("method")
     }
     hp := strings.Split(parts[1], ":")
-    if len(hp) < 2 {
-        return fmt.Errorf("invalid host:port format")
-    }
     var port uint16
     fmt.Sscanf(hp[1], "%d", &port)
     return connectAndForward(c, hp[0], port, ipv6, false)
@@ -502,7 +431,7 @@ func handleConn(c net.Conn) {
     atomic.AddInt64(&activeConns, 1)
     atomic.AddInt64(&totalConns, 1)
     
-    ipv6 := acquireIPv6()
+    ipv6 := acquireIPv6() // 获取可用IP
     
     fb := make([]byte, 1)
     if _, err := c.Read(fb); err != nil {
@@ -520,6 +449,7 @@ func statsRoutine() {
     t := time.NewTicker(30 * time.Second)
     defer t.Stop()
     for range t.C {
+        // 统计活跃IP
         ipCount := 0
         totalIPConns := 0
         ipConcurrency.Range(func(key, value interface{}) bool {
@@ -629,7 +559,6 @@ echo "📊 每IP并发: $MAX_PER_IP"
 $USE_IPV6 && echo "🌐 IPv6池: $IPV6_PREFIX::/64" || echo "⚠️  IPv6: 禁用"
 echo ""
 echo "🧪 测试命令:"
-echo "  curl -x socks5h://$USERNAME:$PASSWORD@$IPV4:$PROXY_PORT http://ipv6.ip.sb"
 echo "  curl -x http://$USERNAME:$PASSWORD@$IPV4:$PROXY_PORT http://ipv6.ip.sb"
 echo ""
 echo "📊 监控命令:"
