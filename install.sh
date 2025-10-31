@@ -1,574 +1,1411 @@
 #!/bin/bash
+#
+# IPv6 代理 (v6.5) 一键安装脚本
+# 自动清理、安装正确的 Go 1.21.5、修复 index.html CWD 错误、
+# 新增 12h 日志清理 & 24h IP 轮换、
+# 编译、安装到 /opt/ipv6-proxy，并自动引导配置和启动。
+#
 
-set -e
+# --- 配置 ---
+INSTALL_DIR="/opt/ipv6-proxy"
+BUILD_DIR="/root/ipv6-proxy-build"
+GO_VERSION="1.21.5"
+GO_TAR="go${GO_VERSION}.linux-amd64.tar.gz"
+GO_URL="https://go.dev/dl/${GO_TAR}"
+# 确保新 Go 的路径被使用
+export GOROOT=/usr/local/go
+export GOPATH=$HOME/go
+export PATH=/usr/local/go/bin:$PATH:$GOPATH/bin
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
 
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
-print_warning() { echo -e "${YELLOW}[⚠]${NC} $1"; }
-print_error() { echo -e "${RED}[✗]${NC} $1"; }
+# --- 脚本开始 ---
+set -e # 遇到错误立即退出
 
-clear
-echo ""
-echo "========================================="
-echo "  IPv6 Rotating Proxy"
-echo "  完全清理 & 全新安装"
-echo "  支持单IP并发限制"
-echo "========================================="
-echo ""
-
-if [ "$EUID" -ne 0 ]; then 
-    print_error "请使用 root 权限运行"
-    exit 1
+# 检查是否为 root
+if [ "$(id -u)" -ne 0 ]; then
+  echo "❌ 错误：此脚本必须以 root 权限运行。"
+  echo "请尝试使用: sudo ./install.sh"
+  exit 1
 fi
 
-# ==================== 第一步：彻底清理 ====================
-print_info "第 1 步：彻底清理现有服务和进程..."
+echo "============================================="
+echo "=== IPv6 代理 (v6.5) 正在开始安装... ==="
+echo "============================================="
+echo "安装目录: $INSTALL_DIR"
 echo ""
 
-# 显示当前状态
-print_info "当前运行的代理相关服务："
-systemctl list-units --type=service --state=running | grep -E "(proxy|ipv6)" || echo "  无"
-
-print_info "当前运行的代理相关进程："
-ps aux | grep -E "(proxy|python.*20000)" | grep -v grep | head -5 || echo "  无"
-
-print_info "当前端口占用："
-lsof -i :20000 2>/dev/null | tail -n +2 || echo "  20000: 空闲"
-lsof -i :20001 2>/dev/null | tail -n +2 || echo "  20001: 空闲"
-
-echo ""
-read -p "开始清理? [Y/n] " start_clean
-if [[ $start_clean =~ ^[Nn]$ ]]; then
-    print_warning "跳过清理，继续安装..."
-else
-    # 停止所有服务
-    print_info "停止所有代理服务..."
-    for service in go-proxy ipv6-proxy dynamic-proxy python-proxy; do
-        if systemctl list-unit-files | grep -q "^$service.service"; then
-            systemctl stop $service 2>/dev/null || true
-            systemctl disable $service 2>/dev/null || true
-            rm -f /etc/systemd/system/$service.service
-            print_success "已清理: $service"
-        fi
-    done
-
-    systemctl daemon-reload
-
-    # 终止所有进程
-    print_info "终止所有代理进程..."
-    pkill -9 -f "proxy-server" 2>/dev/null && print_success "已终止: proxy-server" || true
-    pkill -9 -f "ipv6-proxy" 2>/dev/null && print_success "已终止: ipv6-proxy" || true
-    pkill -9 -f "python.*proxy" 2>/dev/null && print_success "已终止: Python 代理" || true
-    pkill -9 -f "python.*20000" 2>/dev/null && print_success "已终止: Python 20000" || true
-
-    # 强制释放端口
-    print_info "释放端口..."
-    for port in 20000 20001; do
-        fuser -k $port/tcp 2>/dev/null && print_success "已释放端口: $port" || true
-    done
-
-    sleep 3
-
-    # 验证清理
-    print_info "验证清理结果..."
-    if pgrep -f "proxy" >/dev/null || lsof -i :20000 >/dev/null 2>&1; then
-        print_warning "仍有残留，再次清理..."
-        pkill -9 -f "proxy" 2>/dev/null || true
-        fuser -k -9 20000/tcp 2>/dev/null || true
-        fuser -k -9 20001/tcp 2>/dev/null || true
-        sleep 2
-    fi
-
-    print_success "清理完成"
-fi
-
-echo ""
-
-# ==================== 第二步：交互式配置 ====================
-print_info "第 2 步：配置参数..."
-echo ""
-
-# IPv4
-IPV4=$(curl -s -4 --max-time 3 ifconfig.me 2>/dev/null || echo "")
-if [ -z "$IPV4" ]; then
-    read -p "请输入服务器 IPv4: " IPV4
-else
-    print_success "检测到 IPv4: $IPV4"
-    read -p "确认? [Y/n] " confirm
-    [[ $confirm =~ ^[Nn]$ ]] && read -p "请输入 IPv4: " IPV4
-fi
-
-# IPv6
-if ping6 -c 1 -W 2 2001:4860:4860::8888 &>/dev/null; then
-    IPV6_ADDR=$(ip -6 addr show scope global 2>/dev/null | grep inet6 | head -1 | awk '{print $2}' | cut -d'/' -f1)
-    if [ -n "$IPV6_ADDR" ]; then
-        IPV6_PREFIX=$(echo "$IPV6_ADDR" | cut -d':' -f1-4)
-        print_success "检测到 IPv6: $IPV6_PREFIX::/64"
-        read -p "启用 IPv6 轮换? [Y/n] " use_ipv6
-        [[ $use_ipv6 =~ ^[Nn]$ ]] && USE_IPV6=false || USE_IPV6=true
-    else
-        USE_IPV6=false
-    fi
-else
-    print_warning "IPv6 不可用"
-    USE_IPV6=false
-    IPV6_PREFIX=""
-fi
-
-# 端口
-read -p "代理端口 [20000]: " PROXY_PORT
-PROXY_PORT=${PROXY_PORT:-20000}
-read -p "监控端口 [20001]: " METRICS_PORT
-METRICS_PORT=${METRICS_PORT:-20001}
-
-# 并发限制
-read -p "每个IP最大并发数 [5]: " MAX_PER_IP
-MAX_PER_IP=${MAX_PER_IP:-5}
-
-# 认证
-read -p "用户名 [proxy]: " USERNAME
-USERNAME=${USERNAME:-proxy}
-read -sp "密码 [回车自动生成]: " PASSWORD
-echo ""
-[ -z "$PASSWORD" ] && PASSWORD=$(openssl rand -hex 6) && print_info "生成密码: $PASSWORD"
-
-# 确认
-echo ""
-echo "========================================="
-echo "  配置摘要"
-echo "========================================="
-echo "服务器: $IPV4:$PROXY_PORT"
-echo "用户名: $USERNAME"
-echo "密码: $PASSWORD"
-echo "每IP并发: $MAX_PER_IP"
-$USE_IPV6 && echo "IPv6: $IPV6_PREFIX::/64" || echo "IPv6: 禁用"
-echo "========================================="
-echo ""
-
-read -p "确认安装? [Y/n] " confirm
-[[ $confirm =~ ^[Nn]$ ]] && exit 0
-
-# ==================== 第三步：安装 ====================
-print_info "第 3 步：安装..."
-echo ""
-
-# Go
-export PATH=$PATH:/usr/local/go/bin
-if ! command -v go &> /dev/null; then
-    print_info "安装 Go 1.21.5..."
-    cd /tmp
-    wget -q --show-progress https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-    export PATH=$PATH:/usr/local/go/bin
-    print_success "Go 安装完成"
-else
-    print_success "Go 已安装: $(go version)"
-fi
-
-# 创建目录
-print_info "创建工作目录..."
+# --- 步骤 1: 彻底清理旧服务和文件 ---
+echo "--- 步骤 1: 正在清理旧的服务和文件... ---"
+systemctl stop ipv6-proxy.service >/dev/null 2>&1 || true
+systemctl disable ipv6-proxy.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/ipv6-proxy.service
+# 清理所有已知目录
 rm -rf /opt/ipv6-proxy
-mkdir -p /opt/ipv6-proxy /etc/ipv6-proxy
-cd /opt/ipv6-proxy
-print_success "目录创建完成"
+rm -rf /home/ubuntu/geminiip
+rm -rf /root/ip
+rm -rf "$BUILD_DIR" # 清理临时编译目录
+systemctl daemon-reload
+echo "✅ 旧服务和文件清理完毕。"
+echo ""
 
-# 创建配置
-print_info "生成配置文件..."
-cat > /etc/ipv6-proxy/config.txt << CONFIG
-PROXY_PORT=$PROXY_PORT
-METRICS_PORT=$METRICS_PORT
-USERNAME=$USERNAME
-PASSWORD=$PASSWORD
-IPV6_ENABLED=$USE_IPV6
-IPV6_PREFIX=$IPV6_PREFIX
-MAX_PER_IP=$MAX_PER_IP
-CONFIG
-print_success "配置文件: /etc/ipv6-proxy/config.txt"
+# --- 步骤 2: 安装依赖 (wget 和 最新的 Go) ---
+echo "--- 步骤 2: 正在安装依赖 (wget 和 Go $GO_VERSION)... ---"
+apt-get update >/dev/null
+apt-get install -y wget
+# 移除旧的 apt-get go
+apt-get remove -y golang-go >/dev/null 2>&1 || true
+rm -rf /usr/lib/go # 清理旧的 GOROOT
 
-# 创建程序
-print_info "创建代理程序（支持并发限制）..."
+# 下载并安装 Go 1.21.5
+if [ ! -d "/usr/local/go" ] || ! /usr/local/go/bin/go version | grep -q "$GO_VERSION"; then
+  echo "正在下载 Go $GO_VERSION..."
+  wget -q "$GO_URL" -O "/tmp/$GO_TAR"
+  echo "正在解压 Go..."
+  tar -C /usr/local -xzf "/tmp/$GO_TAR"
+  rm "/tmp/$GO_TAR"
+else
+  echo "Go $GO_VERSION 已安装。"
+fi
 
-cat > main.go << 'GOCODE'
+# 确保 shell 知道新的 Go 路径
+export GOROOT=/usr/local/go
+export GOPATH=$HOME/go
+export PATH=/usr/local/go/bin:$PATH:$GOPATH/bin
+echo "✅ Go 环境已就绪。 (`go version`)"
+/usr/local/go/bin/go version # 验证版本
+echo ""
+
+# --- 步骤 3: 创建项目文件 (v6.5 代码) ---
+echo "--- 步骤 3: 正在创建 v6.5 源代码到 $BUILD_DIR ... ---"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+# 创建 main.go (v6.5 - 修复 CWD 和 io.File, 新增 12h/24h 任务)
+cat << 'EOF' > main.go
 package main
 
 import (
-    "bufio"
-    "encoding/base64"
-    "encoding/binary"
-    "fmt"
-    "io"
-    "log"
-    "math/rand"
-    "net"
-    "net/http"
-    "os"
-    "runtime"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "time"
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json" // 用于 config.json
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	mrand "math/rand"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath" // 用于获取可执行文件路径
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/shirou/gopsutil/v3/process" // 用于获取 CPU
+	"github.com/vishvananda/netlink"
+	"golang.org/x/term" // 用于安全读取密码
 )
 
 var (
-    cfg Config
-    ipConcurrency sync.Map // map[string]*int32 记录每个IP的并发数
-    activeConns, totalConns, successConns, failedConns, bytesIn, bytesOut int64
-    ipRetries int64 // IP重试统计
-    bufferPool = sync.Pool{New: func() interface{} { return make([]byte, 65536) }}
+	config            Config
+	stats             Stats
+	ipv6Pool          []net.IP
+	poolLock          sync.RWMutex
+	backgroundRunning int32
+	backgroundAdded   int64
+	connLogs          []*ConnLog
+	connLogsLock      sync.RWMutex
+	maxLogs           = 100
+
+	// 网络相关缓存
+	iface     netlink.Link
+	prefixIP  net.IP
+	prefixNet *net.IPNet
+
+	// 配置文件路径
+	configFilePath string
+    // !!! 修复 CWD 错误：存储 index.html 的路径
+    indexHTMLPath string
 )
 
+// JSON 标签，用于保存到 config.json
 type Config struct {
-    ProxyPort, MetricsPort, Username, Password, IPv6Prefix string
-    IPv6Enabled                                            bool
-    MaxPerIP                                               int
+	Port        string `json:"port"`
+	WebPort     string `json:"web_port"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	IPv6Prefix  string `json:"ipv6_prefix"`
+	Interface   string `json:"interface"`
+	InitialPool int    `json:"initial_pool"`
+	TargetPool  int    `json:"target_pool"`
 }
 
-func loadConfig() {
-    data, _ := os.ReadFile("/etc/ipv6-proxy/config.txt")
-    cfg.MaxPerIP = 5 // 默认值
-    for _, line := range strings.Split(string(data), "\n") {
-        parts := strings.SplitN(line, "=", 2)
-        if len(parts) == 2 {
-            key, val := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-            switch key {
-            case "PROXY_PORT":
-                cfg.ProxyPort = val
-            case "METRICS_PORT":
-                cfg.MetricsPort = val
-            case "USERNAME":
-                cfg.Username = val
-            case "PASSWORD":
-                cfg.Password = val
-            case "IPV6_ENABLED":
-                cfg.IPv6Enabled = val == "true"
-            case "IPV6_PREFIX":
-                cfg.IPv6Prefix = val
-            case "MAX_PER_IP":
-                fmt.Sscanf(val, "%d", &cfg.MaxPerIP)
-            }
-        }
-    }
+type Stats struct {
+	TotalConns, ActiveConns, SuccessConns, FailedConns int64
+	TimeoutConns      int64
+	PoolSize          int64
+	StartTime         time.Time
+	TotalDuration     int64 // (原子操作, 纳秒)
+	CurrentCPUPercent int64 // (原子操作, 值为 % * 100, 例如 12.5% 存为 1250)
 }
 
-func randomIPv6() string {
-    if !cfg.IPv6Enabled || cfg.IPv6Prefix == "" {
-        return ""
-    }
-    return fmt.Sprintf("%s:%x:%x:%x:%x", cfg.IPv6Prefix,
-        rand.Int31n(0x10000), rand.Int31n(0x10000), rand.Int31n(0x10000), rand.Int31n(0x10000))
+type ConnLog struct {
+	Time     string `json:"time"`
+	ClientIP string `json:"client_ip"`
+	Target   string `json:"target"`
+	IPv6     string `json:"ipv6"`
+	Status   string `json:"status"`
+	Duration string `json:"duration"`
 }
 
-// 获取可用IP（带并发检查）
-func acquireIPv6() string {
-    if !cfg.IPv6Enabled {
-        return ""
-    }
-    
-    for i := 0; i < 100; i++ { // 最多重试100次
-        ip := randomIPv6()
-        val, _ := ipConcurrency.LoadOrStore(ip, new(int32))
-        counter := val.(*int32)
-        current := atomic.LoadInt32(counter)
-        
-        if current < int32(cfg.MaxPerIP) {
-            atomic.AddInt32(counter, 1)
-            if i > 0 {
-                atomic.AddInt64(&ipRetries, int64(i))
-            }
-            return ip
-        }
-    }
-    
-    // 降级：直接返回随机IP
-    return randomIPv6()
+// 交互式助手：读取用户选择 (1-N)
+func readUserChoice(maxChoice int) int {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf("请输入您的选择 (1-%d): ", maxChoice)
+		text, _ := reader.ReadString('\n')
+		choice, err := strconv.Atoi(strings.TrimSpace(text))
+		if err != nil || choice < 1 || choice > maxChoice {
+			log.Printf("❌ 无效输入，请输入 1 到 %d 之间的数字。", maxChoice)
+			continue
+		}
+		return choice
+	}
 }
 
-// 释放IP
-func releaseIPv6(ip string) {
-    if ip == "" {
-        return
-    }
-    if val, ok := ipConcurrency.Load(ip); ok {
-        atomic.AddInt32(val.(*int32), -1)
-    }
+// 交互式助手：读取用户输入的数字
+func readUserInt(prompt string, defaultValue int) int {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf("%s (默认 %d): ", prompt, defaultValue)
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return defaultValue
+		}
+		val, err := strconv.Atoi(text)
+		if err != nil || val < 0 {
+			log.Printf("❌ 无效输入，请输入一个有效的正整数。")
+			continue
+		}
+		return val
+	}
 }
 
-func checkAuth(h string) bool {
-    exp := base64.StdEncoding.EncodeToString([]byte(cfg.Username + ":" + cfg.Password))
-    for _, l := range strings.Split(h, "\r\n") {
-        if strings.HasPrefix(strings.ToLower(l), "proxy-authorization: basic ") && strings.TrimSpace(l[27:]) == exp {
-            return true
-        }
-    }
-    return false
+// 交互式助手：读取用户输入的字符串
+func readUserString(prompt string, defaultValue string) string {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("%s (默认 %s): ", prompt, defaultValue)
+	text, _ := reader.ReadString('\n')
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return defaultValue
+	}
+	return text
 }
 
-func transfer(dst io.Writer, src io.Reader, dir string, wg *sync.WaitGroup) {
-    defer wg.Done()
-    buf := bufferPool.Get().([]byte)
-    defer bufferPool.Put(buf)
-    w, _ := io.CopyBuffer(dst, src, buf)
-    if dir == "up" {
-        atomic.AddInt64(&bytesOut, w)
-    } else {
-        atomic.AddInt64(&bytesIn, w)
-    }
+// 交互式助手：读取密码 (不回显)
+func readUserPassword(prompt string, defaultValue string) string {
+	fmt.Printf("%s (默认 %s): ", prompt, defaultValue)
+	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println()
+
+	if err != nil {
+		log.Printf("⚠️ 无法安全读取密码, 将使用明文输入...: %v", err)
+		reader := bufio.NewReader(os.Stdin)
+		text, _ := reader.ReadString('\n')
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return defaultValue
+		}
+		return text
+	}
+
+	text := string(bytePassword)
+	if text == "" {
+		return defaultValue
+	}
+	return text
 }
 
-func handleSOCKS5(c net.Conn, ipv6 string) error {
-    defer releaseIPv6(ipv6)
-    
-    buf := make([]byte, 512)
-    io.ReadFull(c, buf[:2])
-    io.ReadFull(c, buf[:int(buf[1])])
-    c.Write([]byte{5, 2})
-    io.ReadFull(c, buf[:2])
-    io.ReadFull(c, buf[:int(buf[1])])
-    user := string(buf[:int(buf[1])])
-    io.ReadFull(c, buf[:1])
-    io.ReadFull(c, buf[:int(buf[0])])
-    pass := string(buf[:int(buf[0])])
-    if user != cfg.Username || pass != cfg.Password {
-        c.Write([]byte{1, 1})
-        return fmt.Errorf("auth")
-    }
-    c.Write([]byte{1, 0})
-    io.ReadFull(c, buf[:4])
-    var host string
-    var port uint16
-    if buf[3] == 1 {
-        io.ReadFull(c, buf[:6])
-        host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
-        port = binary.BigEndian.Uint16(buf[4:6])
-    } else if buf[3] == 3 {
-        io.ReadFull(c, buf[:1])
-        dlen := int(buf[0])
-        io.ReadFull(c, buf[:dlen+2])
-        host = string(buf[:dlen])
-        port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
-    }
-    return connectAndForward(c, host, port, ipv6, true)
+// 交互式选择网卡
+func selectInterface() (netlink.Link, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil, fmt.Errorf("无法列出网卡: %v", err)
+	}
+
+	var validLinks []netlink.Link
+	for _, link := range links {
+		if link.Attrs().Flags&net.FlagUp != 0 && link.Attrs().Flags&net.FlagLoopback == 0 {
+			validLinks = append(validLinks, link)
+		}
+	}
+
+	if len(validLinks) == 0 {
+		return nil, errors.New("未找到任何处于 'UP' 状态的非环回网卡")
+	}
+
+	log.Println("🔎 发现以下可用网卡:")
+	for i, link := range validLinks {
+		log.Printf("  %d: %s", i+1, link.Attrs().Name)
+	}
+
+	choice := readUserChoice(len(validLinks))
+	return validLinks[choice-1], nil
 }
 
-func handleHTTP(c net.Conn, fb byte, ipv6 string) error {
-    defer releaseIPv6(ipv6)
-    
-    r := bufio.NewReader(io.MultiReader(strings.NewReader(string(fb)), c))
-    line, _ := r.ReadString('\n')
-    parts := strings.Fields(line)
-    if len(parts) < 2 {
-        return fmt.Errorf("invalid")
-    }
-    var h strings.Builder
-    for {
-        l, _ := r.ReadString('\n')
-        h.WriteString(l)
-        if l == "\r\n" || l == "\n" {
-            break
-        }
-    }
-    if !checkAuth(h.String()) {
-        c.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
-        return fmt.Errorf("auth")
-    }
-    if parts[0] != "CONNECT" {
-        c.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
-        return fmt.Errorf("method")
-    }
-    hp := strings.Split(parts[1], ":")
-    var port uint16
-    fmt.Sscanf(hp[1], "%d", &port)
-    return connectAndForward(c, hp[0], port, ipv6, false)
+// 交互式选择 IPv6 前缀
+func selectIPv6Prefix(iface netlink.Link) (string, error) {
+	addrs, err := netlink.AddrList(iface, netlink.FAMILY_V6)
+	if err != nil {
+		return "", fmt.Errorf("无法获取网卡 %s 的地址: %v", iface.Attrs().Name, err)
+	}
+
+	prefixMap := make(map[string]bool)
+	for _, addr := range addrs {
+		if addr.IPNet != nil && addr.IPNet.IP.IsGlobalUnicast() {
+			ones, bits := addr.IPNet.Mask.Size()
+			if bits == 128 && ones <= 64 {
+				ip64 := addr.IPNet.IP.Mask(net.CIDRMask(64, 128))
+				prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+					ip64[0], ip64[1], ip64[2], ip64[3], ip64[4], ip64[5], ip64[6], ip64[7])
+				prefixMap[prefixStr] = true
+			}
+		}
+	}
+
+	if len(prefixMap) == 0 {
+		log.Printf("⚠️ 在 %s 上未自动检测到 Global IPv6 /64 网段。", iface.Attrs().Name)
+		log.Println("请输入您的 /64 前缀 (例如: 2402:1f00:800d:bd00):")
+		reader := bufio.NewReader(os.Stdin)
+		text, _ := reader.ReadString('\n')
+		prefix := strings.TrimSpace(text)
+		if prefix == "" {
+			return "", errors.New("前缀不能为空")
+		}
+		return prefix, nil
+	}
+
+	var validPrefixes []string
+	for prefix := range prefixMap {
+		validPrefixes = append(validPrefixes, prefix)
+	}
+
+	log.Printf("🔎 在 %s 上发现以下 IPv6 /64 前缀:", iface.Attrs().Name)
+	for i, prefix := range validPrefixes {
+		log.Printf("  %d: %s", i+1, prefix)
+	}
+
+	choice := readUserChoice(len(validPrefixes))
+	return validPrefixes[choice-1], nil
 }
 
-func connectAndForward(c net.Conn, host string, port uint16, ipv6 string, socks bool) error {
-    var d net.Dialer
-    if cfg.IPv6Enabled && ipv6 != "" {
-        if addr, err := net.ResolveIPAddr("ip6", ipv6); err == nil {
-            d.LocalAddr = &net.TCPAddr{IP: addr.IP}
-        }
-    }
-    d.Timeout = 15 * time.Second
-    remote, err := d.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-    if err != nil {
-        atomic.AddInt64(&failedConns, 1)
-        if socks {
-            c.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
-        } else {
-            c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-        }
-        return err
-    }
-    defer remote.Close()
-    if tcp, ok := remote.(*net.TCPConn); ok {
-        tcp.SetNoDelay(true)
-    }
-    atomic.AddInt64(&successConns, 1)
-    if socks {
-        c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-    } else {
-        c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-    }
-    var wg sync.WaitGroup
-    wg.Add(2)
-    go transfer(remote, c, "up", &wg)
-    go transfer(c, remote, "down", &wg)
-    wg.Wait()
-    return nil
+// 运行交互式设置向导
+func runInteractiveSetup() error {
+	log.Println("--- 基础设置 ---")
+	config.Port = readUserString("请输入代理端口", "1080")
+	config.WebPort = readUserString("请输入 Web 面板端口", "8080")
+	config.Username = readUserString("请输入代理用户名", "proxy")
+	config.Password = readUserPassword("请输入代理密码", "proxy")
+	log.Printf("✅ 基础配置完成")
+
+	log.Println("")
+	log.Println("--- 网络设置 ---")
+	selectedIface, err := selectInterface()
+	if err != nil {
+		return fmt.Errorf("❌ 网卡选择失败: %v", err)
+	}
+	config.Interface = selectedIface.Attrs().Name
+	log.Printf("✅ 已选择网卡: %s", config.Interface)
+
+	selectedPrefix, err := selectIPv6Prefix(selectedIface)
+	if err != nil {
+		return fmt.Errorf("❌ IPv6 前缀选择失败: %v", err)
+	}
+	config.IPv6Prefix = selectedPrefix
+	log.Printf("✅ 已选择 IPv6 /64 前缀: %s", config.IPv6Prefix)
+
+	log.Println("")
+	log.Println("--- IP 池设置 ---")
+	config.InitialPool = readUserInt("请输入初始池大小", 10000)
+	config.TargetPool = readUserInt("请输入目标池大小", 100000)
+
+	if config.TargetPool < config.InitialPool {
+		log.Printf("⚠️ 目标池 (%d) 小于初始池 (%d)，已自动设置为 %d", config.TargetPool, config.InitialPool, config.InitialPool)
+		config.TargetPool = config.InitialPool
+	}
+	log.Printf("✅ 初始池: %d, 目标池: %d", config.InitialPool, config.TargetPool)
+	return nil
 }
 
-func handleConn(c net.Conn) {
-    defer c.Close()
-    defer atomic.AddInt64(&activeConns, -1)
-    atomic.AddInt64(&activeConns, 1)
-    atomic.AddInt64(&totalConns, 1)
-    
-    ipv6 := acquireIPv6() // 获取可用IP
-    
-    fb := make([]byte, 1)
-    if _, err := c.Read(fb); err != nil {
-        releaseIPv6(ipv6)
-        return
-    }
-    if fb[0] == 0x05 {
-        handleSOCKS5(c, ipv6)
-    } else {
-        handleHTTP(c, fb[0], ipv6)
-    }
+// 保存配置到 config.json
+func saveConfigToFile() error {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("无法序列化配置: %v", err)
+	}
+	return os.WriteFile(configFilePath, data, 0644)
+}
+
+// 从 config.json 加载配置
+func loadConfigFromFile() error {
+	if _, err := os.Stat(configFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("找不到配置文件 %s。请先以交互模式运行一次 (sudo ./ipv6-proxy) 来生成配置", configFilePath)
+	}
+
+	data, err := os.ReadFile(configFilePath)
+	if err != nil {
+		return fmt.Errorf("无法读取配置文件 %s: %v", configFilePath, err)
+	}
+	return json.Unmarshal(data, &config)
+}
+
+// --- 后续代码 ---
+
+func generateRandomIP() net.IP {
+	ip := make(net.IP, 16)
+	copy(ip, prefixIP)
+	if _, err := rand.Read(ip[8:]); err != nil {
+		log.Printf("⚠️ crypto/rand 读取失败: %v, 回退到 math/rand", err)
+		binary.BigEndian.PutUint64(ip[8:], mrand.Uint64())
+	}
+	return ip
+}
+
+func addIPv6(ip net.IP) error {
+	addr, _ := netlink.ParseAddr(ip.String() + "/128")
+	return netlink.AddrAdd(iface, addr)
+}
+
+func addConnLog(clientIP, target, ipv6, status string, duration time.Duration) {
+	connLog := &ConnLog{
+		Time:     time.Now().Format("15:04:05"),
+		ClientIP: clientIP,
+		Target:   target,
+		IPv6:     ipv6,
+		Status:   status,
+		Duration: fmt.Sprintf("%.2fs", duration.Seconds()),
+	}
+	connLogsLock.Lock()
+	if len(connLogs) >= maxLogs {
+		connLogs = connLogs[1:]
+	}
+	connLogs = append(connLogs, connLog)
+	connLogsLock.Unlock()
+}
+
+// 内部函数：添加 IP，带进度
+func populateIPPool(numToAdd int) ([]net.IP, int) {
+	newIPs := make([]net.IP, 0, numToAdd)
+	success := 0
+	startTime := time.Now()
+
+	for i := 0; i < numToAdd; i++ {
+		ip := generateRandomIP()
+		if addIPv6(ip) == nil {
+			newIPs = append(newIPs, ip)
+			success++
+		}
+
+		if (i+1)%100 == 0 || (i+1) == numToAdd {
+			percent := float64(i+1) / float64(numToAdd) * 100
+			fmt.Printf("\r   进度: %d/%d (%.0f%%) ", i+1, numToAdd, percent)
+		}
+	}
+	fmt.Println()
+	duration := time.Since(startTime)
+	log.Printf("✅ 添加了 %d 个 IP (耗时: %.2fs)", success, duration.Seconds())
+	return newIPs, success
+}
+
+func initIPv6Pool() error {
+	log.Printf("🚀 初始化 IPv6 池: %d 个", config.InitialPool)
+	if config.InitialPool == 0 {
+		log.Printf("✅ 初始池为 0，跳过初始化。")
+		return nil
+	}
+
+	newIPs, success := populateIPPool(config.InitialPool)
+	
+	poolLock.Lock()
+	ipv6Pool = newIPs
+	poolLock.Unlock()
+	
+	atomic.StoreInt64(&stats.PoolSize, int64(success))
+
+	if success == 0 {
+		return fmt.Errorf("所有 IPv6 添加失败。请检查前缀 '%s' 是否正确，以及是否以 root 权限运行", config.IPv6Prefix)
+	}
+	return nil
+}
+
+func backgroundAddTask() {
+	defer atomic.StoreInt32(&backgroundRunning, 0)
+	
+	// 确保我们只在需要时运行
+	if config.TargetPool <= config.InitialPool {
+		log.Printf("ℹ️ 目标池不大于初始池，后台添加任务跳过。")
+		return
+	}
+	
+	log.Printf("🔄 后台任务: 添加到目标池 %d", config.TargetPool)
+	
+	// 死循环，直到被 stop (backgroundRunning=0) 或达到目标
+	for {
+		if atomic.LoadInt32(&backgroundRunning) == 0 {
+			log.Printf("ℹ️ 后台任务被停止。")
+			break 
+		}
+
+		currentSize := int(atomic.LoadInt64(&stats.PoolSize))
+		if currentSize >= config.TargetPool {
+			log.Printf("✅ 后台完成: %d 个", currentSize)
+			break // 达到目标
+		}
+
+		ip := generateRandomIP()
+		if addIPv6(ip) == nil {
+			poolLock.Lock()
+			ipv6Pool = append(ipv6Pool, ip)
+			poolLock.Unlock()
+			atomic.AddInt64(&stats.PoolSize, 1)
+			atomic.AddInt64(&backgroundAdded, 1)
+		}
+
+		if atomic.LoadInt64(&backgroundAdded)%10000 == 0 {
+			log.Printf("📈 后台进度: %d/%d", atomic.LoadInt64(&stats.PoolSize), config.TargetPool)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+func getRandomIP() net.IP {
+	poolLock.RLock()
+	defer poolLock.RUnlock()
+	if len(ipv6Pool) == 0 {
+		return nil
+	}
+	return ipv6Pool[mrand.Intn(len(ipv6Pool))]
+}
+
+func checkAuth(user, pass string) bool {
+	return user == config.Username && pass == config.Password
+}
+
+func transfer(dst net.Conn, src net.Conn, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer dst.Close()
+
+	buf := make([]byte, 32*1024)
+	for {
+		src.SetReadDeadline(time.Now().Add(120 * time.Second))
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			dst.SetWriteDeadline(time.Now().Add(120 * time.Second))
+			if _, ew := dst.Write(buf[0:nr]); ew != nil {
+				break
+			}
+		}
+		if er != nil {
+			break
+		}
+	}
+}
+
+func handleSOCKS5(conn net.Conn) {
+	defer conn.Close()
+	defer atomic.AddInt64(&stats.ActiveConns, -1)
+	buf := make([]byte, 512)
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return
+	}
+	nmethods := int(buf[1])
+	if _, err := io.ReadFull(conn, buf[:nmethods]); err != nil {
+		return
+	}
+	conn.Write([]byte{5, 2})
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return
+	}
+	ulen := int(buf[1])
+	if _, err := io.ReadFull(conn, buf[:ulen]); err != nil {
+		return
+	}
+	username := string(buf[:ulen])
+	if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+		return
+	}
+	plen := int(buf[0])
+	if _, err := io.ReadFull(conn, buf[:plen]); err != nil {
+		return
+	}
+	password := string(buf[:plen])
+	if !checkAuth(username, password) {
+		conn.Write([]byte{1, 1})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	conn.Write([]byte{1, 0})
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return
+	}
+	var host string
+	var port uint16
+	atyp := buf[3]
+	switch atyp {
+	case 1:
+		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
+			return
+		}
+		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
+		port = binary.BigEndian.Uint16(buf[4:6])
+	case 3:
+		// 修复：io.File -> io.ReadFull
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return
+		}
+		dlen := int(buf[0])
+		if _, err := io.ReadFull(conn, buf[:dlen+2]); err != nil {
+			return
+		}
+		host = string(buf[:dlen])
+		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
+	default:
+		conn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	connectAndProxy(conn, host, port, true)
+}
+
+func handleHTTP(conn net.Conn, firstByte byte) {
+	defer conn.Close()
+	defer atomic.AddInt64(&stats.ActiveConns, -1)
+	buf := make([]byte, 4096)
+	buf[0] = firstByte
+	n, err := conn.Read(buf[1:])
+	if err != nil {
+		return
+	}
+	request := string(buf[:n+1])
+	lines := strings.Split(request, "\r\n")
+	if len(lines) < 1 {
+		return
+	}
+	parts := strings.Fields(lines[0])
+	if len(parts) < 3 {
+		return
+	}
+	method := parts[0]
+	target := parts[1]
+	authorized := false
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "proxy-authorization: basic ") {
+			encoded := strings.TrimSpace(line[27:])
+			if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+				credentials := strings.SplitN(string(decoded), ":", 2)
+				if len(credentials) == 2 && checkAuth(credentials[0], credentials[1]) {
+					authorized = true
+					break
+				}
+			}
+		}
+	}
+	if !authorized {
+		conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\nConnection: close\r\n\r\n"))
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	if method != "CONNECT" {
+		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n"))
+		return
+	}
+	hostPort := strings.Split(target, ":")
+	if len(hostPort) != 2 {
+		return
+	}
+	host := hostPort[0]
+	var port uint16
+	fmt.Sscanf(hostPort[1], "%d", &port)
+	connectAndProxy(conn, host, port, false)
+}
+
+func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool) {
+	startTime := time.Now()
+	clientIP := clientConn.RemoteAddr().String()
+	target := fmt.Sprintf("%s:%d", host, port)
+
+	ip := getRandomIP()
+	if ip == nil {
+		addConnLog(clientIP, target, "N/A", "❌ 无IP", time.Since(startTime))
+		if isSocks {
+			clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		} else {
+			clientConn.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n"))
+		}
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+
+	ipv6String := ip.String()
+	localAddr := &net.TCPAddr{IP: ip}
+	dialer := &net.Dialer{
+		LocalAddr: localAddr,
+		Timeout:   15 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	remoteConn, err := dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		status := "❌ 失败"
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			status = "⏱️ 超时"
+			atomic.AddInt64(&stats.TimeoutConns, 1)
+		}
+		addConnLog(clientIP, target, ipv6String, status, time.Since(startTime))
+		if isSocks {
+			clientConn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
+		} else {
+			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
+		}
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	defer remoteConn.Close()
+
+	atomic.AddInt64(&stats.SuccessConns, 1)
+	duration := time.Since(startTime)
+	atomic.AddInt64(&stats.TotalDuration, duration.Nanoseconds())
+	addConnLog(clientIP, target, ipv6String, "✅ 成功", duration)
+
+	if isSocks {
+		clientConn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+	} else {
+		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go transfer(remoteConn, clientConn, &wg)
+	go transfer(clientConn, remoteConn, &wg)
+	wg.Wait()
+}
+
+func handleConnection(conn net.Conn) {
+	atomic.AddInt64(&stats.ActiveConns, 1)
+	atomic.AddInt64(&stats.TotalConns, 1)
+	firstByte := make([]byte, 1)
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	n, err := conn.Read(firstByte)
+	if err != nil {
+		if err != io.EOF {
+			// log.Printf("Pre-read error: %v", err)
+		}
+		conn.Close()
+		atomic.AddInt64(&stats.ActiveConns, -1)
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	if n == 1 && firstByte[0] == 0x05 {
+		handleSOCKS5(conn)
+	} else if n == 1 {
+		handleHTTP(conn, firstByte[0])
+	} else {
+		conn.Close()
+		atomic.AddInt64(&stats.ActiveConns, -1)
+	}
+}
+
+func statsCPURoutine() {
+	time.Sleep(3 * time.Second)
+
+	p, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		log.Printf("⚠️ 无法获取当前进程 (pid: %d) 来监控 CPU: %v", os.Getpid(), err)
+		return
+	}
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		percent, err := p.CPUPercent()
+		if err == nil {
+			atomic.StoreInt64(&stats.CurrentCPUPercent, int64(percent*100))
+		}
+	}
 }
 
 func statsRoutine() {
-    t := time.NewTicker(30 * time.Second)
-    defer t.Stop()
-    for range t.C {
-        // 统计活跃IP
-        ipCount := 0
-        totalIPConns := 0
-        ipConcurrency.Range(func(key, value interface{}) bool {
-            count := atomic.LoadInt32(value.(*int32))
-            if count > 0 {
-                ipCount++
-                totalIPConns += int(count)
-            }
-            return true
-        })
-        
-        log.Printf("[Stats] Conn: A=%d T=%d S=%d F=%d | IPv6: IPs=%d Conns=%d Retries=%d | Traffic: In=%.1fM Out=%.1fM",
-            atomic.LoadInt64(&activeConns), atomic.LoadInt64(&totalConns),
-            atomic.LoadInt64(&successConns), atomic.LoadInt64(&failedConns),
-            ipCount, totalIPConns, atomic.LoadInt64(&ipRetries),
-            float64(atomic.LoadInt64(&bytesIn))/1e6, float64(atomic.LoadInt64(&bytesOut))/1e6)
-    }
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Printf("📊 活跃:%d 总计:%d 成功:%d 失败:%d 超时:%d 池:%d",
+			atomic.LoadInt64(&stats.ActiveConns),
+			atomic.LoadInt64(&stats.TotalConns),
+			atomic.LoadInt64(&stats.SuccessConns),
+			atomic.LoadInt64(&stats.FailedConns),
+			atomic.LoadInt64(&stats.TimeoutConns),
+			atomic.LoadInt64(&stats.PoolSize))
+	}
 }
 
-func metricsServer() {
-    mux := http.NewServeMux()
-    mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-        ipCount := 0
-        ipConcurrency.Range(func(key, value interface{}) bool {
-            if atomic.LoadInt32(value.(*int32)) > 0 {
-                ipCount++
-            }
-            return true
-        })
-        
-        fmt.Fprintf(w, "proxy_active %d\nproxy_total %d\nproxy_success %d\nproxy_failed %d\nipv6_using %d\nipv6_retries %d\n",
-            atomic.LoadInt64(&activeConns), atomic.LoadInt64(&totalConns),
-            atomic.LoadInt64(&successConns), atomic.LoadInt64(&failedConns),
-            ipCount, atomic.LoadInt64(&ipRetries))
-    })
-    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        fmt.Fprintf(w, "OK\n")
-    })
-    http.ListenAndServe(":"+cfg.MetricsPort, mux)
+// 新增：12 小时日志清理
+func logClearRoutine() {
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Printf("🧹 正在执行 12 小时日志自动清理...")
+		connLogsLock.Lock()
+		connLogs = []*ConnLog{}
+		connLogsLock.Unlock()
+		log.Printf("✅ 12 小时日志已自动清理")
+	}
+}
+
+// 新增：24 小时 IP 池轮换
+func ipRotationRoutine() {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for range ticker.C {
+		log.Printf("🔄 正在执行 24 小时 IP 池轮换 (安全模式)...")
+		
+		// 1. 停止后台任务（如果它在运行）
+		atomic.StoreInt32(&backgroundRunning, 0)
+		time.Sleep(1 * time.Second) // 等待任务退出
+
+		// 2. 准备新池 (使用 InitialPool 大小)
+		log.Printf("   ...正在生成 %d 个新 IP...", config.InitialPool)
+		newIPs, success := populateIPPool(config.InitialPool)
+		if success == 0 {
+			log.Printf("❌ 24 小时轮换失败：无法添加任何新 IP。")
+			continue // 跳过此次轮换
+		}
+
+		// 3. 安全替换
+		poolLock.Lock()
+		ipv6Pool = newIPs
+		poolLock.Unlock()
+		
+		atomic.StoreInt64(&stats.PoolSize, int64(success))
+		log.Printf("✅ IP 池轮换完毕。新池中有 %d 个 IP。", success)
+		
+		// 4. 重启后台任务（如果需要）
+		if config.TargetPool > success {
+			atomic.StoreInt32(&backgroundRunning, 1)
+			go backgroundAddTask()
+			log.Printf("   ...已重启后台任务以填充到 %d。", config.TargetPool)
+		}
+	}
+}
+
+
+func handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(stats.StartTime)
+	total := atomic.LoadInt64(&stats.TotalConns)
+	qps := 0.0
+	if uptime.Seconds() > 0 {
+		qps = float64(total) / uptime.Seconds()
+	}
+	currentPool := atomic.LoadInt64(&stats.PoolSize)
+	targetPool := int64(config.TargetPool)
+	progress := 0.0
+	if targetPool > 0 {
+		progress = float64(currentPool) * 100 / float64(targetPool)
+		if progress > 100 {
+			progress = 100
+		}
+	}
+
+	var avgDurationMs float64
+	successConns := atomic.LoadInt64(&stats.SuccessConns)
+	if successConns > 0 {
+		avgDurationNs := atomic.LoadInt64(&stats.TotalDuration)
+		avgDurationMs = float64(avgDurationNs) / float64(successConns) / float64(time.Millisecond)
+	}
+
+	cpuPercent := float64(atomic.LoadInt64(&stats.CurrentCPUPercent)) / 100.0
+
+	data := map[string]interface{}{
+		"active":       atomic.LoadInt64(&stats.ActiveConns),
+		"total":        total,
+		"success":      successConns,
+		"failed":       atomic.LoadInt64(&stats.FailedConns),
+		"timeout":      atomic.LoadInt64(&stats.TimeoutConns),
+		"pool":         currentPool,
+		"target":       targetPool,
+		"progress":     progress,
+		"bg_running":   atomic.LoadInt32(&backgroundRunning) == 1,
+		"bg_added":     atomic.LoadInt64(&backgroundAdded),
+		"qps":          qps,
+		"uptime":       fmt.Sprintf("%dd %dh %dm", int(uptime.Hours())/24, int(uptime.Hours())%24, int(uptime.Minutes())%60),
+		"avg_duration": avgDurationMs,
+		"cpu_percent":  cpuPercent,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func handleAPILogs(w http.ResponseWriter, r *http.Request) {
+	connLogsLock.RLock()
+	logs := make([]*ConnLog, len(connLogs))
+	copy(logs, connLogs)
+	connLogsLock.RUnlock()
+
+	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
+		logs[i], logs[j] = logs[j], logs[i]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
+func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Target int `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"请求无效"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Target < 100 {
+		http.Error(w, `{"error":"目标值至少100"}`, http.StatusBadRequest)
+		return
+	}
+
+	config.TargetPool = req.Target
+	log.Printf("🎯 调整目标池: %d", req.Target)
+
+	if atomic.LoadInt32(&backgroundRunning) == 0 && atomic.LoadInt64(&stats.PoolSize) < int64(req.Target) {
+		atomic.StoreInt32(&backgroundRunning, 1)
+		go backgroundAddTask()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置目标: %d", req.Target)})
+}
+
+// 修复 CWD 错误：使用 indexHTMLPath
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	html, err := os.ReadFile(indexHTMLPath)
+	if err != nil {
+		log.Printf("❌ 错误: 找不到 index.html 文件 (路径: %s): %v", indexHTMLPath, err)
+		http.Error(w, "index.html not found. Make sure it is in the same directory.", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(html)
+}
+
+func startWebServer() {
+	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/api/stats", handleAPIStats)
+	http.HandleFunc("/api/logs", handleAPILogs)
+	http.HandleFunc("/api/pool/resize", handleAPIPoolResize)
+	log.Printf("🌐 Web 面板: http://0.0.0.0:%s", config.WebPort)
+	go func() {
+		if err := http.ListenAndServe(":"+config.WebPort, nil); err != nil {
+			log.Printf("⚠️ Web 服务器启动失败: %v", err)
+		}
+	}()
 }
 
 func main() {
-    loadConfig()
-    rand.Seed(time.Now().UnixNano())
-    runtime.GOMAXPROCS(runtime.NumCPU())
-    log.Printf("IPv6 Rotating Proxy | Port:%s Metrics:%s IPv6:%v MaxPerIP:%d", 
-        cfg.ProxyPort, cfg.MetricsPort, cfg.IPv6Enabled, cfg.MaxPerIP)
-    go statsRoutine()
-    go metricsServer()
-    ln, _ := net.Listen("tcp", ":"+cfg.ProxyPort)
-    defer ln.Close()
-    for {
-        conn, _ := ln.Accept()
-        go handleConn(conn)
-    }
+	log.Printf("╔════════════════════════════════════════════╗")
+	log.Printf("║  IPv6 代理 + Web 面板 v6.5 (终极版)  ║")
+	log.Printf("╚════════════════════════════════════════════╝")
+	log.Printf("")
+
+	stats.StartTime = time.Now()
+
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("❌ 无法获取可执行文件路径: %v", err)
+	}
+	exeDir := filepath.Dir(exePath)
+
+	// 修复 CWD 错误：设置 config 和 index 的绝对路径
+	configFilePath = filepath.Join(exeDir, "config.json")
+	indexHTMLPath = filepath.Join(exeDir, "index.html")
+
+	isInteractive := term.IsTerminal(int(syscall.Stdin))
+
+	if isInteractive {
+		log.Println("--- 欢迎使用交互式设置向导 ---")
+		if err := runInteractiveSetup(); err != nil {
+			log.Fatalf("❌ 向导失败: %v", err)
+		}
+		if err := saveConfigToFile(); err != nil {
+			log.Fatalf("❌ 保存配置到 %s 失败: %v", configFilePath, err)
+		}
+		log.Printf("✅ 配置已保存到 %s", configFilePath)
+	} else {
+		log.Printf("🔄 以服务模式运行，正在从 %s 加载配置...", configFilePath)
+		if err := loadConfigFromFile(); err != nil {
+			log.Fatalf("❌ 无法加载配置: %v", err)
+		}
+		log.Println("✅ 配置加载成功")
+	}
+
+	// --- 启动流程 ---
+
+	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix + "::/64")
+	if err != nil {
+		log.Fatalf("❌ 无法解析 IPv6 前缀: %v", err)
+	}
+	iface, err = netlink.LinkByName(config.Interface)
+	if err != nil {
+		log.Fatalf("❌ 无法找到网卡 '%s': %v", config.Interface, err)
+	}
+
+	log.Printf("")
+	log.Printf("--- 最终配置 ---")
+	log.Printf("代理: %s | Web: %s", config.Port, config.WebPort)
+	log.Printf("用户: %s | 密码: [已隐藏]", config.Username)
+	log.Printf("IPv6: %s::/64 | 网卡: %s", config.IPv6Prefix, config.Interface)
+	log.Printf("初始池: %d | 目标池: %d", config.InitialPool, config.TargetPool)
+	log.Printf("------------------")
+	log.Printf("")
+
+	if err := initIPv6Pool(); err != nil {
+		log.Fatalf("❌ 初始化失败: %v", err)
+	}
+
+	// 启动所有后台任务
+	atomic.StoreInt32(&backgroundRunning, 1) // 允许后台任务运行
+	go backgroundAddTask() // 启动 IP 池填充任务
+	go statsRoutine()
+	go statsCPURoutine() // 启动 CPU 监控
+	go logClearRoutine() // 启动 12h 日志清理
+	go ipRotationRoutine() // 启动 24h IP 轮换
+	startWebServer()
+
+	listener, err := net.Listen("tcp", ":"+config.Port)
+	if err != nil {
+		log.Fatalf("监听失败: %v", err)
+	}
+	defer listener.Close()
+
+	log.Printf("✅ 服务就绪")
+	log.Printf("")
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Accept 失败: %v", err)
+			continue
+		}
+		go handleConnection(conn)
+	}
 }
-GOCODE
+EOF
 
-print_success "源代码创建完成"
+# 创建 index.html (v6.2)
+cat << 'EOF' > index.html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>IPv6 代理管理面板</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
 
-# 编译
-print_info "编译 Go 程序..."
-go mod init ipv6-proxy >/dev/null 2>&1
-go build -ldflags="-s -w" -o ipv6-proxy main.go
-print_success "编译完成: /opt/ipv6-proxy/ipv6-proxy"
+        body {
+            font-family: sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 20px
+        }
 
-# systemd
-print_info "创建 systemd 服务..."
-cat > /etc/systemd/system/ipv6-proxy.service << 'SERVICE'
+        .container {
+            max-width: 1400px;
+            margin: 0 auto
+        }
+
+        h1 {
+            font-size: 28px;
+            margin-bottom: 20px;
+            color: #60a5fa
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px
+        }
+
+        .card {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px
+        }
+
+        .card-title {
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 10px
+        }
+
+        .card-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #60a5fa
+        }
+        /* 为连接统计卡片调整字体 */
+        .card-value-small {
+            font-size: 24px;
+            font-weight: bold;
+            color: #60a5fa
+        }
+        .card-value-small .success {
+            color: #10b981
+        }
+        .card-value-small .fail {
+            color: #ef4444
+        }
+
+        .card-sub {
+            font-size: 12px;
+            color: #64748b;
+            margin-top: 5px
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #334155;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #60a5fa);
+            transition: width .3s
+        }
+
+        .section {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px
+        }
+
+        .section-title {
+            font-size: 18px;
+            margin-bottom: 15px
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse
+        }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #334155
+        }
+
+        th {
+            color: #94a3b8;
+            font-size: 14px
+        }
+
+        .status-success {
+            color: #10b981
+        }
+
+        .status-fail {
+            color: #ef4444
+        }
+
+        .status-timeout {
+            color: #f59e0b
+        }
+
+        .input-group {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap
+        }
+
+        input[type=number] {
+            background: #334155;
+            border: 1px solid #475569;
+            color: #e2e8f0;
+            padding: 8px 12px;
+            border-radius: 6px;
+            width: 150px
+        }
+
+        button {
+            background: #3b82f6;
+            color: #fff;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer
+        }
+
+        button:hover {
+            background: #2563eb
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px
+        }
+
+        .badge-success {
+            background: #10b98120;
+            color: #10b981
+        }
+
+        .badge-info {
+            background: #3b82f620;
+            color: #3b82f6
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🚀 IPv6 代理管理面板 (v6.5)</h1>
+    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));">
+        <div class="card">
+            <div class="card-title">活跃连接</div>
+            <div class="card-value" id="active">-</div>
+        </div>
+        <div class="card">
+            <div class="card-title">总连接数</div>
+            <div class="card-value" id="total">-</div>
+            <div class="card-sub">QPS: <span id="qps">-</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">连接统计 (成功/失败)</div>
+            <div class="card-value-small" id="success-fail">
+                <span class="success">-</span> / <span class="fail">-</span>
+            </div>
+            <div class="card-sub">超时: <span id="timeout">-</span></div>
+        </div>
+        <div class="card">
+            <div class="card-title">CPU 占用率</div>
+            <div class="card-value" id="cpu-percent">- %</div>
+            <div class="card-sub">进程 CPU 占用</div>
+        </div>
+        <div class="card">
+            <div class="card-title">平均连接耗时</div>
+            <div class="card-value" id="avg-duration">- ms</div>
+            <div class="card-sub">成功连接的平均值</div>
+        </div>
+        <div class="card">
+            <div class="card-title">IPv6 池</div>
+            <div class="card-value" id="pool-size">-</div>
+            <div class="card-sub">目标: <span id="pool-target">-</span></div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="pool-progress"></div>
+            </div>
+        </div>
+    </div>
+    <div class="section">
+        <div class="section-title">📊 IPv6 池管理</div>
+        <div class="input-group">
+            <label>目标池大小:</label>
+            <input type="number" id="new-target" placeholder="100000" min="100" step="1000">
+            <button onclick="resizePool()">应用</button>
+            <span id="pool-status"></span>
+        </div>
+    </div>
+    <div class="section">
+        <div class="section-title">📝 最近连接</div>
+        <table>
+            <thead>
+            <tr>
+                <th>时间</th>
+                <th>客户端</th>
+                <th>目标</th>
+                <th>IPv6</th>
+                <th>状态</th>
+                <th>耗时</th>
+            </tr>
+            </thead>
+            <tbody id="logs-table">
+            <tr>
+                <td colspan="6" style="text-align:center;color:#64748b">等待连接...</td>
+            </tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+<script>
+    function updateStats() {
+        fetch('/api/stats').then(r => r.json()).then(d => {
+            document.getElementById('active').textContent = d.active;
+            document.getElementById('total').textContent = d.total;
+            document.getElementById('qps').textContent = d.qps.toFixed(2);
+            
+            // 更新 连接统计 卡片
+            document.getElementById('success-fail').innerHTML = '<span class="success">' + d.success + '</span> / <span class="fail">' + d.failed + '</span>';
+            document.getElementById('timeout').textContent = d.timeout;
+            
+            // 更新 CPU 卡片
+            document.getElementById('cpu-percent').textContent = d.cpu_percent.toFixed(1) + ' %';
+            
+            // 更新 平均耗时 卡片
+            document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0) + ' ms';
+
+            // 更新 IP 池 卡片
+            document.getElementById('pool-size').textContent = d.pool;
+            document.getElementById('pool-target').textContent = d.target;
+            document.getElementById('pool-progress').style.width = d.progress.toFixed(1) + '%';
+            document.getElementById('pool-status').innerHTML = d.bg_running ? '<span class="badge badge-info">后台运行中</span>' : '<span class="badge badge-success">就绪</span>';
+        })
+    }
+
+    function updateLogs() {
+        fetch('/api/logs').then(r => r.json()).then(logs => {
+            const table = document.getElementById('logs-table');
+            if (!logs || logs.length === 0) return;
+            table.innerHTML = logs.map(log => '<tr><td>' + log.time + '</td><td>' + log.client_ip + '</td><td>' + log.target + '</td><td>' + log.ipv6 + '</td><td class="' + (log.status.includes('✅') ? 'status-success' : log.status.includes('⏱') ? 'status-timeout' : 'status-fail') + '">' + log.status + '</td><td>' + log.duration + '</td></tr>').join('');
+        })
+    }
+
+    function resizePool() {
+        const v = parseInt(document.getElementById('new-target').value);
+        if (!v || v < 100) {
+            alert('请输入有效值 (至少100)');
+            return
+        }
+        fetch('/api/pool/resize', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({target: v})
+        }).then(r => r.json()).then(d => {
+            alert(d.message || d.error);
+            updateStats()
+        })
+    }
+
+    setInterval(updateStats, 3000);
+    setInterval(updateLogs, 5000);
+    updateStats();
+    updateLogs();
+</script>
+</body>
+</html>
+EOF
+
+echo "✅ 源代码和网页文件创建完毕。"
+echo ""
+
+# --- 步骤 4: 编译程序 ---
+echo "--- 步骤 4: 正在编译程序 (可能需要几分钟)... ---"
+# 使用新安装的 Go (v1.21.5)
+/usr/local/go/bin/go mod init ipv6-proxy >/dev/null
+/usr/local/go/bin/go mod tidy >/dev/null
+echo "正在编译，请稍候... (这会下载 gopsutil, netlink, term 等库)"
+CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy .
+echo "✅ 程序 'ipv6-proxy' 编译完毕！"
+echo ""
+
+# --- 步骤 5: 将文件移动到 /opt/ipv6-proxy ---
+echo "--- 步骤 5: 正在将文件安装到 $INSTALL_DIR ... ---"
+mkdir -p "$INSTALL_DIR"
+mv ipv6-proxy "$INSTALL_DIR/"
+mv index.html "$INSTALL_DIR/"
+# 编译完后删除临时目录
+cd /
+rm -rf "$BUILD_DIR"
+echo "✅ 文件已安装到 $INSTALL_DIR"
+echo ""
+
+# --- 步骤 6: 创建 systemd 服务文件 ---
+echo "--- 步骤 6: 正在创建 systemd 服务... ---"
+
+# 注意：这里我们使用了 $INSTALL_DIR 变量
+cat << EOF > /etc/systemd/system/ipv6-proxy.service
 [Unit]
-Description=IPv6 Rotating Proxy
-After=network.target
+Description=IPv6 Proxy Service v6.5 (Gemini)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/ipv6-proxy
-ExecStart=/opt/ipv6-proxy/ipv6-proxy
+Group=root
+
+# 关键：设置正确的工作目录和启动命令
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/ipv6-proxy
+
+# 需要 CAP_NET_ADMIN 权限来修改 IP 地址
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
 Restart=always
 RestartSec=3
-LimitNOFILE=1000000
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
-print_success "服务文件创建完成"
+EOF
 
-# 启动
-print_info "启动服务..."
 systemctl daemon-reload
-systemctl enable ipv6-proxy
-systemctl start ipv6-proxy
-print_success "服务已启动"
-
-sleep 3
-
-# 完成
-echo ""
-echo "========================================="
-print_success "安装完成！"
-echo "========================================="
-echo ""
-echo "📍 代理地址: $IPV4:$PROXY_PORT"
-echo "👤 用户名: $USERNAME"
-echo "🔑 密码: $PASSWORD"
-echo "📊 每IP并发: $MAX_PER_IP"
-$USE_IPV6 && echo "🌐 IPv6池: $IPV6_PREFIX::/64" || echo "⚠️  IPv6: 禁用"
-echo ""
-echo "🧪 测试命令:"
-echo "  curl -x http://$USERNAME:$PASSWORD@$IPV4:$PROXY_PORT http://ipv6.ip.sb"
-echo ""
-echo "📊 监控命令:"
-echo "  curl http://localhost:$METRICS_PORT/metrics"
-echo "  curl http://localhost:$METRICS_PORT/health"
-echo ""
-echo "📝 日志命令:"
-echo "  journalctl -u ipv6-proxy -f"
-echo "  systemctl status ipv6-proxy"
+echo "✅ systemd 服务 'ipv6-proxy.service' 创建完毕。"
 echo ""
 
-print_info "服务状态:"
-systemctl status ipv6-proxy --no-pager -l | head -12
+# --- 步骤 7: 自动引导安装 + 启动 ---
+echo "============================================="
+echo "🎉🎉🎉 恭喜！安装已全部完成！ 🎉🎉🎉"
+echo "============================================="
+echo ""
+echo "您现在需要执行【最后两个步骤】来启动服务："
+echo ""
+echo "1. 【首次配置】(自动引导安装)"
+echo "   脚本现在将自动为您运行首次配置向导。"
+echo "   请回答所有问题 (端口, 密码, 网卡, IP池等)..."
+echo ""
+
+# 自动运行交互式向导
+# 我们用 '|| true' 来防止用户按 Ctrl+C 导致 'set -e' 终止脚本
+sudo $INSTALL_DIR/ipv6-proxy || true
+
+# ^^^^
+# 脚本会在这里暂停，等待用户完成交互式设置。
+# 用户回答完所有问题，看到 "✅ 服务就绪" 后，按 Ctrl+C 退出。
+
+echo ""
+echo "---------------------------------------------"
+echo "✅ 交互式配置完成 (config.json 已生成)。"
+echo "---------------------------------------------"
+echo ""
+echo "2. 【启动后台服务】"
+echo "   现在，我们将为您启动后台服务并设置开机自启："
+echo ""
+
+sudo systemctl enable ipv6-proxy
+sudo systemctl start ipv6-proxy
+
+echo ""
+echo "✅ 服务已在后台启动！"
+echo "您可以使用 'sudo systemctl status ipv6-proxy' 来检查状态。"
+echo "您的 Web 面板 (config.json中配置的) 应该可以访问了。"
+echo ""
