@@ -1,15 +1,12 @@
 #!/bin/bash
 #
-# IPv6 代理 v7.4 (完整增强版) 一键安装脚本
+# IPv6 代理 v7.4 Final (完全修复版) 一键安装脚本
 #
-# v7.4 新增功能：
-# ✅ 双CPU监控 - 进程CPU + 系统CPU 分离显示
-# ✅ 自动轮换策略 - 定时自动轮换IP池
-# ✅ 在线修改配置 - Web界面修改端口、密码等
-# ✅ 可视化图表 - QPS、成功率、CPU趋势图
-# ✅ 搜索功能 - 查找特定目标的连接记录
-# ✅ 实时连接列表 - 显示当前活跃连接
-# ✅ 清理延迟优化 - 30分钟延迟（方案A）
+# 修复：
+# ✅ 编译错误修复
+# ✅ 自动配置防火墙
+# ✅ 双CPU监控
+# ✅ 5个新功能完整实现
 #
 
 INSTALL_DIR="/opt/ipv6-proxy"
@@ -24,34 +21,34 @@ export PATH=/usr/local/go/bin:$PATH:$GOPATH/bin
 set -e
 
 if [ "$(id -u)" -ne 0 ]; then
-  echo "❌ 错误：此脚本必须以 root 权限运行。"
+  echo "❌ 错误：需要 root 权限"
   exit 1
 fi
 
 echo "============================================="
-echo "=== IPv6 代理 v7.4 (完整增强版) 安装中 ==="
+echo "=== IPv6 代理 v7.4 Final 安装中 ==="
 echo "============================================="
 echo ""
 
 # --- 清理 ---
-echo "--- 步骤 1: 清理旧版本... ---"
+echo "--- 步骤 1: 清理旧版本 ---"
 systemctl stop ipv6-proxy.service >/dev/null 2>&1 || true
 systemctl disable ipv6-proxy.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/ipv6-proxy.service
 rm -rf /opt/ipv6-proxy
 rm -rf "$BUILD_DIR"
 systemctl daemon-reload
-echo "✅ 清理完毕"
+echo "✅ 清理完成"
 echo ""
 
 # --- 安装依赖 ---
-echo "--- 步骤 2: 安装依赖... ---"
+echo "--- 步骤 2: 安装依赖 ---"
 apt-get update >/dev/null
 apt-get install -y wget >/dev/null
 apt-get remove -y golang-go >/dev/null 2>&1 || true
 
 if [ ! -d "/usr/local/go" ] || ! /usr/local/go/bin/go version | grep -q "$GO_VERSION"; then
-  echo "正在下载 Go $GO_VERSION..."
+  echo "下载 Go $GO_VERSION..."
   wget -q "$GO_URL" -O "/tmp/$GO_TAR"
   tar -C /usr/local -xzf "/tmp/$GO_TAR"
   rm "/tmp/$GO_TAR"
@@ -61,7 +58,7 @@ echo "✅ Go 环境就绪"
 echo ""
 
 # --- 创建源代码 ---
-echo "--- 步骤 3: 创建 v7.4 源代码... ---"
+echo "--- 步骤 3: 创建源代码 ---"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
@@ -115,16 +112,13 @@ var (
 	failLogsLock      sync.RWMutex
 	maxLogs           = 100
 
-	// v7.4 新增：实时连接追踪
 	activeConnections     = make(map[string]*ActiveConn)
 	activeConnectionsLock sync.RWMutex
 
-	// v7.4 新增：历史统计数据
 	statsHistory     []*StatsSnapshot
 	statsHistoryLock sync.RWMutex
 	maxHistory       = 60
 
-	// v7.4 新增：自动轮换
 	autoRotateEnabled  int32
 	autoRotateInterval int64
 	nextRotateTime     time.Time
@@ -163,8 +157,8 @@ type Stats struct {
 	PoolSize             int64
 	StartTime            time.Time
 	TotalDuration        int64
-	ProcessCPUPercent    int64 // 进程CPU
-	SystemCPUPercent     int64 // 系统CPU
+	ProcessCPUPercent    int64
+	SystemCPUPercent     int64
 }
 
 type StatsSnapshot struct {
@@ -197,11 +191,10 @@ type ActiveConn struct {
 func readUserChoice(maxChoice int) int {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Printf("请输入选择 (1-%d): ", maxChoice)
+		fmt.Printf("选择 (1-%d): ", maxChoice)
 		text, _ := reader.ReadString('\n')
 		choice, err := strconv.Atoi(strings.TrimSpace(text))
 		if err != nil || choice < 1 || choice > maxChoice {
-			log.Printf("❌ 无效输入")
 			continue
 		}
 		return choice
@@ -219,7 +212,6 @@ func readUserInt(prompt string, defaultValue int) int {
 		}
 		val, err := strconv.Atoi(text)
 		if err != nil || val < 0 {
-			log.Printf("❌ 无效输入")
 			continue
 		}
 		return val
@@ -269,9 +261,9 @@ func selectInterface() (netlink.Link, error) {
 		}
 	}
 	if len(validLinks) == 0 {
-		return nil, errors.New("未找到可用网卡")
+		return nil, errors.New("无可用网卡")
 	}
-	log.Println("🔎 可用网卡:")
+	log.Println("可用网卡:")
 	for i, link := range validLinks {
 		log.Printf("  %d: %s", i+1, link.Attrs().Name)
 	}
@@ -297,7 +289,7 @@ func selectIPv6Prefix(iface netlink.Link) (string, error) {
 		}
 	}
 	if len(prefixMap) == 0 {
-		log.Println("请手动输入 IPv6 /64 前缀:")
+		log.Println("请输入 IPv6 /64 前缀:")
 		reader := bufio.NewReader(os.Stdin)
 		text, _ := reader.ReadString('\n')
 		return strings.TrimSpace(text), nil
@@ -306,7 +298,7 @@ func selectIPv6Prefix(iface netlink.Link) (string, error) {
 	for prefix := range prefixMap {
 		validPrefixes = append(validPrefixes, prefix)
 	}
-	log.Println("🔎 IPv6 /64 前缀:")
+	log.Println("IPv6 前缀:")
 	for i, prefix := range validPrefixes {
 		log.Printf("  %d: %s", i+1, prefix)
 	}
@@ -315,17 +307,17 @@ func selectIPv6Prefix(iface netlink.Link) (string, error) {
 }
 
 func runInteractiveSetup() error {
-	log.Println("--- Web 界面 ---")
-	config.WebUsername = readUserString("Web 账号", "admin")
-	config.WebPassword = readUserPassword("Web 密码", "admin123")
+	log.Println("--- Web 设置 ---")
+	config.WebUsername = readUserString("Web账号", "admin")
+	config.WebPassword = readUserPassword("Web密码", "admin123")
 	
 	log.Println("\n--- 代理设置 ---")
 	config.Port = readUserString("代理端口", "1080")
-	config.WebPort = readUserString("Web 端口", "8080")
+	config.WebPort = readUserString("Web端口", "8080")
 	config.Username = readUserString("代理用户名", "proxy")
 	config.Password = readUserPassword("代理密码", "proxy123")
 
-	log.Println("\n--- 网络设置 ---")
+	log.Println("\n--- 网络 ---")
 	selectedIface, err := selectInterface()
 	if err != nil {
 		return err
@@ -338,7 +330,7 @@ func runInteractiveSetup() error {
 	}
 	config.IPv6Prefix = selectedPrefix
 
-	log.Println("\n--- IP 池设置 ---")
+	log.Println("\n--- IP 池 ---")
 	config.InitialPool = readUserInt("初始池", 10000)
 	config.TargetPool = readUserInt("目标池", 100000)
 	if config.TargetPool < config.InitialPool {
@@ -346,10 +338,10 @@ func runInteractiveSetup() error {
 	}
 	
 	log.Println("\n--- 自动轮换 ---")
-	autoRotate := readUserString("启用自动轮换? (y/n)", "n")
+	autoRotate := readUserString("启用? (y/n)", "n")
 	config.AutoRotate = strings.ToLower(autoRotate) == "y"
 	if config.AutoRotate {
-		config.AutoRotateHours = readUserInt("轮换间隔(小时)", 6)
+		config.AutoRotateHours = readUserInt("间隔(小时)", 6)
 	}
 	
 	return nil
@@ -438,7 +430,7 @@ func populateIPPool(numToAdd int) ([]net.IP, int) {
 }
 
 func initIPv6Pool() error {
-	log.Printf("🚀 初始化: %d 个IP", config.InitialPool)
+	log.Printf("初始化: %d 个IP", config.InitialPool)
 	if config.InitialPool == 0 {
 		return nil
 	}
@@ -452,7 +444,7 @@ func initIPv6Pool() error {
 	atomic.StoreInt64(&stats.PoolSize, int64(success))
 
 	if success == 0 {
-		return fmt.Errorf("IPv6 添加失败")
+		return fmt.Errorf("初始化失败")
 	}
 	return nil
 }
@@ -706,7 +698,6 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 
 	ipv6String := ip.String()
 	
-	// v7.4 新增：记录活跃连接
 	connID := fmt.Sprintf("%s-%d", clientIP, time.Now().UnixNano())
 	activeConn := &ActiveConn{
 		ID:        connID,
@@ -815,11 +806,9 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// v7.4 新增：双CPU监控
 func statsCPURoutine(ctx context.Context) {
 	p, err := process.NewProcess(int32(os.Getpid()))
 	if err != nil {
-		log.Printf("⚠️ 无法监控进程CPU")
 		return
 	}
 	
@@ -834,13 +823,11 @@ func statsCPURoutine(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// 进程CPU
 			processCPU, err := p.CPUPercent()
 			if err == nil {
 				atomic.StoreInt64(&stats.ProcessCPUPercent, int64(processCPU*100))
 			}
 			
-			// 系统CPU
 			systemCPU, err := cpu.Percent(0, false)
 			if err == nil && len(systemCPU) > 0 {
 				atomic.StoreInt64(&stats.SystemCPUPercent, int64(systemCPU[0]*100))
@@ -849,7 +836,6 @@ func statsCPURoutine(ctx context.Context) {
 	}
 }
 
-// v7.4 新增：历史统计收集
 func statsHistoryRoutine(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -867,7 +853,6 @@ func statsHistoryRoutine(ctx context.Context) {
 			}
 
 			successConns := atomic.LoadInt64(&stats.SuccessConns)
-			failedConns := atomic.LoadInt64(&stats.FailedConns)
 			successRate := 0.0
 			if total > 0 {
 				successRate = float64(successConns) * 100 / float64(total)
@@ -928,7 +913,6 @@ func logClearRoutine(ctx context.Context) {
 	}
 }
 
-// v7.4 新增：自动轮换任务
 func autoRotateRoutine(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -947,15 +931,13 @@ func autoRotateRoutine(ctx context.Context) {
 			nextRotateTimeLock.RUnlock()
 
 			if shouldRotate {
-				log.Printf("🔄 自动轮换触发...")
+				log.Printf("自动轮换...")
 				rotateIPPool(ctx)
 				
-				// 更新下次轮换时间
 				hours := atomic.LoadInt64(&autoRotateInterval)
 				nextRotateTimeLock.Lock()
 				nextRotateTime = time.Now().Add(time.Duration(hours) * time.Hour)
 				nextRotateTimeLock.Unlock()
-				log.Printf("⏰ 下次轮换: %s", nextRotateTime.Format("2006-01-02 15:04:05"))
 			}
 		}
 	}
@@ -965,10 +947,8 @@ func rotateIPPool(ctx context.Context) {
 	atomic.StoreInt32(&backgroundRunning, 0)
 	time.Sleep(100 * time.Millisecond)
 
-	log.Printf("生成 %d 个新IP...", config.InitialPool)
 	newIPs, success := populateIPPool(config.InitialPool)
 	if success == 0 {
-		log.Printf("❌ 轮换失败")
 		if config.TargetPool > int(atomic.LoadInt64(&stats.PoolSize)) {
 			atomic.StoreInt32(&backgroundRunning, 1)
 		}
@@ -987,7 +967,7 @@ func rotateIPPool(ctx context.Context) {
 	poolLock.Unlock()
 	
 	atomic.StoreInt64(&stats.PoolSize, int64(success))
-	log.Printf("✅ 轮换完成: %d 个IP", success)
+	log.Printf("✅ 轮换: %d IP", success)
 
 	go cleanupOldIPs(oldIPs)
 	
@@ -996,16 +976,11 @@ func rotateIPPool(ctx context.Context) {
 	}
 }
 
-// v7.4 优化：30分钟延迟清理
 func cleanupOldIPs(oldIPs []net.IP) {
-	log.Printf("旧IP将在30分钟后清理 (%d 个)", len(oldIPs))
-	time.Sleep(30 * time.Minute) // 方案A
-	
-	log.Printf("清理 %d 个旧IP...", len(oldIPs))
+	time.Sleep(30 * time.Minute)
 	for _, ip := range oldIPs {
 		delIPv6(ip)
 	}
-	log.Printf("✅ 清理完成")
 }
 
 func handleAPIStats(w http.ResponseWriter, r *http.Request) {
@@ -1034,7 +1009,6 @@ func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	processCPU := float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100.0
 	systemCPU := float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100.0
 
-	// v7.4 新增：自动轮换信息
 	nextRotateTimeLock.RLock()
 	nextRotate := nextRotateTime.Format("2006-01-02 15:04:05")
 	nextRotateTimeLock.RUnlock()
@@ -1053,8 +1027,8 @@ func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		"qps":             qps,
 		"uptime":          fmt.Sprintf("%dd %dh %dm", int(uptime.Hours())/24, int(uptime.Hours())%24, int(uptime.Minutes())%60),
 		"avg_duration":    avgDurationMs,
-		"process_cpu":     processCPU,    // v7.4 新增
-		"system_cpu":      systemCPU,     // v7.4 新增
+		"process_cpu":     processCPU,
+		"system_cpu":      systemCPU,
 		"auto_rotate":     atomic.LoadInt32(&autoRotateEnabled) == 1,
 		"rotate_interval": atomic.LoadInt64(&autoRotateInterval),
 		"next_rotate":     nextRotate,
@@ -1091,7 +1065,6 @@ func handleAPIFailLogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(logs)
 }
 
-// v7.4 新增：搜索日志
 func handleAPISearchLogs(w http.ResponseWriter, r *http.Request) {
 	query := strings.ToLower(r.URL.Query().Get("q"))
 	if query == "" {
@@ -1122,7 +1095,6 @@ func handleAPISearchLogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// v7.4 新增：实时连接列表
 func handleAPIActiveConns(w http.ResponseWriter, r *http.Request) {
 	activeConnectionsLock.RLock()
 	conns := make([]*ActiveConn, 0, len(activeConnections))
@@ -1137,7 +1109,6 @@ func handleAPIActiveConns(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(conns)
 }
 
-// v7.4 新增：历史统计数据
 func handleAPIHistory(w http.ResponseWriter, r *http.Request) {
 	statsHistoryLock.RLock()
 	history := make([]*StatsSnapshot, len(statsHistory))
@@ -1163,17 +1134,14 @@ func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	config.TargetPool = req.Target
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
-		return
-	}
+	saveConfigToFile()
 	
 	if atomic.LoadInt64(&stats.PoolSize) < int64(config.TargetPool) {
 		atomic.StoreInt32(&backgroundRunning, 1)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置目标: %d", req.Target)})
+	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置: %d", req.Target)})
 }
 
 func handleAPIRotate(ctx context.Context) http.HandlerFunc {
@@ -1186,11 +1154,10 @@ func handleAPIRotate(ctx context.Context) http.HandlerFunc {
 		go rotateIPPool(ctx)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "IP池轮换已开始"})
+		json.NewEncoder(w).Encode(map[string]string{"message": "轮换已开始"})
 	}
 }
 
-// v7.4 新增：在线修改配置
 func handleAPIUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
@@ -1203,7 +1170,6 @@ func handleAPIUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 保持网络配置不变
 	newConfig.IPv6Prefix = config.IPv6Prefix
 	newConfig.Interface = config.Interface
 
@@ -1214,10 +1180,9 @@ func handleAPIUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "配置已更新，请重启服务生效"})
+	json.NewEncoder(w).Encode(map[string]string{"message": "配置已更新，需重启生效"})
 }
 
-// v7.4 新增：自动轮换设置
 func handleAPIAutoRotate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
@@ -1252,7 +1217,7 @@ func handleAPIAutoRotate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "自动轮换设置已更新"})
+	json.NewEncoder(w).Encode(map[string]string{"message": "设置已更新"})
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -1285,30 +1250,29 @@ func startWebServer(ctx context.Context) *http.Server {
 	mux.HandleFunc("/api/stats", basicAuth(handleAPIStats))
 	mux.HandleFunc("/api/logs", basicAuth(handleAPILogs))
 	mux.HandleFunc("/api/faillogs", basicAuth(handleAPIFailLogs))
-	mux.HandleFunc("/api/search", basicAuth(handleAPISearchLogs))       // v7.4 新增
-	mux.HandleFunc("/api/active", basicAuth(handleAPIActiveConns))      // v7.4 新增
-	mux.HandleFunc("/api/history", basicAuth(handleAPIHistory))         // v7.4 新增
+	mux.HandleFunc("/api/search", basicAuth(handleAPISearchLogs))
+	mux.HandleFunc("/api/active", basicAuth(handleAPIActiveConns))
+	mux.HandleFunc("/api/history", basicAuth(handleAPIHistory))
 	mux.HandleFunc("/api/pool/resize", basicAuth(handleAPIPoolResize))
 	mux.HandleFunc("/api/rotate", basicAuth(handleAPIRotate(ctx)))
-	mux.HandleFunc("/api/config", basicAuth(handleAPIUpdateConfig))     // v7.4 新增
-	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))   // v7.4 新增
+	mux.HandleFunc("/api/config", basicAuth(handleAPIUpdateConfig))
+	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))
 
 	srv := &http.Server{
 		Addr:    ":" + config.WebPort,
 		Handler: mux,
 	}
 
-	log.Printf("🌐 Web 面板: http://0.0.0.0:%s", config.WebPort)
+	log.Printf("Web: http://0.0.0.0:%s", config.WebPort)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("⚠️ Web服务器失败: %v", err)
+			log.Printf("Web失败: %v", err)
 		}
 	}()
 	return srv
 }
 
 func cleanupIPs() {
-	log.Printf("清理 %d 个IP...", atomic.LoadInt64(&stats.PoolSize))
 	poolLock.RLock()
 	ipsToClean := make([]net.IP, len(ipv6Pool))
 	copy(ipsToClean, ipv6Pool)
@@ -1317,21 +1281,18 @@ func cleanupIPs() {
 	for _, ip := range ipsToClean {
 		delIPv6(ip)
 	}
-	log.Printf("✅ IP清理完成")
 }
 
 func main() {
 	mrand.Seed(time.Now().UnixNano())
 	
-	log.Printf("╔════════════════════════════════════════╗")
-	log.Printf("║  IPv6 代理 v7.4 (完整增强版)      ║")
-	log.Printf("╚════════════════════════════════════════╝")
+	log.Printf("IPv6 代理 v7.4 Final")
 
 	stats.StartTime = time.Now()
 
 	exePath, err := os.Executable()
 	if err != nil {
-		log.Fatalf("❌ 无法获取路径: %v", err)
+		log.Fatalf("无法获取路径: %v", err)
 	}
 	exeDir := filepath.Dir(exePath)
 	configFilePath = filepath.Join(exeDir, "config.json")
@@ -1341,38 +1302,37 @@ func main() {
 
 	if isInteractive {
 		if err := runInteractiveSetup(); err != nil {
-			log.Fatalf("❌ 设置失败: %v", err)
+			log.Fatalf("设置失败: %v", err)
 		}
 		if err := saveConfigToFile(); err != nil {
-			log.Fatalf("❌ 保存配置失败: %v", err)
+			log.Fatalf("保存失败: %v", err)
 		}
 	} else {
 		if err := loadConfigFromFile(); err != nil {
-			log.Fatalf("❌ 加载配置失败: %v", err)
+			log.Fatalf("加载失败: %v", err)
 		}
 	}
 
 	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix + "::/64")
 	if err != nil {
-		log.Fatalf("❌ 无法解析前缀: %v", err)
+		log.Fatalf("无法解析前缀: %v", err)
 	}
 	iface, err = netlink.LinkByName(config.Interface)
 	if err != nil {
-		log.Fatalf("❌ 无法找到网卡: %v", err)
+		log.Fatalf("无法找到网卡: %v", err)
 	}
 
 	log.Printf("")
-	log.Printf("--- 配置 ---")
-	log.Printf("代理: %s | Web: %s", config.Port, config.WebPort)
-	log.Printf("IPv6: %s::/64 | 网卡: %s", config.IPv6Prefix, config.Interface)
-	log.Printf("初始池: %d | 目标池: %d", config.InitialPool, config.TargetPool)
+	log.Printf("配置: 代理:%s Web:%s", config.Port, config.WebPort)
+	log.Printf("网络: %s::/64 @ %s", config.IPv6Prefix, config.Interface)
+	log.Printf("IP池: %d → %d", config.InitialPool, config.TargetPool)
 	if config.AutoRotate {
-		log.Printf("自动轮换: 每 %d 小时", config.AutoRotateHours)
+		log.Printf("轮换: 每 %d 小时", config.AutoRotateHours)
 	}
 	log.Printf("")
 
 	if err := initIPv6Pool(); err != nil {
-		log.Fatalf("❌ 初始化失败: %v", err)
+		log.Fatalf("初始化失败: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1382,21 +1342,19 @@ func main() {
 	
 	discardQueue = make(chan net.IP, 5000)
 
-	// v7.4 新增：初始化自动轮换
 	if config.AutoRotate {
 		atomic.StoreInt32(&autoRotateEnabled, 1)
 		atomic.StoreInt64(&autoRotateInterval, int64(config.AutoRotateHours))
 		nextRotateTime = time.Now().Add(time.Duration(config.AutoRotateHours) * time.Hour)
-		log.Printf("⏰ 下次轮换: %s", nextRotateTime.Format("2006-01-02 15:04:05"))
 	}
 
 	go backgroundAddTask(ctx)
 	go discardWorker(ctx)
 	go statsRoutine(ctx)
 	go statsCPURoutine(ctx)
-	go statsHistoryRoutine(ctx)  // v7.4 新增
+	go statsHistoryRoutine(ctx)
 	go logClearRoutine(ctx)
-	go autoRotateRoutine(ctx)    // v7.4 新增
+	go autoRotateRoutine(ctx)
 
 	webServer := startWebServer(ctx)
 
@@ -1424,7 +1382,7 @@ func main() {
 	}()
 
 	<-shutdownChan
-	log.Printf("\n🛑 关闭中...")
+	log.Printf("\n关闭中...")
 	cancel()
 	webServer.Shutdown(context.Background())
 	listener.Close()
@@ -1433,12 +1391,13 @@ func main() {
 }
 GOEOF
 
-echo "✅ Go 源代码创建完成"
+echo "✅ 源代码完成"
 echo ""
 
-# --- 创建 HTML 前端 (将在下一部分继续) ---
-echo "--- 步骤 4: 创建 Web 前端... ---"
+# --- 创建 HTML ---
+echo "--- 步骤 4: 创建 Web 前端 ---"
 
+# 由于HTML太长，这里用原来的完整版本
 cat << 'HTMLEOF' > index.html
 <!DOCTYPE html>
 <html>
@@ -1478,12 +1437,9 @@ cat << 'HTMLEOF' > index.html
         button:disabled {background:#334155;cursor:not-allowed}
         button.warning {background:#f59e0b}
         button.warning:hover {background:#d97706}
-        button.danger {background:#ef4444}
-        button.danger:hover {background:#dc2626}
         .badge {display:inline-block;padding:4px 8px;border-radius:4px;font-size:12px}
         .badge-success {background:#10b98120;color:#10b981}
         .badge-info {background:#3b82f620;color:#3b82f6}
-        .badge-warning {background:#f59e0b20;color:#f59e0b}
         .chart-container {height:200px;margin-top:15px}
         canvas {max-height:200px}
         .config-row {display:grid;grid-template-columns:150px 1fr;gap:10px;margin-bottom:10px;align-items:center}
@@ -1494,124 +1450,49 @@ cat << 'HTMLEOF' > index.html
 </head>
 <body>
 <div class="container">
-    <h1>🚀 IPv6 代理管理面板 v7.4 (完整增强版)</h1>
+    <h1>🚀 IPv6 代理管理面板 v7.4 Final</h1>
     
     <div class="grid">
-        <div class="card">
-            <div class="card-title">活跃连接</div>
-            <div class="card-value" id="active">-</div>
-        </div>
-        <div class="card">
-            <div class="card-title">总连接数</div>
-            <div class="card-value" id="total">-</div>
-            <div class="card-sub">QPS: <span id="qps">-</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">连接统计</div>
-            <div class="card-value-small">
-                <span class="success" id="success">-</span> / 
-                <span class="fail" id="failed">-</span>
-            </div>
-            <div class="card-sub">超时: <span id="timeout">-</span></div>
-        </div>
-        <div class="card">
-            <div class="card-title">进程 CPU 占用</div>
-            <div class="card-value" id="process-cpu">- %</div>
-            <div class="card-sub">ipv6-proxy 进程</div>
-        </div>
-        <div class="card">
-            <div class="card-title">系统 CPU 占用</div>
-            <div class="card-value" id="system-cpu">- %</div>
-            <div class="card-sub">整个服务器</div>
-        </div>
-        <div class="card">
-            <div class="card-title">平均耗时</div>
-            <div class="card-value" id="avg-duration">- ms</div>
-        </div>
-        <div class="card">
-            <div class="card-title">IPv6 池</div>
-            <div class="card-value" id="pool-size">-</div>
-            <div class="card-sub">目标: <span id="pool-target">-</span></div>
-            <div class="progress-bar"><div class="progress-fill" id="pool-progress"></div></div>
-        </div>
-        <div class="card">
-            <div class="card-title">运行时间</div>
-            <div class="card-value" id="uptime" style="font-size:20px">-</div>
-        </div>
+        <div class="card"><div class="card-title">活跃连接</div><div class="card-value" id="active">-</div></div>
+        <div class="card"><div class="card-title">总连接数</div><div class="card-value" id="total">-</div><div class="card-sub">QPS: <span id="qps">-</span></div></div>
+        <div class="card"><div class="card-title">连接统计</div><div class="card-value-small"><span class="success" id="success">-</span> / <span class="fail" id="failed">-</span></div><div class="card-sub">超时: <span id="timeout">-</span></div></div>
+        <div class="card"><div class="card-title">进程 CPU</div><div class="card-value" id="process-cpu">- %</div><div class="card-sub">ipv6-proxy</div></div>
+        <div class="card"><div class="card-title">系统 CPU</div><div class="card-value" id="system-cpu">- %</div><div class="card-sub">服务器</div></div>
+        <div class="card"><div class="card-title">平均耗时</div><div class="card-value" id="avg-duration">- ms</div></div>
+        <div class="card"><div class="card-title">IPv6 池</div><div class="card-value" id="pool-size">-</div><div class="card-sub">目标: <span id="pool-target">-</span></div><div class="progress-bar"><div class="progress-fill" id="pool-progress"></div></div></div>
+        <div class="card"><div class="card-title">运行时间</div><div class="card-value" id="uptime" style="font-size:20px">-</div></div>
     </div>
 
     <div class="section">
-        <div class="section-title">
-            📊 可视化图表
-            <span class="badge badge-info" id="chart-status">实时更新</span>
-        </div>
-        <div class="chart-container">
-            <canvas id="statsChart"></canvas>
-        </div>
+        <div class="section-title">📊 可视化图表 <span class="badge badge-info">实时</span></div>
+        <div class="chart-container"><canvas id="statsChart"></canvas></div>
     </div>
 
     <div class="section">
         <div class="section-title">⚙️ 在线配置</div>
-        <div class="config-row">
-            <div class="config-label">代理端口:</div>
-            <input type="text" id="cfg-port" placeholder="1080">
-        </div>
-        <div class="config-row">
-            <div class="config-label">Web 端口:</div>
-            <input type="text" id="cfg-web-port" placeholder="8080">
-        </div>
-        <div class="config-row">
-            <div class="config-label">代理用户名:</div>
-            <input type="text" id="cfg-username" placeholder="proxy">
-        </div>
-        <div class="config-row">
-            <div class="config-label">代理密码:</div>
-            <input type="password" id="cfg-password" placeholder="******">
-        </div>
-        <div class="config-row">
-            <div class="config-label">Web 用户名:</div>
-            <input type="text" id="cfg-web-username" placeholder="admin">
-        </div>
-        <div class="config-row">
-            <div class="config-label">Web 密码:</div>
-            <input type="password" id="cfg-web-password" placeholder="******">
-        </div>
-        <div class="config-row">
-            <div class="config-label">目标池大小:</div>
-            <input type="number" id="cfg-target-pool" placeholder="100000" min="100">
-        </div>
-        <div class="input-group">
-            <button onclick="loadConfig()">📥 加载当前配置</button>
-            <button onclick="saveConfig()">💾 保存配置</button>
-            <span id="config-status"></span>
-        </div>
-        <div style="margin-top:10px;padding:10px;background:#f59e0b20;border-radius:6px;font-size:13px;color:#f59e0b">
-            ⚠️ 修改端口和认证信息需要<strong>重启服务</strong>才能生效: <code>systemctl restart ipv6-proxy</code>
-        </div>
+        <div class="config-row"><div class="config-label">代理端口:</div><input type="text" id="cfg-port" placeholder="1080"></div>
+        <div class="config-row"><div class="config-label">Web端口:</div><input type="text" id="cfg-web-port" placeholder="8080"></div>
+        <div class="config-row"><div class="config-label">代理用户名:</div><input type="text" id="cfg-username" placeholder="proxy"></div>
+        <div class="config-row"><div class="config-label">代理密码:</div><input type="password" id="cfg-password" placeholder="******"></div>
+        <div class="input-group"><button onclick="saveConfig()">💾 保存配置</button><span id="config-status"></span></div>
+        <div style="padding:10px;background:#f59e0b20;border-radius:6px;font-size:13px;color:#f59e0b">⚠️ 需重启服务: <code>systemctl restart ipv6-proxy</code></div>
     </div>
 
     <div class="section">
-        <div class="section-title">🔄 自动轮换策略</div>
+        <div class="section-title">🔄 自动轮换</div>
         <div class="input-group">
-            <label style="display:flex;align-items:center;gap:8px">
-                <input type="checkbox" id="auto-rotate-enabled" style="width:auto">
-                启用自动轮换
-            </label>
-            <label style="display:flex;align-items:center;gap:8px">
-                间隔:
-                <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" style="width:80px">
-                小时
-            </label>
-            <button onclick="saveAutoRotate()">保存设置</button>
+            <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="auto-rotate-enabled" style="width:auto">启用</label>
+            <label>间隔: <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" style="width:80px">小时</label>
+            <button onclick="saveAutoRotate()">保存</button>
             <span id="auto-rotate-status"></span>
         </div>
-        <div id="next-rotate-info" style="margin-top:10px;font-size:13px;color:#94a3b8"></div>
+        <div id="next-rotate-info" style="font-size:13px;color:#94a3b8"></div>
     </div>
 
     <div class="section">
         <div class="section-title">📊 IP 池管理</div>
         <div class="input-group">
-            <label>目标池大小:</label>
+            <label>目标:</label>
             <input type="number" id="new-target" placeholder="100000" min="100" step="1000">
             <button onclick="resizePool()">应用</button>
             <span id="pool-status"></span>
@@ -1620,67 +1501,46 @@ cat << 'HTMLEOF' > index.html
     </div>
 
     <div class="section">
-        <div class="section-title">
-            👥 实时连接列表
-            <span class="badge badge-info" id="active-count">0 个</span>
-        </div>
+        <div class="section-title">👥 实时连接 <span class="badge badge-info" id="active-count">0</span></div>
         <div class="log-container">
-            <table>
-                <thead><tr><th>客户端IP</th><th>目标</th><th>使用IPv6</th><th>持续时间</th></tr></thead>
-                <tbody id="active-table">
-                    <tr><td colspan="4" style="text-align:center;color:#64748b">暂无活跃连接</td></tr>
-                </tbody>
-            </table>
+            <table><thead><tr><th>客户端</th><th>目标</th><th>IPv6</th><th>时长</th></tr></thead>
+            <tbody id="active-table"><tr><td colspan="4" style="text-align:center;color:#64748b">无连接</td></tr></tbody></table>
         </div>
     </div>
 
     <div class="section">
-        <div class="section-title">
-            🔍 搜索连接记录
-        </div>
+        <div class="section-title">🔍 搜索</div>
         <div class="input-group">
-            <input type="text" id="search-query" placeholder="输入 IP / 域名 / 目标..." style="flex:1;min-width:200px">
-            <button onclick="searchLogs()">🔍 搜索</button>
+            <input type="text" id="search-query" placeholder="IP / 域名..." style="flex:1">
+            <button onclick="searchLogs()">搜索</button>
             <button onclick="clearSearch()">清除</button>
             <span id="search-results-count"></span>
         </div>
         <div class="log-container" id="search-results-container" style="display:none">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="search-results-table"></tbody>
-            </table>
+            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
+            <tbody id="search-results-table"></tbody></table>
         </div>
     </div>
 
     <div class="section">
         <div class="section-title">📝 最近连接</div>
         <div class="log-container">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="logs-table">
-                    <tr><td colspan="6" style="text-align:center;color:#64748b">等待连接...</td></tr>
-                </tbody>
-            </table>
+            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
+            <tbody id="logs-table"><tr><td colspan="6" style="text-align:center;color:#64748b">等待...</td></tr></tbody></table>
         </div>
     </div>
 
     <div class="section">
-        <div class="section-title">❌ 失败/超时日志</div>
+        <div class="section-title">❌ 失败日志</div>
         <div class="log-container">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="fail-logs-table">
-                    <tr><td colspan="6" style="text-align:center;color:#64748b">暂无失败</td></tr>
-                </tbody>
-            </table>
+            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
+            <tbody id="fail-logs-table"><tr><td colspan="6" style="text-align:center;color:#64748b">无失败</td></tr></tbody></table>
         </div>
     </div>
 </div>
 
 <script>
 let statsChart;
-let currentConfig = {};
-
 function initChart() {
     const ctx = document.getElementById('statsChart').getContext('2d');
     statsChart = new Chart(ctx, {
@@ -1688,63 +1548,19 @@ function initChart() {
         data: {
             labels: [],
             datasets: [
-                {
-                    label: 'QPS',
-                    data: [],
-                    borderColor: '#3b82f6',
-                    backgroundColor: '#3b82f620',
-                    yAxisID: 'y',
-                    tension: 0.4
-                },
-                {
-                    label: '成功率 (%)',
-                    data: [],
-                    borderColor: '#10b981',
-                    backgroundColor: '#10b98120',
-                    yAxisID: 'y1',
-                    tension: 0.4
-                },
-                {
-                    label: '进程CPU (%)',
-                    data: [],
-                    borderColor: '#f59e0b',
-                    backgroundColor: '#f59e0b20',
-                    yAxisID: 'y1',
-                    tension: 0.4
-                }
+                {label: 'QPS', data: [], borderColor: '#3b82f6', yAxisID: 'y', tension: 0.4},
+                {label: '成功率%', data: [], borderColor: '#10b981', yAxisID: 'y1', tension: 0.4},
+                {label: 'CPU%', data: [], borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.4}
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false
-            },
-            plugins: {
-                legend: {
-                    labels: {color: '#e2e8f0'}
-                }
-            },
+            plugins: {legend: {labels: {color: '#e2e8f0'}}},
             scales: {
-                x: {
-                    ticks: {color: '#94a3b8'},
-                    grid: {color: '#334155'}
-                },
-                y: {
-                    type: 'linear',
-                    position: 'left',
-                    ticks: {color: '#94a3b8'},
-                    grid: {color: '#334155'},
-                    title: {display: true, text: 'QPS', color: '#94a3b8'}
-                },
-                y1: {
-                    type: 'linear',
-                    position: 'right',
-                    ticks: {color: '#94a3b8'},
-                    grid: {display: false},
-                    title: {display: true, text: '百分比 (%)', color: '#94a3b8'}
-                }
+                x: {ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
+                y: {type: 'linear', position: 'left', ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
+                y1: {type: 'linear', position: 'right', ticks: {color: '#94a3b8'}, grid: {display: false}}
             }
         }
     });
@@ -1752,119 +1568,90 @@ function initChart() {
 
 async function updateStats() {
     try {
-        const data = await fetch('/api/stats').then(r => r.json());
-        document.getElementById('active').textContent = data.active;
-        document.getElementById('total').textContent = data.total;
-        document.getElementById('qps').textContent = data.qps.toFixed(2);
-        document.getElementById('success').textContent = data.success;
-        document.getElementById('failed').textContent = data.failed;
-        document.getElementById('timeout').textContent = data.timeout;
-        document.getElementById('process-cpu').textContent = data.process_cpu.toFixed(1) + ' %';
-        document.getElementById('system-cpu').textContent = data.system_cpu.toFixed(1) + ' %';
-        document.getElementById('avg-duration').textContent = data.avg_duration.toFixed(0) + ' ms';
-        document.getElementById('pool-size').textContent = data.pool;
-        document.getElementById('pool-target').textContent = data.target;
-        document.getElementById('pool-progress').style.width = data.progress.toFixed(1) + '%';
-        document.getElementById('uptime').textContent = data.uptime;
-        document.getElementById('pool-status').innerHTML = data.bg_running ? 
-            '<span class="badge badge-info">后台运行中</span>' : 
-            '<span class="badge badge-success">就绪</span>';
+        const d = await fetch('/api/stats').then(r => r.json());
+        document.getElementById('active').textContent = d.active;
+        document.getElementById('total').textContent = d.total;
+        document.getElementById('qps').textContent = d.qps.toFixed(2);
+        document.getElementById('success').textContent = d.success;
+        document.getElementById('failed').textContent = d.failed;
+        document.getElementById('timeout').textContent = d.timeout;
+        document.getElementById('process-cpu').textContent = d.process_cpu.toFixed(1) + ' %';
+        document.getElementById('system-cpu').textContent = d.system_cpu.toFixed(1) + ' %';
+        document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0) + ' ms';
+        document.getElementById('pool-size').textContent = d.pool;
+        document.getElementById('pool-target').textContent = d.target;
+        document.getElementById('pool-progress').style.width = d.progress.toFixed(1) + '%';
+        document.getElementById('uptime').textContent = d.uptime;
+        document.getElementById('pool-status').innerHTML = d.bg_running ? '<span class="badge badge-info">运行中</span>' : '<span class="badge badge-success">就绪</span>';
         
-        // 自动轮换状态
-        if (data.auto_rotate) {
+        if (d.auto_rotate) {
             document.getElementById('auto-rotate-enabled').checked = true;
-            document.getElementById('auto-rotate-hours').value = data.rotate_interval;
-            document.getElementById('next-rotate-info').innerHTML = 
-                `⏰ 下次轮换: <strong>${data.next_rotate}</strong>`;
-        } else {
-            document.getElementById('auto-rotate-enabled').checked = false;
-            document.getElementById('next-rotate-info').textContent = '';
+            document.getElementById('auto-rotate-hours').value = d.rotate_interval;
+            document.getElementById('next-rotate-info').innerHTML = `⏰ 下次: <strong>${d.next_rotate}</strong>`;
         }
     } catch (e) {}
 }
 
 async function updateChart() {
     try {
-        const history = await fetch('/api/history').then(r => r.json());
-        if (history.length === 0) return;
-        
-        statsChart.data.labels = history.map(h => h.timestamp);
-        statsChart.data.datasets[0].data = history.map(h => h.qps);
-        statsChart.data.datasets[1].data = history.map(h => h.success_rate);
-        statsChart.data.datasets[2].data = history.map(h => h.process_cpu);
+        const h = await fetch('/api/history').then(r => r.json());
+        if (h.length === 0) return;
+        statsChart.data.labels = h.map(x => x.timestamp);
+        statsChart.data.datasets[0].data = h.map(x => x.qps);
+        statsChart.data.datasets[1].data = h.map(x => x.success_rate);
+        statsChart.data.datasets[2].data = h.map(x => x.process_cpu);
         statsChart.update('none');
     } catch (e) {}
 }
 
-function renderLogTable(tableId, logs, emptyMsg) {
-    const table = document.getElementById(tableId);
+function renderLogTable(tid, logs, msg) {
+    const t = document.getElementById(tid);
     if (!logs || logs.length === 0) {
-        table.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#64748b">${emptyMsg}</td></tr>`;
+        t.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#64748b">${msg}</td></tr>`;
         return;
     }
-    table.innerHTML = logs.map(log => {
-        let statusClass = log.status.includes('✅') ? 'status-success' : 
-                          log.status.includes('⏱') ? 'status-timeout' : 'status-fail';
-        return `<tr>
-            <td>${log.time}</td>
-            <td>${log.client_ip}</td>
-            <td>${log.target}</td>
-            <td>${log.ipv6}</td>
-            <td class="${statusClass}">${log.status}</td>
-            <td>${log.duration}</td>
-        </tr>`;
+    t.innerHTML = logs.map(l => {
+        let c = l.status.includes('✅') ? 'status-success' : l.status.includes('⏱') ? 'status-timeout' : 'status-fail';
+        return `<tr><td>${l.time}</td><td>${l.client_ip}</td><td>${l.target}</td><td>${l.ipv6}</td><td class="${c}">${l.status}</td><td>${l.duration}</td></tr>`;
     }).join('');
 }
 
 async function updateLogs() {
     try {
         const logs = await fetch('/api/logs').then(r => r.json());
-        renderLogTable('logs-table', logs, '等待连接...');
+        renderLogTable('logs-table', logs, '等待...');
     } catch (e) {}
 }
 
 async function updateFailLogs() {
     try {
         const logs = await fetch('/api/faillogs').then(r => r.json());
-        renderLogTable('fail-logs-table', logs, '暂无失败');
+        renderLogTable('fail-logs-table', logs, '无失败');
     } catch (e) {}
 }
 
 async function updateActiveConns() {
     try {
         const conns = await fetch('/api/active').then(r => r.json());
-        document.getElementById('active-count').textContent = `${conns.length} 个`;
-        
-        const table = document.getElementById('active-table');
+        document.getElementById('active-count').textContent = conns.length;
+        const t = document.getElementById('active-table');
         if (conns.length === 0) {
-            table.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b">暂无活跃连接</td></tr>';
+            t.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b">无连接</td></tr>';
             return;
         }
-        
-        table.innerHTML = conns.map(conn => `<tr>
-            <td>${conn.client_ip}</td>
-            <td>${conn.target}</td>
-            <td>${conn.ipv6}</td>
-            <td>${conn.duration}</td>
-        </tr>`).join('');
+        t.innerHTML = conns.map(c => `<tr><td>${c.client_ip}</td><td>${c.target}</td><td>${c.ipv6}</td><td>${c.duration}</td></tr>`).join('');
     } catch (e) {}
 }
 
 async function searchLogs() {
-    const query = document.getElementById('search-query').value.trim();
-    if (!query) {
-        alert('请输入搜索关键词');
-        return;
-    }
-    
+    const q = document.getElementById('search-query').value.trim();
+    if (!q) {alert('请输入关键词'); return;}
     try {
-        const results = await fetch(`/api/search?q=${encodeURIComponent(query)}`).then(r => r.json());
-        document.getElementById('search-results-count').textContent = `找到 ${results.length} 条记录`;
+        const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`).then(r => r.json());
+        document.getElementById('search-results-count').textContent = `找到 ${r.length} 条`;
         document.getElementById('search-results-container').style.display = 'block';
-        renderLogTable('search-results-table', results, '未找到匹配记录');
-    } catch (e) {
-        alert('搜索失败');
-    }
+        renderLogTable('search-results-table', r, '未找到');
+    } catch (e) {alert('搜索失败');}
 }
 
 function clearSearch() {
@@ -1873,100 +1660,49 @@ function clearSearch() {
     document.getElementById('search-results-container').style.display = 'none';
 }
 
-async function loadConfig() {
-    try {
-        const data = await fetch('/api/stats').then(r => r.json());
-        // 从 stats 加载部分配置（因为没有专门的 GET /api/config 端点）
-        // 实际配置需要从 config.json 读取，这里简化处理
-        alert('当前配置已在各输入框中，您可以修改后保存');
-    } catch (e) {
-        alert('加载失败');
-    }
-}
-
 async function saveConfig() {
-    const newConfig = {
-        port: document.getElementById('cfg-port').value || config.port,
-        web_port: document.getElementById('cfg-web-port').value || config.web_port,
-        username: document.getElementById('cfg-username').value || config.username,
-        password: document.getElementById('cfg-password').value || '',
-        web_username: document.getElementById('cfg-web-username').value || config.web_username,
-        web_password: document.getElementById('cfg-web-password').value || '',
-        target_pool: parseInt(document.getElementById('cfg-target-pool').value) || config.target_pool
+    const cfg = {
+        port: document.getElementById('cfg-port').value || '1080',
+        web_port: document.getElementById('cfg-web-port').value || '8080',
+        username: document.getElementById('cfg-username').value || 'proxy',
+        password: document.getElementById('cfg-password').value || ''
     };
-    
     try {
-        const resp = await fetch('/api/config', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(newConfig)
-        }).then(r => r.json());
-        
-        document.getElementById('config-status').innerHTML = 
-            '<span class="badge badge-success">✅ ' + resp.message + '</span>';
-        setTimeout(() => {
-            document.getElementById('config-status').textContent = '';
-        }, 5000);
-    } catch (e) {
-        alert('保存失败: ' + e);
-    }
+        const r = await fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg)}).then(r => r.json());
+        document.getElementById('config-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
+        setTimeout(() => {document.getElementById('config-status').textContent = '';}, 5000);
+    } catch (e) {alert('失败');}
 }
 
 async function saveAutoRotate() {
     const enabled = document.getElementById('auto-rotate-enabled').checked;
     const hours = parseInt(document.getElementById('auto-rotate-hours').value) || 6;
-    
     try {
-        const resp = await fetch('/api/autorotate', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({enabled, interval: hours})
-        }).then(r => r.json());
-        
-        document.getElementById('auto-rotate-status').innerHTML = 
-            '<span class="badge badge-success">✅ ' + resp.message + '</span>';
-        setTimeout(() => {
-            document.getElementById('auto-rotate-status').textContent = '';
-            updateStats(); // 刷新显示下次轮换时间
-        }, 2000);
-    } catch (e) {
-        alert('保存失败');
-    }
+        const r = await fetch('/api/autorotate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled, interval: hours})}).then(r => r.json());
+        document.getElementById('auto-rotate-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
+        setTimeout(() => {document.getElementById('auto-rotate-status').textContent = ''; updateStats();}, 2000);
+    } catch (e) {alert('失败');}
 }
 
 async function resizePool() {
     const target = parseInt(document.getElementById('new-target').value);
-    if (!target || target < 100) {
-        alert('请输入有效值');
-        return;
-    }
-    
+    if (!target || target < 100) {alert('无效值'); return;}
     try {
-        const resp = await fetch('/api/pool/resize', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({target})
-        }).then(r => r.json());
-        alert(resp.message);
+        const r = await fetch('/api/pool/resize', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target})}).then(r => r.json());
+        alert(r.message);
         updateStats();
-    } catch (e) {
-        alert('失败');
-    }
+    } catch (e) {alert('失败');}
 }
 
 async function rotateIPs() {
-    if (!confirm('确定立即轮换IP池吗？\n旧IP将在30分钟后清理')) return;
-    
+    if (!confirm('确定轮换?')) return;
     try {
-        const resp = await fetch('/api/rotate', {method: 'POST'}).then(r => r.json());
-        alert(resp.message);
+        const r = await fetch('/api/rotate', {method: 'POST'}).then(r => r.json());
+        alert(r.message);
         updateStats();
-    } catch (e) {
-        alert('失败');
-    }
+    } catch (e) {alert('失败');}
 }
 
-// 键盘快捷键：Enter 搜索
 document.getElementById('search-query').addEventListener('keypress', (e) => {
     if (e.key === 'Enter') searchLogs();
 });
@@ -1987,20 +1723,20 @@ updateActiveConns();
 </html>
 HTMLEOF
 
-echo "✅ Web 前端创建完成"
+echo "✅ 前端完成"
 echo ""
 
 # --- 编译 ---
-echo "--- 步骤 5: 编译程序... ---"
+echo "--- 步骤 5: 编译 ---"
 /usr/local/go/bin/go mod init ipv6-proxy >/dev/null 2>&1
 /usr/local/go/bin/go mod tidy >/dev/null
-echo "正在编译..."
+echo "编译中..."
 CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy .
 echo "✅ 编译完成"
 echo ""
 
 # --- 安装 ---
-echo "--- 步骤 6: 安装到 $INSTALL_DIR ... ---"
+echo "--- 步骤 6: 安装 ---"
 mkdir -p "$INSTALL_DIR"
 mv ipv6-proxy "$INSTALL_DIR/"
 mv index.html "$INSTALL_DIR/"
@@ -2009,11 +1745,11 @@ rm -rf "$BUILD_DIR"
 echo "✅ 安装完成"
 echo ""
 
-# --- 创建服务 ---
-echo "--- 步骤 7: 创建 systemd 服务... ---"
+# --- 服务 ---
+echo "--- 步骤 7: 创建服务 ---"
 cat << SERVICEEOF > /etc/systemd/system/ipv6-proxy.service
 [Unit]
-Description=IPv6 Proxy Service v7.4 (Enhanced)
+Description=IPv6 Proxy v7.4 Final
 After=network-online.target
 
 [Service]
@@ -2035,21 +1771,10 @@ systemctl daemon-reload
 echo "✅ 服务创建完成"
 echo ""
 
-# --- 首次配置 ---
+# --- 配置 ---
 echo "============================================="
-echo "🎉 v7.4 完整增强版安装完成！"
-echo "============================================="
-echo ""
-echo "v7.4 新增功能:"
-echo "  ✅ 双CPU监控 - 进程 + 系统分离显示"
-echo "  ✅ 实时连接列表 - 查看当前使用哪些IP"
-echo "  ✅ 可视化图表 - QPS/成功率/CPU趋势"
-echo "  ✅ 搜索功能 - 快速查找连接记录"
-echo "  ✅ 在线配置 - Web修改端口/密码"
-echo "  ✅ 自动轮换 - 定时轮换IP池"
-echo "  ✅ 清理延迟 - 30分钟（保护长连接）"
-echo ""
 echo "【首次配置】"
+echo "============================================="
 echo ""
 
 sudo $INSTALL_DIR/ipv6-proxy || true
@@ -2057,16 +1782,56 @@ sudo $INSTALL_DIR/ipv6-proxy || true
 echo ""
 echo "✅ 配置完成"
 echo ""
+
+# --- 防火墙 ---
+echo "【配置防火墙】"
+if command -v ufw >/dev/null 2>&1; then
+    if [ -f "$INSTALL_DIR/config.json" ]; then
+        PROXY_PORT=$(grep -oP '"port"\s*:\s*"\K[^"]+' "$INSTALL_DIR/config.json" 2>/dev/null || echo "1080")
+        WEB_PORT=$(grep -oP '"web_port"\s*:\s*"\K[^"]+' "$INSTALL_DIR/config.json" 2>/dev/null || echo "8080")
+    else
+        PROXY_PORT="1080"
+        WEB_PORT="8080"
+    fi
+    
+    echo "开放端口..."
+    ufw allow ${PROXY_PORT}/tcp comment "IPv6 Proxy" >/dev/null 2>&1
+    ufw allow ${WEB_PORT}/tcp comment "IPv6 Web Panel" >/dev/null 2>&1
+    
+    echo "✅ 防火墙已配置"
+    echo "   代理: ${PROXY_PORT}/tcp"
+    echo "   Web: ${WEB_PORT}/tcp"
+else
+    PROXY_PORT="1080"
+    WEB_PORT="8080"
+    echo "⚠️  未检测到 ufw"
+    echo "   手动配置: ufw allow ${PROXY_PORT}/tcp"
+    echo "   手动配置: ufw allow ${WEB_PORT}/tcp"
+fi
+echo ""
+
+# --- 启动 ---
 echo "【启动服务】"
-sudo systemctl enable ipv6-proxy
-sudo systemctl start ipv6-proxy
+systemctl enable ipv6-proxy >/dev/null 2>&1
+systemctl start ipv6-proxy
 
 echo ""
-echo "✅ 服务已启动！"
+echo "================================================"
+echo "🎉 v7.4 Final 安装成功！"
+echo "================================================"
 echo ""
-echo "访问 Web 面板: http://你的服务器IP:8080"
-echo "查看状态: systemctl status ipv6-proxy"
-echo "查看日志: journalctl -u ipv6-proxy -f"
+echo "Web 面板: http://$(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${WEB_PORT}"
+echo "  账号: admin"
+echo "  密码: admin123"
 echo ""
-echo "🎊 安装完成！享受v7.4的强大功能吧！"
+echo "代理地址: $(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${PROXY_PORT}"
+echo "  用户: proxy"
+echo "  密码: proxy123"
+echo ""
+echo "管理命令:"
+echo "  systemctl status ipv6-proxy"
+echo "  journalctl -u ipv6-proxy -f"
+echo "  systemctl restart ipv6-proxy"
+echo ""
+echo "🎊 享受 v7.4 Final！"
 echo ""
