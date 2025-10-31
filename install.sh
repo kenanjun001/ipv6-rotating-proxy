@@ -1,8 +1,9 @@
 #!/bin/bash
 #
-# IPv6 代理 (v6.5) 一键安装脚本
-# 自动清理、安装正确的 Go 1.21.5、修复 index.html CWD 错误、
-# 新增 12h 日志清理 & 24h IP 轮换、
+# IPv6 代理 (v7.2 - 终极版) 一键安装脚本
+# 自动清理、安装正确的 Go 1.21.5、
+# 修复：后台任务不重启的致命 Bug
+# 新增：Web 登录、超时 IP 自动丢弃、失败日志、自动清理 IP、Web 界面换 IP、手机端适配
 # 编译、安装到 /opt/ipv6-proxy，并自动引导配置和启动。
 #
 
@@ -29,7 +30,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "============================================="
-echo "=== IPv6 代理 (v6.5) 正在开始安装... ==="
+echo "=== IPv6 代理 (v7.2 - 终极版) 正在开始安装... ==="
 echo "============================================="
 echo "安装目录: $INSTALL_DIR"
 echo ""
@@ -75,12 +76,12 @@ echo "✅ Go 环境已就绪。 (`go version`)"
 /usr/local/go/bin/go version # 验证版本
 echo ""
 
-# --- 步骤 3: 创建项目文件 (v6.5 代码) ---
-echo "--- 步骤 3: 正在创建 v6.5 源代码到 $BUILD_DIR ... ---"
+# --- 步骤 3: 创建项目文件 (v7.2 代码) ---
+echo "--- 步骤 3: 正在创建 v7.2 源代码到 $BUILD_DIR ... ---"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# 创建 main.go (v6.5 - 修复 CWD 和 io.File, 新增 12h/24h 任务)
+# 创建 main.go (v7.2 - 终极版)
 cat << 'EOF' > main.go
 package main
 
@@ -88,6 +89,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json" // 用于 config.json
@@ -99,12 +101,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"     // 新增：用于 "systemctl stop" 清理
 	"path/filepath" // 用于获取可执行文件路径
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
+	"syscall" // 新增：用于 "systemctl stop" 清理
 	"time"
 
 	"github.com/shirou/gopsutil/v3/process" // 用于获取 CPU
@@ -117,11 +120,16 @@ var (
 	stats             Stats
 	ipv6Pool          []net.IP
 	poolLock          sync.RWMutex
-	backgroundRunning int32
+	backgroundRunning int32 // 0 = 暂停, 1 = 运行
 	backgroundAdded   int64
 	connLogs          []*ConnLog
 	connLogsLock      sync.RWMutex
-	maxLogs           = 100
+	failLogs          []*ConnLog // 新增：失败日志
+	failLogsLock      sync.RWMutex
+	maxLogs           = 100 // 每个日志列表的最大条数
+
+	// 新增：用于自动丢弃 IP 的通道
+	discardQueue chan net.IP
 
 	// 网络相关缓存
 	iface     netlink.Link
@@ -130,14 +138,15 @@ var (
 
 	// 配置文件路径
 	configFilePath string
-    // !!! 修复 CWD 错误：存储 index.html 的路径
-    indexHTMLPath string
+	indexHTMLPath  string
 )
 
 // JSON 标签，用于保存到 config.json
 type Config struct {
 	Port        string `json:"port"`
 	WebPort     string `json:"web_port"`
+	WebUsername string `json:"web_username"` // 新增
+	WebPassword string `json:"web_password"` // 新增
 	Username    string `json:"username"`
 	Password    string `json:"password"`
 	IPv6Prefix  string `json:"ipv6_prefix"`
@@ -309,11 +318,15 @@ func selectIPv6Prefix(iface netlink.Link) (string, error) {
 
 // 运行交互式设置向导
 func runInteractiveSetup() error {
-	log.Println("--- 基础设置 ---")
+	log.Println("--- 基础设置 (Web 界面) ---")
+	config.WebUsername = readUserString("请输入 Web 界面登录账号", "admin")
+	config.WebPassword = readUserPassword("请输入 Web 界面登录密码", "admin123")
+	
+	log.Println("\n--- 基础设置 (代理) ---")
 	config.Port = readUserString("请输入代理端口", "1080")
 	config.WebPort = readUserString("请输入 Web 面板端口", "8080")
 	config.Username = readUserString("请输入代理用户名", "proxy")
-	config.Password = readUserPassword("请输入代理密码", "proxy")
+	config.Password = readUserPassword("请输入代理密码", "proxy123")
 	log.Printf("✅ 基础配置完成")
 
 	log.Println("")
@@ -379,6 +392,18 @@ func generateRandomIP() net.IP {
 	return ip
 }
 
+// 新增：从 IP 池中删除一个 IP
+func delIPv6(ip net.IP) {
+	addr, _ := netlink.ParseAddr(ip.String() + "/128")
+	err := netlink.AddrDel(iface, addr)
+	if err != nil {
+		// 在高并发删除时，"no such address" 是正常错误，忽略
+		if !strings.Contains(err.Error(), "no such address") {
+			log.Printf("⚠️ 删除 IP %s 失败: %v", ip.String(), err)
+		}
+	}
+}
+
 func addIPv6(ip net.IP) error {
 	addr, _ := netlink.ParseAddr(ip.String() + "/128")
 	return netlink.AddrAdd(iface, addr)
@@ -393,12 +418,24 @@ func addConnLog(clientIP, target, ipv6, status string, duration time.Duration) {
 		Status:   status,
 		Duration: fmt.Sprintf("%.2fs", duration.Seconds()),
 	}
+	
+	// 添加到“最近连接”
 	connLogsLock.Lock()
 	if len(connLogs) >= maxLogs {
 		connLogs = connLogs[1:]
 	}
 	connLogs = append(connLogs, connLog)
 	connLogsLock.Unlock()
+	
+	// 新增：如果失败/超时，也添加到“失败日志”
+	if !strings.Contains(status, "✅") {
+		 failLogsLock.Lock()
+		 if len(failLogs) >= maxLogs {
+			 failLogs = failLogs[1:]
+		 }
+		 failLogs = append(failLogs, connLog)
+		 failLogsLock.Unlock()
+	}
 }
 
 // 内部函数：添加 IP，带进度
@@ -414,12 +451,17 @@ func populateIPPool(numToAdd int) ([]net.IP, int) {
 			success++
 		}
 
-		if (i+1)%100 == 0 || (i+1) == numToAdd {
+		// 进度条只在交互模式下显示
+		if term.IsTerminal(int(syscall.Stdin)) && ((i+1)%100 == 0 || (i+1) == numToAdd) {
 			percent := float64(i+1) / float64(numToAdd) * 100
 			fmt.Printf("\r   进度: %d/%d (%.0f%%) ", i+1, numToAdd, percent)
 		}
 	}
-	fmt.Println()
+	// 只有在交互模式下才需要换行
+	if term.IsTerminal(int(syscall.Stdin)) && numToAdd > 0 {
+		fmt.Println()
+	}
+
 	duration := time.Since(startTime)
 	log.Printf("✅ 添加了 %d 个 IP (耗时: %.2fs)", success, duration.Seconds())
 	return newIPs, success
@@ -433,11 +475,11 @@ func initIPv6Pool() error {
 	}
 
 	newIPs, success := populateIPPool(config.InitialPool)
-	
+
 	poolLock.Lock()
 	ipv6Pool = newIPs
 	poolLock.Unlock()
-	
+
 	atomic.StoreInt64(&stats.PoolSize, int64(success))
 
 	if success == 0 {
@@ -446,45 +488,97 @@ func initIPv6Pool() error {
 	return nil
 }
 
-func backgroundAddTask() {
-	defer atomic.StoreInt32(&backgroundRunning, 0)
-	
-	// 确保我们只在需要时运行
-	if config.TargetPool <= config.InitialPool {
-		log.Printf("ℹ️ 目标池不大于初始池，后台添加任务跳过。")
-		return
-	}
-	
-	log.Printf("🔄 后台任务: 添加到目标池 %d", config.TargetPool)
-	
-	// 死循环，直到被 stop (backgroundRunning=0) 或达到目标
+// ！！！v7.2 修复版 - 永久运行的后台任务！！！
+func backgroundAddTask(ctx context.Context) {
+	log.Printf("🔄 后台任务: 启动...")
+
 	for {
-		if atomic.LoadInt32(&backgroundRunning) == 0 {
-			log.Printf("ℹ️ 后台任务被停止。")
-			break 
-		}
+		select {
+		case <-ctx.Done(): // 监听停止信号
+			log.Printf("ℹ️ 后台添加任务被停止。")
+			return
+		default:
+			// 检查是否需要工作
+			if atomic.LoadInt32(&backgroundRunning) == 0 {
+				// --- We are inactive ---
+				// 慢速轮询，等待被激活
+				time.Sleep(1 * time.Second)
+				continue // Continue the for loop
+			}
 
-		currentSize := int(atomic.LoadInt64(&stats.PoolSize))
-		if currentSize >= config.TargetPool {
-			log.Printf("✅ 后台完成: %d 个", currentSize)
-			break // 达到目标
-		}
+			// --- We are active! ---
+			currentSize := int(atomic.LoadInt64(&stats.PoolSize))
+			currentTarget := config.TargetPool // 关键：在循环内部读取当前目标
 
-		ip := generateRandomIP()
-		if addIPv6(ip) == nil {
-			poolLock.Lock()
-			ipv6Pool = append(ipv6Pool, ip)
-			poolLock.Unlock()
-			atomic.AddInt64(&stats.PoolSize, 1)
-			atomic.AddInt64(&backgroundAdded, 1)
-		}
+			if currentSize >= currentTarget {
+				// 达到了目标
+				log.Printf("✅ 后台完成: %d 个 (目标 %d), 暂停任务。", currentSize, currentTarget)
+				atomic.StoreInt32(&backgroundRunning, 0) // 标记为非运行
+				time.Sleep(1 * time.Second) // Go back to sleeping
+				continue                    // Continue the for loop
+			}
 
-		if atomic.LoadInt64(&backgroundAdded)%10000 == 0 {
-			log.Printf("📈 后台进度: %d/%d", atomic.LoadInt64(&stats.PoolSize), config.TargetPool)
+			// --- 需要工作 ---
+			ip := generateRandomIP()
+			if addIPv6(ip) == nil {
+				poolLock.Lock()
+				ipv6Pool = append(ipv6Pool, ip)
+				poolLock.Unlock()
+				atomic.AddInt64(&stats.PoolSize, 1)
+				atomic.AddInt64(&backgroundAdded, 1)
+			}
+
+			if atomic.LoadInt64(&backgroundAdded)%10000 == 0 {
+				log.Printf("📈 后台进度: %d/%d", atomic.LoadInt64(&stats.PoolSize), currentTarget)
+			}
+
+			// 快速添加
+			time.Sleep(1 * time.Millisecond)
 		}
-		time.Sleep(1 * time.Millisecond)
 	}
 }
+
+
+// 新增：自动丢弃 IP 的后台工作
+func discardWorker(ctx context.Context) {
+	log.Printf("ℹ️ IP 自动丢弃服务已启动。")
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("ℹ️ IP 自动丢弃服务已停止。")
+			return
+		case ipToDiscard := <-discardQueue:
+			// 1. 从网卡删除
+			delIPv6(ipToDiscard)
+			
+			// 2. 从池中删除
+			poolLock.Lock()
+			found := -1
+			for i, ip := range ipv6Pool {
+				if ip.Equal(ipToDiscard) {
+					found = i
+					break
+				}
+			}
+			if found != -1 {
+				// 高效删除
+				ipv6Pool[found] = ipv6Pool[len(ipv6Pool)-1]
+				ipv6Pool = ipv6Pool[:len(ipv6Pool)-1]
+			}
+			poolLock.Unlock()
+
+			if found != -1 {
+				atomic.AddInt64(&stats.PoolSize, -1)
+				log.Printf("DISCARD: 丢弃 %s, 池大小: %d", ipToDiscard.String(), atomic.LoadInt64(&stats.PoolSize))
+				// 激活后台任务进行补充
+				if config.TargetPool > int(atomic.LoadInt64(&stats.PoolSize)) {
+					atomic.StoreInt32(&backgroundRunning, 1)
+				}
+			}
+		}
+	}
+}
+
 
 func getRandomIP() net.IP {
 	poolLock.RLock()
@@ -643,7 +737,7 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 
 	ip := getRandomIP()
 	if ip == nil {
-		addConnLog(clientIP, target, "N/A", "❌ 无IP", time.Since(startTime))
+		addConnLog(clientIP, target, "N/A", "❌ 无可用IP", time.Since(startTime))
 		if isSocks {
 			clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
 		} else {
@@ -655,21 +749,34 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 
 	ipv6String := ip.String()
 	localAddr := &net.TCPAddr{IP: ip}
+	// 优化：连接超时 5s，总上下文 10s
 	dialer := &net.Dialer{
 		LocalAddr: localAddr,
-		Timeout:   15 * time.Second,
+		Timeout:   5 * time.Second, // 优化：更快的连接超时
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // 优化：总超时
 	defer cancel()
 
 	remoteConn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
-		status := "❌ 失败"
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			status = "⏱️ 超时"
+		// 新增：更详细的超时日志
+		var status string
+		if errors.Is(err, context.DeadlineExceeded) {
+			status = "⏱️ 总体超时 (10s)" // 10s 总超时
 			atomic.AddInt64(&stats.TimeoutConns, 1)
+		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			status = "⏱️ 连接超时 (5s)" // 5s 连接超时
+			atomic.AddInt64(&stats.TimeoutConns, 1)
+		} else {
+			// 新增：显示详细错误
+			errMsg := err.Error()
+			if len(errMsg) > 50 { // 截断过长的错误
+				errMsg = errMsg[:50]
+			}
+			status = fmt.Sprintf("❌ %s", errMsg)
 		}
+		
 		addConnLog(clientIP, target, ipv6String, status, time.Since(startTime))
 		if isSocks {
 			clientConn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
@@ -677,6 +784,15 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"))
 		}
 		atomic.AddInt64(&stats.FailedConns, 1)
+		
+		// 新增：自动丢弃 IP
+		select {
+		case discardQueue <- ip:
+			// 成功放入队列
+		default:
+			log.Printf("⚠️ 丢弃队列已满，暂时无法丢弃 %s", ipv6String)
+		}
+		
 		return
 	}
 	defer remoteConn.Close()
@@ -725,87 +841,124 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func statsCPURoutine() {
-	time.Sleep(3 * time.Second)
-
+func statsCPURoutine(ctx context.Context) {
 	p, err := process.NewProcess(int32(os.Getpid()))
 	if err != nil {
 		log.Printf("⚠️ 无法获取当前进程 (pid: %d) 来监控 CPU: %v", os.Getpid(), err)
 		return
 	}
+	
+	// 第一次调用返回 0，先调用一次
+	_, _ = p.CPUPercent() 
+	time.Sleep(3 * time.Second)
+
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		percent, err := p.CPUPercent()
-		if err == nil {
-			atomic.StoreInt64(&stats.CurrentCPUPercent, int64(percent*100))
+	for {
+		select {
+		case <-ctx.Done():
+			return // 停止
+		case <-ticker.C:
+			percent, err := p.CPUPercent()
+			if err == nil {
+				atomic.StoreInt64(&stats.CurrentCPUPercent, int64(percent*100))
+			}
 		}
 	}
 }
 
-func statsRoutine() {
+func statsRoutine(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		log.Printf("📊 活跃:%d 总计:%d 成功:%d 失败:%d 超时:%d 池:%d",
-			atomic.LoadInt64(&stats.ActiveConns),
-			atomic.LoadInt64(&stats.TotalConns),
-			atomic.LoadInt64(&stats.SuccessConns),
-			atomic.LoadInt64(&stats.FailedConns),
-			atomic.LoadInt64(&stats.TimeoutConns),
-			atomic.LoadInt64(&stats.PoolSize))
+	for {
+		select {
+		case <-ctx.Done():
+			return // 停止
+		case <-ticker.C:
+			log.Printf("📊 活跃:%d 总计:%d 成功:%d 失败:%d 超时:%d 池:%d",
+				atomic.LoadInt64(&stats.ActiveConns),
+				atomic.LoadInt64(&stats.TotalConns),
+				atomic.LoadInt64(&stats.SuccessConns),
+				atomic.LoadInt64(&stats.FailedConns),
+				atomic.LoadInt64(&stats.TimeoutConns),
+				atomic.LoadInt64(&stats.PoolSize))
+		}
 	}
 }
 
-// 新增：12 小时日志清理
-func logClearRoutine() {
+// 12 小时日志清理
+func logClearRoutine(ctx context.Context) {
 	ticker := time.NewTicker(12 * time.Hour)
 	defer ticker.Stop()
-	for range ticker.C {
-		log.Printf("🧹 正在执行 12 小时日志自动清理...")
-		connLogsLock.Lock()
-		connLogs = []*ConnLog{}
-		connLogsLock.Unlock()
-		log.Printf("✅ 12 小时日志已自动清理")
+	for {
+		select {
+		case <-ctx.Done():
+			return // 停止
+		case <-ticker.C:
+			log.Printf("🧹 正在执行 12 小时日志自动清理...")
+			connLogsLock.Lock()
+			connLogs = []*ConnLog{}
+			connLogsLock.Unlock()
+			failLogsLock.Lock()
+			failLogs = []*ConnLog{}
+			failLogsLock.Unlock()
+			log.Printf("✅ 12 小时日志已自动清理")
+		}
 	}
 }
 
-// 新增：24 小时 IP 池轮换
-func ipRotationRoutine() {
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
-	for range ticker.C {
-		log.Printf("🔄 正在执行 24 小时 IP 池轮换 (安全模式)...")
-		
-		// 1. 停止后台任务（如果它在运行）
-		atomic.StoreInt32(&backgroundRunning, 0)
-		time.Sleep(1 * time.Second) // 等待任务退出
+// 新增：安全轮换 IP 池的实现 (Web 触发)
+func rotateIPPool(ctx context.Context) {
+	log.Printf("🔄 [Web] 收到 IP 池轮换请求...")
+	
+	// 1. 停止后台任务（如果它在运行）
+	atomic.StoreInt32(&backgroundRunning, 0)
+	time.Sleep(100 * time.Millisecond) // 等待任务退出
 
-		// 2. 准备新池 (使用 InitialPool 大小)
-		log.Printf("   ...正在生成 %d 个新 IP...", config.InitialPool)
-		newIPs, success := populateIPPool(config.InitialPool)
-		if success == 0 {
-			log.Printf("❌ 24 小时轮换失败：无法添加任何新 IP。")
-			continue // 跳过此次轮换
-		}
-
-		// 3. 安全替换
-		poolLock.Lock()
-		ipv6Pool = newIPs
-		poolLock.Unlock()
-		
-		atomic.StoreInt64(&stats.PoolSize, int64(success))
-		log.Printf("✅ IP 池轮换完毕。新池中有 %d 个 IP。", success)
-		
-		// 4. 重启后台任务（如果需要）
-		if config.TargetPool > success {
+	// 2. 准备新池 (使用 InitialPool 大小)
+	log.Printf("   ...正在生成 %d 个新 IP...", config.InitialPool)
+	newIPs, success := populateIPPool(config.InitialPool)
+	if success == 0 {
+		log.Printf("❌ IP 轮换失败：无法添加任何新 IP。")
+		// 重启旧的后台任务
+		if config.TargetPool > int(atomic.LoadInt64(&stats.PoolSize)) {
 			atomic.StoreInt32(&backgroundRunning, 1)
-			go backgroundAddTask()
-			log.Printf("   ...已重启后台任务以填充到 %d。", config.TargetPool)
 		}
+		return
 	}
+	
+	// 3. 备份旧池以便稍后清理
+	poolLock.Lock()
+	oldIPs := ipv6Pool
+	// 4. 安全替换
+	ipv6Pool = newIPs
+	poolLock.Unlock()
+	
+	atomic.StoreInt64(&stats.PoolSize, int64(success))
+	log.Printf("✅ IP 池轮换完毕。新池中有 %d 个 IP。", success)
+
+	// 5. 启动一个 goroutine 在 5 分钟后清理旧 IP
+	go cleanupOldIPs(oldIPs)
+	
+	// 6. 重启后台任务（如果需要）
+	if config.TargetPool > success {
+		atomic.StoreInt32(&backgroundRunning, 1)
+	}
+}
+
+// 新增：清理旧 IP 池的函数
+func cleanupOldIPs(oldIPs []net.IP) {
+	log.Printf("ℹ️ 旧 IP 池 (%d 个) 将在 5 分钟后被清理，以等待现有连接结束...", len(oldIPs))
+	time.Sleep(5 * time.Minute)
+	
+	log.Printf("🧹 正在清理 %d 个旧 IP...", len(oldIPs))
+	startTime := time.Now()
+	for _, ip := range oldIPs {
+		delIPv6(ip)
+	}
+	log.Printf("✅ 旧 IP 池清理完毕 (耗时: %.2fs)", time.Since(startTime).Seconds())
 }
 
 
@@ -869,6 +1022,22 @@ func handleAPILogs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(logs)
 }
 
+// 新增：失败日志 API
+func handleAPIFailLogs(w http.ResponseWriter, r *http.Request) {
+	failLogsLock.RLock()
+	logs := make([]*ConnLog, len(failLogs))
+	copy(logs, failLogs)
+	failLogsLock.RUnlock()
+
+	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
+		logs[i], logs[j] = logs[j], logs[i]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
+
 func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Target int `json:"target"`
@@ -885,14 +1054,30 @@ func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
 
 	config.TargetPool = req.Target
 	log.Printf("🎯 调整目标池: %d", req.Target)
-
-	if atomic.LoadInt32(&backgroundRunning) == 0 && atomic.LoadInt64(&stats.PoolSize) < int64(req.Target) {
+	
+	// 激活后台任务
+	if atomic.LoadInt64(&stats.PoolSize) < int64(config.TargetPool) {
 		atomic.StoreInt32(&backgroundRunning, 1)
-		go backgroundAddTask()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置目标: %d", req.Target)})
+}
+
+// 新增：Web 界面 IP 轮换的 API
+func handleAPIRotate(ctx context.Context) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, `{"error":"仅支持 POST"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// 在 goroutine 中执行轮换，立即返回响应
+		go rotateIPPool(ctx)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"message": "IP 池轮换已开始..."})
+	}
 }
 
 // 修复 CWD 错误：使用 indexHTMLPath
@@ -907,22 +1092,68 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(html)
 }
 
-func startWebServer() {
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/api/stats", handleAPIStats)
-	http.HandleFunc("/api/logs", handleAPILogs)
-	http.HandleFunc("/api/pool/resize", handleAPIPoolResize)
+// 新增：Web UI 认证中间件
+func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		// 使用 constant time compare 避免时序攻击
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(config.WebUsername)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(config.WebPassword)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte("Unauthorized.\n"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+
+func startWebServer(ctx context.Context) *http.Server {
+	mux := http.NewServeMux()
+	// 新增：为所有路由启用 Basic Auth
+	mux.HandleFunc("/", basicAuth(handleIndex))
+	mux.HandleFunc("/api/stats", basicAuth(handleAPIStats))
+	mux.HandleFunc("/api/logs", basicAuth(handleAPILogs))
+	mux.HandleFunc("/api/faillogs", basicAuth(handleAPIFailLogs)) // 新增
+	mux.HandleFunc("/api/pool/resize", basicAuth(handleAPIPoolResize))
+	mux.HandleFunc("/api/rotate", basicAuth(handleAPIRotate(ctx)))
+
+	srv := &http.Server{
+		Addr:    ":" + config.WebPort,
+		Handler: mux,
+	}
+
 	log.Printf("🌐 Web 面板: http://0.0.0.0:%s", config.WebPort)
 	go func() {
-		if err := http.ListenAndServe(":"+config.WebPort, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("⚠️ Web 服务器启动失败: %v", err)
 		}
 	}()
+	return srv
 }
+
+// 新增：优雅关机时清理所有 IP
+func cleanupIPs() {
+	log.Printf("🧹 正在清理 %d 个已添加的 IP...", atomic.LoadInt64(&stats.PoolSize))
+	startTime := time.Now()
+	
+	poolLock.RLock()
+	// 复制切片以快速释放锁
+	ipsToClean := make([]net.IP, len(ipv6Pool))
+	copy(ipsToClean, ipv6Pool)
+	poolLock.RUnlock()
+
+	for _, ip := range ipsToClean {
+		delIPv6(ip)
+	}
+	
+	log.Printf("✅ 所有 IP 清理完毕 (耗时: %.2fs)", time.Since(startTime).Seconds())
+}
+
 
 func main() {
 	log.Printf("╔════════════════════════════════════════════╗")
-	log.Printf("║  IPv6 代理 + Web 面板 v6.5 (终极版)  ║")
+	log.Printf("║  IPv6 代理 + Web 面板 v7.1 (终极版)  ║")
 	log.Printf("╚════════════════════════════════════════════╝")
 	log.Printf("")
 
@@ -934,7 +1165,6 @@ func main() {
 	}
 	exeDir := filepath.Dir(exePath)
 
-	// 修复 CWD 错误：设置 config 和 index 的绝对路径
 	configFilePath = filepath.Join(exeDir, "config.json")
 	indexHTMLPath = filepath.Join(exeDir, "index.html")
 
@@ -970,8 +1200,9 @@ func main() {
 
 	log.Printf("")
 	log.Printf("--- 最终配置 ---")
-	log.Printf("代理: %s | Web: %s", config.Port, config.WebPort)
-	log.Printf("用户: %s | 密码: [已隐藏]", config.Username)
+	log.Printf("代理端口: %s | Web 端口: %s", config.Port, config.WebPort)
+	log.Printf("代理用户: %s | 密码: [已隐藏]", config.Username)
+	log.Printf("Web 用户: %s | 密码: [已隐藏]", config.WebUsername)
 	log.Printf("IPv6: %s::/64 | 网卡: %s", config.IPv6Prefix, config.Interface)
 	log.Printf("初始池: %d | 目标池: %d", config.InitialPool, config.TargetPool)
 	log.Printf("------------------")
@@ -981,42 +1212,80 @@ func main() {
 		log.Fatalf("❌ 初始化失败: %v", err)
 	}
 
-	// 启动所有后台任务
-	atomic.StoreInt32(&backgroundRunning, 1) // 允许后台任务运行
-	go backgroundAddTask() // 启动 IP 池填充任务
-	go statsRoutine()
-	go statsCPURoutine() // 启动 CPU 监控
-	go logClearRoutine() // 启动 12h 日志清理
-	go ipRotationRoutine() // 启动 24h IP 轮换
-	startWebServer()
+	// --- 启动所有后台服务 ---
+	ctx, cancel := context.WithCancel(context.Background())
+	atomic.StoreInt32(&backgroundRunning, 1) // 默认允许后台任务运行
+	
+	// 初始化丢弃队列
+	discardQueue = make(chan net.IP, 1000)
+
+	go backgroundAddTask(ctx) // 启动 IP 池填充任务
+	go discardWorker(ctx)     // 启动 IP 自动丢弃任务
+	go statsRoutine(ctx)
+	go statsCPURoutine(ctx)
+	go logClearRoutine(ctx)   // 启动 12h 日志清理
+
+	webServer := startWebServer(ctx)
 
 	listener, err := net.Listen("tcp", ":"+config.Port)
 	if err != nil {
 		log.Fatalf("监听失败: %v", err)
 	}
-	defer listener.Close()
 
 	log.Printf("✅ 服务就绪")
 	log.Printf("")
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Accept 失败: %v", err)
-			continue
+	// --- 优雅关机处理 ---
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// 启动主连接循环
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				// 检查是否是由于 listener.Close() 导致的错误
+				if strings.Contains(err.Error(), "use of closed network connection") {
+					break // 正常退出
+				}
+				log.Printf("Accept 失败: %v", err)
+				continue
+			}
+			go handleConnection(conn)
 		}
-		go handleConnection(conn)
+	}()
+
+	// 等待关闭信号
+	<-shutdownChan
+	log.Printf("\n🛑 收到关闭信号... 正在优雅退出...")
+
+	// 1. 停止所有后台任务
+	cancel()
+	atomic.StoreInt32(&backgroundRunning, 0)
+	
+	// 2. 停止 Web 服务器
+	if err := webServer.Shutdown(context.Background()); err != nil {
+		log.Printf("⚠️ Web 服务器关闭失败: %v", err)
 	}
+	
+	// 3. 停止主监听器
+	listener.Close()
+	
+	// 4. 清理所有 IP
+	cleanupIPs()
+
+	log.Printf("✅ 已成功关闭。")
 }
 EOF
 
-# 创建 index.html (v6.2)
+# 创建 index.html (v7.1 - 新增“轮换IP”按钮和“失败日志”)
 cat << 'EOF' > index.html
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <title>IPv6 代理管理面板</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * {
             margin: 0;
@@ -1025,10 +1294,10 @@ cat << 'EOF' > index.html
         }
 
         body {
-            font-family: sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             background: #0f172a;
             color: #e2e8f0;
-            padding: 20px
+            padding: 10px; /* 手机端边距 */
         }
 
         .container {
@@ -1037,7 +1306,7 @@ cat << 'EOF' > index.html
         }
 
         h1 {
-            font-size: 28px;
+            font-size: 24px; /* 缩小标题 */
             margin-bottom: 20px;
             color: #60a5fa
         }
@@ -1045,9 +1314,32 @@ cat << 'EOF' > index.html
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
+            gap: 15px; /* 减小间距 */
             margin-bottom: 20px
         }
+        
+        /* 日志布局：默认堆叠 */
+        .log-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 20px;
+        }
+        /* 宽屏时并排 */
+        @media (min-width: 900px) {
+            .log-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+        /* 手机上卡片变单列 */
+        @media (max-width: 600px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+             h1 {
+                font-size: 20px;
+            }
+        }
+
 
         .card {
             background: #1e293b;
@@ -1104,7 +1396,15 @@ cat << 'EOF' > index.html
             background: #1e293b;
             border-radius: 12px;
             padding: 20px;
-            margin-bottom: 20px
+            margin-bottom: 20px;
+            overflow: hidden; 
+        }
+        
+        /* 手机端适配：日志表格可横向滚动 */
+        .log-container {
+             max-height: 400px;
+             overflow-y: auto;
+             overflow-x: auto; /* 关键 */
         }
 
         .section-title {
@@ -1114,18 +1414,24 @@ cat << 'EOF' > index.html
 
         table {
             width: 100%;
-            border-collapse: collapse
+            border-collapse: collapse;
+            min-width: 600px; /* 确保表格不会过度压缩 */
         }
 
         th, td {
-            padding: 12px;
+            padding: 10px 12px; 
             text-align: left;
-            border-bottom: 1px solid #334155
+            border-bottom: 1px solid #334155;
+            font-size: 14px; 
+            white-space: nowrap; /* 防止换行 */
         }
 
         th {
             color: #94a3b8;
-            font-size: 14px
+            font-size: 12px; 
+            position: sticky; 
+            top: 0;
+            background: #1e293b; 
         }
 
         .status-success {
@@ -1143,7 +1449,8 @@ cat << 'EOF' > index.html
         .input-group {
             display: flex;
             gap: 10px;
-            flex-wrap: wrap
+            flex-wrap: wrap;
+            align-items: center;
         }
 
         input[type=number] {
@@ -1152,7 +1459,7 @@ cat << 'EOF' > index.html
             color: #e2e8f0;
             padding: 8px 12px;
             border-radius: 6px;
-            width: 150px
+            width: 120px; /* 缩小一点 */
         }
 
         button {
@@ -1161,12 +1468,32 @@ cat << 'EOF' > index.html
             border: none;
             padding: 8px 16px;
             border-radius: 6px;
-            cursor: pointer
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-size: 14px;
         }
 
         button:hover {
             background: #2563eb
         }
+        
+        button:disabled {
+            background: #334155;
+            cursor: not-allowed;
+        }
+
+        /* 轮换按钮样式 */
+        #rotate-btn {
+            background-color: #f59e0b;
+            margin-left: auto; /* 手机端换行时自动推到最右 */
+        }
+        #rotate-btn:hover {
+            background-color: #d97706;
+        }
+        #rotate-btn:disabled {
+            background-color: #334155;
+        }
+
 
         .badge {
             display: inline-block;
@@ -1188,8 +1515,8 @@ cat << 'EOF' > index.html
 </head>
 <body>
 <div class="container">
-    <h1>🚀 IPv6 代理管理面板 (v6.5)</h1>
-    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));">
+    <h1>🚀 IPv6 代理管理面板 (v7.1)</h1>
+    <div class="grid">
         <div class="card">
             <div class="card-title">活跃连接</div>
             <div class="card-value" id="active">-</div>
@@ -1217,7 +1544,7 @@ cat << 'EOF' > index.html
             <div class="card-sub">成功连接的平均值</div>
         </div>
         <div class="card">
-            <div class="card-title">IPv6 池</div>
+            <div class="card-title">IPv6 池 (失败自动丢弃)</div>
             <div class="card-value" id="pool-size">-</div>
             <div class="card-sub">目标: <span id="pool-target">-</span></div>
             <div class="progress-bar">
@@ -1226,66 +1553,132 @@ cat << 'EOF' > index.html
         </div>
     </div>
     <div class="section">
-        <div class="section-title">📊 IPv6 池管理</div>
+        <div class="section-title">📊 IP 池管理</div>
         <div class="input-group">
             <label>目标池大小:</label>
             <input type="number" id="new-target" placeholder="100000" min="100" step="1000">
-            <button onclick="resizePool()">应用</button>
+            <button id="resize-btn" onclick="resizePool()">应用</button>
             <span id="pool-status"></span>
+            <button id="rotate-btn" onclick="rotateIPs()">🔄 轮换 IP 池</button>
         </div>
     </div>
+    
     <div class="section">
-        <div class="section-title">📝 最近连接</div>
-        <table>
-            <thead>
-            <tr>
-                <th>时间</th>
-                <th>客户端</th>
-                <th>目标</th>
-                <th>IPv6</th>
-                <th>状态</th>
-                <th>耗时</th>
-            </tr>
-            </thead>
-            <tbody id="logs-table">
-            <tr>
-                <td colspan="6" style="text-align:center;color:#64748b">等待连接...</td>
-            </tr>
-            </tbody>
-        </table>
+        <div class="section-title">📝 最近连接 (全部)</div>
+        <div class="log-container">
+            <table>
+                <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>客户端</th>
+                    <th>目标</th>
+                    <th>IPv6</th>
+                    <th>状态</th>
+                    <th>耗时</th>
+                </tr>
+                </thead>
+                <tbody id="logs-table">
+                <tr>
+                    <td colspan="6" style="text-align:center;color:#64748b">等待连接...</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <div class="section">
+        <div class="section-title">❌ 最近失败/超时日志 (自动丢弃)</div>
+         <div class="log-container">
+            <table>
+                <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>客户端</th>
+                    <th>目标</th>
+                    <th>IPv6</th>
+                    <th>状态 (详细原因)</th>
+                    <th>耗时</th>
+                </tr>
+                </thead>
+                <tbody id="fail-logs-table">
+                <tr>
+                    <td colspan="6" style="text-align:center;color:#64748b">暂无失败...</td>
+                </tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 </div>
 <script>
+    function handleFetchError(error) {
+         if (error instanceof TypeError) {
+             console.error("网络错误或API不可达。");
+             document.body.innerHTML = '<h1 style="color: red; text-align: center; margin-top: 50px;">无法连接到 API。</h1>';
+         } else if (error instanceof Response && error.status === 401) {
+             console.error("API 认证失败。");
+             document.body.innerHTML = '<h1 style="color: red; text-align: center; margin-top: 50px;">认证失败，请重新登录。</h1>';
+         } else {
+             console.error("未知错误:", error);
+         }
+    }
+    
+    async function checkedFetch(url) {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw response; // 抛出 response 以便 handleFetchError 检查状态
+        }
+        return response.json();
+    }
+
     function updateStats() {
-        fetch('/api/stats').then(r => r.json()).then(d => {
+        checkedFetch('/api/stats').then(d => {
             document.getElementById('active').textContent = d.active;
             document.getElementById('total').textContent = d.total;
             document.getElementById('qps').textContent = d.qps.toFixed(2);
             
-            // 更新 连接统计 卡片
             document.getElementById('success-fail').innerHTML = '<span class="success">' + d.success + '</span> / <span class="fail">' + d.failed + '</span>';
             document.getElementById('timeout').textContent = d.timeout;
-            
-            // 更新 CPU 卡片
             document.getElementById('cpu-percent').textContent = d.cpu_percent.toFixed(1) + ' %';
-            
-            // 更新 平均耗时 卡片
             document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0) + ' ms';
 
-            // 更新 IP 池 卡片
             document.getElementById('pool-size').textContent = d.pool;
             document.getElementById('pool-target').textContent = d.target;
             document.getElementById('pool-progress').style.width = d.progress.toFixed(1) + '%';
             document.getElementById('pool-status').innerHTML = d.bg_running ? '<span class="badge badge-info">后台运行中</span>' : '<span class="badge badge-success">就绪</span>';
-        })
+        }).catch(handleFetchError);
+    }
+
+    // 渲染日志表格的辅助函数
+    function renderLogTable(tableId, logs, emptyMsg) {
+        const table = document.getElementById(tableId);
+        if (!logs || logs.length === 0) {
+             table.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#64748b">${emptyMsg}</td></tr>`;
+             return;
+        }
+        table.innerHTML = logs.map(log => {
+            let statusClass = log.status.includes('✅') ? 'status-success' : log.status.includes('⏱') ? 'status-timeout' : 'status-fail';
+            return `<tr>
+                <td>${log.time}</td>
+                <td>${log.client_ip}</td>
+                <td>${log.target}</td>
+                <td>${log.ipv6}</td>
+                <td class="${statusClass}">${log.status}</td>
+                <td>${log.duration}</td>
+            </tr>`;
+        }).join('');
     }
 
     function updateLogs() {
-        fetch('/api/logs').then(r => r.json()).then(logs => {
-            const table = document.getElementById('logs-table');
-            if (!logs || logs.length === 0) return;
-            table.innerHTML = logs.map(log => '<tr><td>' + log.time + '</td><td>' + log.client_ip + '</td><td>' + log.target + '</td><td>' + log.ipv6 + '</td><td class="' + (log.status.includes('✅') ? 'status-success' : log.status.includes('⏱') ? 'status-timeout' : 'status-fail') + '">' + log.status + '</td><td>' + log.duration + '</td></tr>').join('');
-        })
+        checkedFetch('/api/logs').then(logs => {
+            renderLogTable('logs-table', logs, '等待连接... (日志每12小时清空)');
+        }).catch(handleFetchError);
+    }
+    
+    // 新增：更新失败日志
+    function updateFailLogs() {
+        checkedFetch('/api/faillogs').then(logs => {
+             renderLogTable('fail-logs-table', logs, '暂无失败... (日志每12小时清空)');
+        }).catch(handleFetchError);
     }
 
     function resizePool() {
@@ -1294,6 +1687,9 @@ cat << 'EOF' > index.html
             alert('请输入有效值 (至少100)');
             return
         }
+        const btn = document.getElementById('resize-btn');
+        btn.disabled = true;
+        btn.textContent = "应用中...";
         fetch('/api/pool/resize', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -1301,13 +1697,48 @@ cat << 'EOF' > index.html
         }).then(r => r.json()).then(d => {
             alert(d.message || d.error);
             updateStats()
-        })
+            btn.disabled = false;
+            btn.textContent = "应用";
+        }).catch(e => {
+            alert("应用失败: " + e);
+            btn.disabled = false;
+            btn.textContent = "应用";
+        });
+    }
+    
+    function rotateIPs() {
+        if (!confirm("您确定要轮换 IP 池吗？\n这会生成一个全新的 IP 池，所有新连接将使用新 IP。\n(旧 IP 会在 5 分钟后被清理)")) {
+            return;
+        }
+        const btn = document.getElementById('rotate-btn');
+        btn.disabled = true;
+        btn.textContent = "正在轮换...";
+        fetch('/api/rotate', { method: 'POST' })
+            .then(r => r.json())
+            .then(d => {
+                alert(d.message || d.error);
+                updateStats(); // 立即更新统计
+                setTimeout(() => { // 5 秒后再次更新
+                     updateStats();
+                }, 5000);
+                // 保持按钮禁用 10 秒，防止误触
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.textContent = "🔄 轮换 IP 池";
+                }, 10000);
+            }).catch(e => {
+                alert("轮换失败: " + e);
+                btn.disabled = false;
+                btn.textContent = "🔄 轮换 IP 池";
+            });
     }
 
     setInterval(updateStats, 3000);
     setInterval(updateLogs, 5000);
+    setInterval(updateFailLogs, 5000); // 新增
     updateStats();
     updateLogs();
+    updateFailLogs(); // 新增
 </script>
 </body>
 </html>
@@ -1343,7 +1774,7 @@ echo "--- 步骤 6: 正在创建 systemd 服务... ---"
 # 注意：这里我们使用了 $INSTALL_DIR 变量
 cat << EOF > /etc/systemd/system/ipv6-proxy.service
 [Unit]
-Description=IPv6 Proxy Service v6.5 (Gemini)
+Description=IPv6 Proxy Service v7.1 (Gemini)
 After=network-online.target
 Wants=network-online.target
 
@@ -1377,11 +1808,9 @@ echo "============================================="
 echo "🎉🎉🎉 恭喜！安装已全部完成！ 🎉🎉🎉"
 echo "============================================="
 echo ""
-echo "您现在需要执行【最后两个步骤】来启动服务："
-echo ""
 echo "1. 【首次配置】(自动引导安装)"
 echo "   脚本现在将自动为您运行首次配置向导。"
-echo "   请回答所有问题 (端口, 密码, 网卡, IP池等)..."
+echo "   请回答所有问题 (Web 登录, 代理端口/密码, 网卡, IP池等)..."
 echo ""
 
 # 自动运行交互式向导
