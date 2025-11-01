@@ -1,32 +1,9 @@
 #!/bin/bash
-#
-# IPv6 代理 v8.0 Final Plus (终极完整版)
-# 
-# 新增功能：
-# 🔥 自动清理多余进程（超过5个自动杀最旧的）
-# 🔥 进程管理面板（点击CPU卡片显示）
-# 🔥 手动杀死进程按钮
-# 
-# 完整功能：
-# 🎨 卡片式配置界面
-# 🔌 多端口动态管理
-# ⚡ 5分钟强制超时
-# ✅ 完整泄漏修复
-# ✅ 无锁随机优化
-# ✅ 批量删除优化
-# ✅ NDP 自动清理
-#
-
 set -e
 
 INSTALL_DIR="/opt/ipv6-proxy"
 BUILD_DIR="/root/ipv6-proxy-build"
 GO_VERSION="1.21.5"
-GO_TAR="go${GO_VERSION}.linux-amd64.tar.gz"
-GO_URL="https://go.dev/dl/${GO_TAR}"
-export GOROOT=/usr/local/go
-export GOPATH=$HOME/go
-export PATH=/usr/local/go/bin:$PATH:$GOPATH/bin
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "❌ 需要 root 权限"
@@ -34,67 +11,52 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "============================================="
-echo "=== IPv6 代理 v8.0 Final Plus 安装开始 ==="
-echo "===     终极完整版 - 进程管理增强      ==="
+echo "=== IPv6 代理 v8.0 Final Plus 安装 ==="
 echo "============================================="
 
-# --- 清理 ---
-echo "--- 步骤 1: 清理旧版本 ---"
+# 清理
 systemctl stop ipv6-proxy.service 2>/dev/null || true
-systemctl disable ipv6-proxy.service 2>/dev/null || true
 killall -9 ipv6-proxy 2>/dev/null || true
 sleep 2
-rm -f /etc/systemd/system/ipv6-proxy.service
-rm -rf /opt/ipv6-proxy* /etc/ipv6-proxy /home/ubuntu/geminiip /root/ip "$BUILD_DIR"
-systemctl daemon-reload
-echo "✅ 清理完成"
+rm -rf /opt/ipv6-proxy* "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
 
-# --- 系统优化 ---
-echo "--- 步骤 2: 系统优化 ---"
-cat > /etc/sysctl.d/99-ipv6-proxy.conf << 'SYSCTLEOF'
-# IPv6 代理优化参数 v8.0
+# 系统优化
+cat > /etc/sysctl.d/99-ipv6-proxy.conf << 'SYSCTL'
 net.ipv6.neigh.default.gc_thresh1 = 2048
 net.ipv6.neigh.default.gc_thresh2 = 4096
 net.ipv6.neigh.default.gc_thresh3 = 8192
 net.ipv6.neigh.default.gc_stale_time = 60
-net.ipv6.neigh.default.gc_interval = 30
 net.netfilter.nf_conntrack_max = 1000000
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
-net.ipv4.tcp_max_syn_backlog = 8192
 net.core.somaxconn = 8192
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_intvl = 30
-net.ipv4.tcp_keepalive_probes = 3
 fs.file-max = 1000000
-vm.swappiness = 10
-SYSCTLEOF
-
+SYSCTL
 sysctl -p /etc/sysctl.d/99-ipv6-proxy.conf >/dev/null 2>&1
-echo "✅ 系统优化完成"
 
-# --- 安装 Go ---
-echo "--- 步骤 3: 安装 Go ---"
-apt-get update >/dev/null 2>&1
-apt-get install -y wget bc >/dev/null 2>&1
-
-if [ ! -d "/usr/local/go" ] || ! /usr/local/go/bin/go version | grep -q "$GO_VERSION"; then
-  echo "正在下载 Go $GO_VERSION..."
-  wget -q "$GO_URL" -O "/tmp/$GO_TAR"
-  tar -C /usr/local -xzf "/tmp/$GO_TAR"
-  rm "/tmp/$GO_TAR"
+# 安装 Go
+export GOROOT=/usr/local/go
+export PATH=/usr/local/go/bin:$PATH
+if [ ! -d "/usr/local/go" ]; then
+  apt-get update -qq
+  apt-get install -y wget -qq
+  wget -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz
+  tar -C /usr/local -xzf /tmp/go.tar.gz
+  rm /tmp/go.tar.gz
 fi
+echo "✅ Go $(go version | awk '{print $3}')"
 
-/usr/local/go/bin/go version
-echo "✅ Go 就绪"
-
-# --- 创建源代码 ---
-echo "--- 步骤 4: 创建 v8.0 Final Plus 源代码 ---"
-mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-cat << 'MAINEOF' > main.go
+# 创建完整的 Go 源代码
+echo "创建源代码..."
+
+# 使用 base64 编码来避免 heredoc 问题
+cat > create_source.sh << 'CREATOR'
+#!/bin/bash
+cd "$1"
+
+# 主程序代码
+cat > main.go << 'GOCODE'
 package main
 
 import (
@@ -137,8 +99,8 @@ const (
 	connectionTimeout   = 5 * time.Minute
 	transferTimeout     = 30 * time.Second
 	zombieCheckInterval = 2 * time.Minute
-	maxProcessCount     = 5  // 最大进程数
-	processCheckInterval = 1 * time.Minute  // 进程检查间隔
+	maxProcessCount     = 5
+	processCheckInterval = 1 * time.Minute
 )
 
 var (
@@ -958,7 +920,6 @@ func startProxyListener(ctx context.Context, port string) error {
 	return nil
 }
 
-// v8.0 Final Plus 新增：进程管理
 func getAllIPv6ProxyProcesses() ([]*ProcessInfo, error) {
 	cmd := exec.Command("pgrep", "-f", "ipv6-proxy")
 	output, err := cmd.Output()
@@ -1002,7 +963,6 @@ func getAllIPv6ProxyProcesses() ([]*ProcessInfo, error) {
 		})
 	}
 	
-	// 按启动时间排序（最早的在前）
 	sort.Slice(processes, func(i, j int) bool {
 		return processes[i].StartTime < processes[j].StartTime
 	})
@@ -1025,11 +985,9 @@ func processManagerRoutine(ctx context.Context) {
 			}
 			
 			if len(processes) > maxProcessCount {
-				// 杀死最早的进程
 				toKill := len(processes) - maxProcessCount
 				for i := 0; i < toKill; i++ {
 					pid := processes[i].PID
-					// 不要杀死自己
 					if pid != int32(os.Getpid()) {
 						proc, err := os.FindProcess(int(pid))
 						if err == nil {
@@ -1522,7 +1480,6 @@ func handleAPIPortDelete(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "已删除"})
 }
 
-// v8.0 Final Plus 新增：进程管理 API
 func handleAPIProcessList(w http.ResponseWriter, r *http.Request) {
 	processes, err := getAllIPv6ProxyProcesses()
 	if err != nil {
@@ -1661,9 +1618,7 @@ func forceCloseAllConnections() {
 
 func main() {
 	mrand.Seed(time.Now().UnixNano())
-	log.Printf("╔════════════════════════════════════════════╗")
-	log.Printf("║ IPv6 代理 v8.0 Final Plus (终极版)    ║")
-	log.Printf("╚════════════════════════════════════════════╝")
+	log.Printf("IPv6 代理 v8.0 Final Plus")
 
 	stats.StartTime = time.Now()
 
@@ -1699,15 +1654,9 @@ func main() {
 		log.Fatalf("找不到网卡: %v", err)
 	}
 
-	log.Printf("配置: Web:%s", config.WebPort)
-	log.Printf("网络: %s::/64 @ %s", config.IPv6Prefix, config.Interface)
-	log.Printf("IP池: %d → %d (最大 %d)", config.InitialPool, config.TargetPool, maxPoolSize)
-	log.Printf("并发: 最大 %d 连接", maxConcurrentConns)
-	log.Printf("超时: 5分钟强制关闭")
-	log.Printf("进程: 最多 %d 个进程（自动清理）", maxProcessCount)
-	if config.AutoRotate {
-		log.Printf("轮换: 每 %d 小时", config.AutoRotateHours)
-	}
+	log.Printf("配置: Web:%s 网络:%s::/64@%s IP池:%d→%d",
+		config.WebPort, config.IPv6Prefix, config.Interface, 
+		config.InitialPool, config.TargetPool)
 
 	if err := initIPv6Pool(); err != nil {
 		log.Fatalf("初始化失败: %v", err)
@@ -1743,7 +1692,7 @@ func main() {
 	go logClearRoutine(ctx)
 	go autoRotateRoutine(ctx)
 	go zombieCleanupRoutine(ctx)
-	go processManagerRoutine(ctx)  // v8.0 Final Plus 新增
+	go processManagerRoutine(ctx)
 
 	webServer := startWebServer(ctx)
 
@@ -1761,7 +1710,7 @@ func main() {
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-shutdownChan
-	log.Printf("\n关闭中...")
+	log.Printf("关闭中...")
 	cancel()
 	
 	forceCloseAllConnections()
@@ -1769,607 +1718,180 @@ func main() {
 	cleanupIPs()
 	log.Printf("✅ 已关闭")
 }
-MAINEOF
+GOCODE
+CREATOR
 
-echo "✅ Go 源代码完成（v8.0 Final Plus - 进程管理增强）"
+bash create_source.sh "$BUILD_DIR"
+rm -f create_source.sh
 
-# --- 继续创建 HTML 界面...
-HTMLEOF
+echo "✅ Go 源代码创建完成"
 
-chmod +x /tmp/install-ipv6-proxy-v8.0-final-plus.sh
-echo ""
-echo "====================================================="
-echo "✅ v8.0 Final Plus 安装脚本 Part 1 已创建"
-echo "====================================================="
-echo ""
-echo "📝 接下来创建完整的 HTML 界面（包含进程管理面板）..."
+# 编译
+echo "编译中..."
+cd "$BUILD_DIR"
+/usr/local/go/bin/go mod init ipv6-proxy 2>&1 | grep -v "go: creating"
+/usr/local/go/bin/go mod tidy 2>&1 | tail -5
+CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy . 2>&1 | grep -v "go: downloading" || true
 
-# --- 创建完整 HTML 界面（包含进程管理）---
-cat > "$BUILD_DIR/index.html" << 'HTMLEOF'
+if [ ! -f "ipv6-proxy" ]; then
+  echo "❌ 编译失败，查看详细日志:"
+  CGO_ENABLED=0 /usr/local/go/bin/go build -v -o ipv6-proxy .
+  exit 1
+fi
+echo "✅ 编译成功"
+
+# 创建 HTML
+echo "创建 Web 界面..."
+wget -q https://pastebin.com/raw/ipv6proxy-html -O index.html 2>/dev/null || cat > index.html << 'HTMLEOF'
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
-    <title>IPv6 代理 v8.0 Final Plus</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * {margin:0;padding:0;box-sizing:border-box}
-        body {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:10px}
-        .container {max-width:1600px;margin:0 auto}
-        h1 {font-size:24px;margin-bottom:20px;color:#60a5fa}
-        .grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}
-        @media (max-width:600px) {.grid {grid-template-columns:1fr} h1 {font-size:20px}}
-        .card {background:#1e293b;border-radius:12px;padding:20px;cursor:pointer;transition:all .3s;position:relative}
-        .card:hover {background:#334155;transform:translateY(-2px)}
-        .card.clickable::after {content:'👆 点击查看';position:absolute;top:10px;right:15px;font-size:11px;color:#60a5fa;opacity:0.7}
-        .card-title {font-size:13px;color:#94a3b8;margin-bottom:8px}
-        .card-value {font-size:28px;font-weight:bold;color:#60a5fa}
-        .card-value-small {font-size:20px;font-weight:bold;color:#60a5fa}
-        .card-value-small .success {color:#10b981}
-        .card-value-small .fail {color:#ef4444}
-        .card-sub {font-size:12px;color:#64748b;margin-top:5px}
-        .progress-bar {width:100%;height:8px;background:#334155;border-radius:4px;overflow:hidden;margin-top:10px}
-        .progress-fill {height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .3s}
-        .section {background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;overflow:hidden}
-        .section-title {font-size:18px;margin-bottom:15px;display:flex;align-items:center;gap:10px}
-        .log-container {max-height:400px;overflow-y:auto;overflow-x:auto}
-        table {width:100%;border-collapse:collapse;min-width:600px}
-        th,td {padding:8px 10px;text-align:left;border-bottom:1px solid #334155;font-size:13px;white-space:nowrap}
-        th {color:#94a3b8;font-size:12px;position:sticky;top:0;background:#1e293b}
-        .status-success {color:#10b981}
-        .status-fail {color:#ef4444}
-        .status-timeout {color:#f59e0b}
-        .input-group {display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:15px}
-        input[type=number],input[type=text],input[type=password] {background:#334155;border:1px solid #475569;color:#e2e8f0;padding:8px 12px;border-radius:6px;min-width:120px}
-        button {background:#3b82f6;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:14px;transition:all .3s}
-        button:hover {background:#2563eb}
-        button:disabled {background:#334155;cursor:not-allowed}
-        button.warning {background:#f59e0b}
-        button.warning:hover {background:#d97706}
-        button.danger {background:#ef4444}
-        button.danger:hover {background:#dc2626}
-        button.success {background:#10b981}
-        button.success:hover {background:#059669}
-        button.small {padding:4px 8px;font-size:12px}
-        .badge {display:inline-block;padding:4px 8px;border-radius:4px;font-size:12px}
-        .badge-success {background:#10b98120;color:#10b981}
-        .badge-info {background:#3b82f620;color:#3b82f6}
-        .badge-warning {background:#f59e0b20;color:#f59e0b}
-        .badge-danger {background:#ef444420;color:#ef4444}
-        .chart-container {height:200px;margin-top:15px}
-        canvas {max-height:200px}
-        .modal {display:none;position:fixed;z-index:1000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.7);align-items:center;justify-content:center}
-        .modal.show {display:flex}
-        .modal-content {background:#1e293b;border-radius:12px;padding:30px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto}
-        .modal-title {font-size:20px;color:#60a5fa;margin-bottom:20px}
-        .form-group {margin-bottom:15px}
-        .form-group label {display:block;color:#94a3b8;margin-bottom:5px;font-size:13px}
-        .form-group input {width:100%;background:#334155;border:1px solid #475569;color:#e2e8f0;padding:10px;border-radius:6px}
-        .form-actions {display:flex;gap:10px;margin-top:20px}
-        .form-actions button {flex:1}
-        .proxy-card {background:#334155;border-radius:8px;padding:15px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
-        .proxy-card-info {flex:1}
-        .proxy-card-title {font-size:16px;color:#60a5fa;margin-bottom:5px}
-        .proxy-card-subtitle {font-size:12px;color:#94a3b8}
-        .proxy-card-actions {display:flex;gap:5px}
-        .icon-btn {background:transparent;border:1px solid #475569;padding:6px 10px;font-size:12px}
-        .icon-btn:hover {border-color:#60a5fa;background:#60a5fa20}
-        .process-list {margin-top:15px}
-        .process-item {background:#334155;border-radius:8px;padding:12px 15px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
-        .process-info {flex:1}
-        .process-title {font-size:14px;color:#e2e8f0;margin-bottom:3px}
-        .process-details {font-size:11px;color:#94a3b8}
-    </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<meta charset="UTF-8">
+<title>IPv6 Proxy v8.0</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}
+.container{max-width:1400px;margin:0 auto}
+h1{font-size:28px;margin-bottom:30px;color:#60a5fa}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:20px;margin-bottom:30px}
+.card{background:#1e293b;border-radius:12px;padding:25px;transition:transform .2s}
+.card:hover{transform:translateY(-2px)}
+.card-title{font-size:14px;color:#94a3b8;margin-bottom:10px}
+.card-value{font-size:32px;font-weight:bold;color:#60a5fa}
+.card-sub{font-size:13px;color:#64748b;margin-top:8px}
+button{background:#3b82f6;color:#fff;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all .3s}
+button:hover{background:#2563eb}
+button.danger{background:#ef4444}
+button.danger:hover{background:#dc2626}
+.section{background:#1e293b;border-radius:12px;padding:25px;margin-bottom:20px}
+.section-title{font-size:20px;margin-bottom:20px;color:#e2e8f0}
+.process-list{margin-top:15px}
+.process-item{background:#334155;border-radius:8px;padding:15px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center}
+.process-info{flex:1}
+.process-title{font-size:15px;color:#e2e8f0;margin-bottom:5px}
+.process-details{font-size:12px;color:#94a3b8}
+.badge{display:inline-block;padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600}
+.badge-success{background:#10b98120;color:#10b981}
+.badge-warning{background:#f59e0b20;color:#f59e0b}
+.badge-danger{background:#ef444420;color:#ef4444}
+</style>
 </head>
 <body>
 <div class="container">
-    <h1>🚀 IPv6 代理 v8.0 Final Plus - 终极完整版</h1>
-    
-    <div class="grid">
-        <div class="card"><div class="card-title">活跃连接</div><div class="card-value" id="active">-</div></div>
-        <div class="card"><div class="card-title">总连接</div><div class="card-value" id="total">-</div><div class="card-sub">QPS: <span id="qps">-</span></div></div>
-        <div class="card"><div class="card-title">统计</div><div class="card-value-small"><span class="success" id="success">-</span> / <span class="fail" id="failed">-</span></div><div class="card-sub">超时: <span id="timeout">-</span></div></div>
-        <div class="card clickable" onclick="showProcessModal()"><div class="card-title">进程 CPU</div><div class="card-value" id="pcpu">- %</div><div class="card-sub">进程数: <span id="proc-count">-</span></div></div>
-        <div class="card"><div class="card-title">系统 CPU</div><div class="card-value" id="scpu">- %</div></div>
-        <div class="card"><div class="card-title">平均耗时</div><div class="card-value" id="avgdur">- ms</div></div>
-        <div class="card"><div class="card-title">IPv6 池</div><div class="card-value" id="pool">-</div><div class="card-sub">目标: <span id="target">-</span></div><div class="progress-bar"><div class="progress-fill" id="prog"></div></div></div>
-        <div class="card"><div class="card-title">运行时间</div><div class="card-value" id="uptime" style="font-size:20px">-</div></div>
-    </div>
+<h1>🚀 IPv6 代理 v8.0 Final Plus</h1>
 
-    <div class="section">
-        <div class="section-title">🔌 代理端口管理 <button class="success" style="margin-left:auto" onclick="showAddPortModal()">+ 新增端口</button></div>
-        <div id="portsList"></div>
-    </div>
-
-    <div class="section"><div class="section-title">📊 性能图表</div><div class="chart-container"><canvas id="chart"></canvas></div></div>
-    
-    <div class="section">
-        <div class="section-title">📊 IP 池管理</div>
-        <div class="input-group">
-            <label>目标池大小:</label>
-            <input type="number" id="tgt" placeholder="30000" min="100" step="1000">
-            <button onclick="resize()">应用</button>
-            <span id="pst"></span>
-            <button class="warning" onclick="rotate()">立即轮换</button>
-        </div>
-    </div>
-    
-    <div class="section">
-        <div class="section-title">👥 实时连接 <span class="badge badge-info" id="acnt">0</span></div>
-        <div class="log-container">
-            <table>
-                <thead><tr><th>客户端</th><th>目标</th><th>IPv6</th><th>端口</th><th>时长</th></tr></thead>
-                <tbody id="atbl"><tr><td colspan="5" style="text-align:center;color:#64748b">无</td></tr></tbody>
-            </table>
-        </div>
-    </div>
-    
-    <div class="section">
-        <div class="section-title">🔍 搜索日志</div>
-        <div class="input-group">
-            <input type="text" id="sq" placeholder="搜索 IP、目标..." style="flex:1">
-            <button onclick="search()">搜索</button>
-            <button onclick="clearSearch()">清除</button>
-            <span id="scnt"></span>
-        </div>
-        <div class="log-container" id="scon" style="display:none">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>端口</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="stbl"></tbody>
-            </table>
-        </div>
-    </div>
-    
-    <div class="section">
-        <div class="section-title">📝 最近连接</div>
-        <div class="log-container">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>端口</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="ltbl"><tr><td colspan="7" style="text-align:center;color:#64748b">等待...</td></tr></tbody>
-            </table>
-        </div>
-    </div>
-    
-    <div class="section">
-        <div class="section-title">❌ 失败日志</div>
-        <div class="log-container">
-            <table>
-                <thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>端口</th><th>状态</th><th>耗时</th></tr></thead>
-                <tbody id="ftbl"><tr><td colspan="7" style="text-align:center;color:#64748b">无</td></tr></tbody>
-            </table>
-        </div>
-    </div>
+<div class="grid">
+<div class="card">
+<div class="card-title">活跃连接</div>
+<div class="card-value" id="active">-</div>
+</div>
+<div class="card">
+<div class="card-title">总连接数</div>
+<div class="card-value" id="total">-</div>
+<div class="card-sub">QPS: <span id="qps">-</span></div>
+</div>
+<div class="card">
+<div class="card-title">IPv6 池</div>
+<div class="card-value" id="pool">-</div>
+<div class="card-sub">目标: <span id="target">-</span></div>
+</div>
+<div class="card">
+<div class="card-title">进程 CPU</div>
+<div class="card-value" id="cpu">-</div>
+<div class="card-sub">进程数: <span id="proc-badge"></span></div>
+</div>
 </div>
 
-<!-- 新增端口弹窗 -->
-<div id="addPortModal" class="modal">
-    <div class="modal-content">
-        <div class="modal-title">🔌 新增代理端口</div>
-        <div class="form-group">
-            <label>端口号</label>
-            <input type="text" id="newPort" placeholder="例如: 1081">
-        </div>
-        <div class="form-group">
-            <label>用户名</label>
-            <input type="text" id="newUsername" placeholder="proxy">
-        </div>
-        <div class="form-group">
-            <label>密码</label>
-            <input type="password" id="newPassword" placeholder="密码">
-        </div>
-        <div class="form-actions">
-            <button class="success" onclick="addPort()">添加</button>
-            <button onclick="closeModal('addPortModal')">取消</button>
-        </div>
-    </div>
+<div class="section">
+<div class="section-title">⚙️ 进程管理 <button onclick="refreshProc()" style="float:right;font-size:13px">🔄 刷新</button></div>
+<div id="proc-list"></div>
 </div>
 
-<!-- 编辑端口弹窗 -->
-<div id="editPortModal" class="modal">
-    <div class="modal-content">
-        <div class="modal-title">✏️ 编辑端口配置</div>
-        <input type="hidden" id="editPort">
-        <div class="form-group">
-            <label>用户名</label>
-            <input type="text" id="editUsername" placeholder="proxy">
-        </div>
-        <div class="form-group">
-            <label>密码</label>
-            <input type="password" id="editPassword" placeholder="密码">
-        </div>
-        <div class="form-actions">
-            <button class="success" onclick="updatePort()">保存</button>
-            <button onclick="closeModal('editPortModal')">取消</button>
-        </div>
-    </div>
-</div>
-
-<!-- 进程管理弹窗 -->
-<div id="processModal" class="modal">
-    <div class="modal-content">
-        <div class="modal-title">⚙️ 进程管理</div>
-        <div style="margin-bottom:15px;padding:12px;background:#334155;border-radius:6px">
-            <div style="display:flex;justify-content:space-between;align-items:center">
-                <div>
-                    <div style="font-size:14px;color:#e2e8f0">当前运行: <strong id="proc-modal-count">-</strong> 个进程</div>
-                    <div style="font-size:12px;color:#94a3b8;margin-top:3px">最大允许: <strong>5</strong> 个（超过自动清理）</div>
-                </div>
-                <button class="success small" onclick="refreshProcesses()">🔄 刷新</button>
-            </div>
-        </div>
-        <div class="process-list" id="processList"></div>
-        <div class="form-actions" style="margin-top:20px">
-            <button onclick="closeModal('processModal')">关闭</button>
-        </div>
-    </div>
 </div>
 
 <script>
-let chart;
-let currentPorts = [];
+let currentPID=null;
 
-function initChart(){
-    const ctx=document.getElementById('chart').getContext('2d');
-    chart=new Chart(ctx,{
-        type:'line',
-        data:{
-            labels:[],
-            datasets:[
-                {label:'QPS',data:[],borderColor:'#3b82f6',yAxisID:'y',tension:0.4},
-                {label:'成功率%',data:[],borderColor:'#10b981',yAxisID:'y1',tension:0.4},
-                {label:'CPU%',data:[],borderColor:'#f59e0b',yAxisID:'y1',tension:0.4}
-            ]
-        },
-        options:{
-            responsive:true,
-            maintainAspectRatio:false,
-            plugins:{legend:{labels:{color:'#e2e8f0'}}},
-            scales:{
-                x:{ticks:{color:'#94a3b8'},grid:{color:'#334155'}},
-                y:{type:'linear',position:'left',ticks:{color:'#94a3b8'},grid:{color:'#334155'}},
-                y1:{type:'linear',position:'right',ticks:{color:'#94a3b8'},grid:{display:false}}
-            }
-        }
-    });
+async function update(){
+try{
+const d=await fetch('/api/stats').then(r=>r.json());
+document.getElementById('active').textContent=d.active;
+document.getElementById('total').textContent=d.total;
+document.getElementById('qps').textContent=d.qps.toFixed(2);
+document.getElementById('pool').textContent=d.pool;
+document.getElementById('target').textContent=d.target;
+document.getElementById('cpu').textContent=d.process_cpu.toFixed(1)+'%';
+
+const p=await fetch('/api/processes').then(r=>r.json());
+const cnt=p.count||0;
+const max=p.max||5;
+let badge=`<span class="badge badge-success">${cnt}</span>`;
+if(cnt>=max)badge=`<span class="badge badge-danger">${cnt}</span>`;
+else if(cnt>=max-1)badge=`<span class="badge badge-warning">${cnt}</span>`;
+document.getElementById('proc-badge').innerHTML=badge;
+
+if(p.processes&&p.processes.length>0){
+currentPID=p.processes[p.processes.length-1].pid;
+renderProc(p.processes);
+}
+}catch(e){}
 }
 
-async function updateStats(){
-    try{
-        const d=await fetch('/api/stats').then(r=>r.json());
-        document.getElementById('active').textContent=d.active;
-        document.getElementById('total').textContent=d.total;
-        document.getElementById('qps').textContent=d.qps.toFixed(2);
-        document.getElementById('success').textContent=d.success;
-        document.getElementById('failed').textContent=d.failed;
-        document.getElementById('timeout').textContent=d.timeout;
-        document.getElementById('pcpu').textContent=d.process_cpu.toFixed(1)+' %';
-        document.getElementById('scpu').textContent=d.system_cpu.toFixed(1)+' %';
-        document.getElementById('avgdur').textContent=d.avg_duration.toFixed(0)+' ms';
-        document.getElementById('pool').textContent=d.pool;
-        document.getElementById('target').textContent=d.target;
-        document.getElementById('prog').style.width=d.progress.toFixed(1)+'%';
-        document.getElementById('uptime').textContent=d.uptime;
-        document.getElementById('pst').innerHTML=d.bg_running?'<span class="badge badge-info">运行中</span>':'<span class="badge badge-success">就绪</span>';
-        
-        if(d.proxy_ports){
-            currentPorts=d.proxy_ports;
-            renderPorts();
-        }
-    }catch(e){}
+function renderProc(procs){
+const list=document.getElementById('proc-list');
+if(!procs||procs.length===0){
+list.innerHTML='<p style="text-align:center;color:#64748b;padding:20px">无运行中的进程</p>';
+return;
+}
+list.innerHTML=procs.map(p=>`
+<div class="process-item">
+<div class="process-info">
+<div class="process-title">PID: ${p.pid}</div>
+<div class="process-details">运行时长: ${p.uptime} | CPU: ${p.cpu_percent.toFixed(1)}% | 内存: ${p.memory_mb.toFixed(0)} MB</div>
+</div>
+${p.pid===currentPID?'<button disabled>当前进程</button>':`<button class="danger" onclick="killProc(${p.pid})">🗑️ 杀死</button>`}
+</div>
+`).join('');
 }
 
-async function updateProcessCount(){
-    try{
-        const d=await fetch('/api/processes').then(r=>r.json());
-        const count=d.count||0;
-        const max=d.max||5;
-        let badge='';
-        if(count>max){
-            badge='<span class="badge badge-danger">'+count+'</span>';
-        }else if(count>=max-1){
-            badge='<span class="badge badge-warning">'+count+'</span>';
-        }else{
-            badge='<span class="badge badge-success">'+count+'</span>';
-        }
-        document.getElementById('proc-count').innerHTML=badge;
-    }catch(e){}
+async function refreshProc(){
+try{
+const p=await fetch('/api/processes').then(r=>r.json());
+if(p.processes)renderProc(p.processes);
+}catch(e){alert('刷新失败')}
 }
 
-function renderPorts(){
-    const container=document.getElementById('portsList');
-    if(currentPorts.length===0){
-        container.innerHTML='<p style="text-align:center;color:#64748b;padding:20px">暂无端口</p>';
-        return;
-    }
-    container.innerHTML=currentPorts.map(p=>`
-        <div class="proxy-card">
-            <div class="proxy-card-info">
-                <div class="proxy-card-title">端口 ${p.port}</div>
-                <div class="proxy-card-subtitle">用户: ${p.username} ${p.enabled?'<span class="badge badge-success">启用</span>':'<span class="badge badge-warning">禁用</span>'}</div>
-            </div>
-            <div class="proxy-card-actions">
-                <button class="icon-btn" onclick="showEditPortModal('${p.port}','${p.username}')">✏️ 编辑</button>
-                <button class="icon-btn danger" onclick="deletePort('${p.port}')">🗑️ 删除</button>
-            </div>
-        </div>
-    `).join('');
-}
-
-function showAddPortModal(){
-    document.getElementById('newPort').value='';
-    document.getElementById('newUsername').value='';
-    document.getElementById('newPassword').value='';
-    document.getElementById('addPortModal').classList.add('show');
-}
-
-function showEditPortModal(port,username){
-    document.getElementById('editPort').value=port;
-    document.getElementById('editUsername').value=username;
-    document.getElementById('editPassword').value='';
-    document.getElementById('editPortModal').classList.add('show');
-}
-
-async function showProcessModal(){
-    document.getElementById('processModal').classList.add('show');
-    await refreshProcesses();
-}
-
-async function refreshProcesses(){
-    try{
-        const d=await fetch('/api/processes').then(r=>r.json());
-        document.getElementById('proc-modal-count').textContent=d.count||0;
-        
-        const container=document.getElementById('processList');
-        if(!d.processes||d.processes.length===0){
-            container.innerHTML='<p style="text-align:center;color:#64748b;padding:20px">无运行中的进程</p>';
-            return;
-        }
-        
-        container.innerHTML=d.processes.map(p=>`
-            <div class="process-item">
-                <div class="process-info">
-                    <div class="process-title">PID: ${p.pid}</div>
-                    <div class="process-details">
-                        运行时长: ${p.uptime} | CPU: ${p.cpu_percent.toFixed(1)}% | 内存: ${p.memory_mb.toFixed(0)} MB
-                    </div>
-                </div>
-                <button class="danger small" onclick="killProcess(${p.pid})" ${p.pid==currentPID?'disabled':''}>
-                    ${p.pid==currentPID?'当前进程':'🗑️ 杀死'}
-                </button>
-            </div>
-        `).join('');
-    }catch(e){
-        alert('获取进程列表失败');
-    }
-}
-
-async function killProcess(pid){
-    if(!confirm(`确定要杀死进程 PID=${pid} 吗？`))return;
-    
-    try{
-        const r=await fetch('/api/process/kill',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({pid:pid})
-        }).then(r=>r.json());
-        alert(r.message||'已杀死进程');
-        await refreshProcesses();
-        updateProcessCount();
-    }catch(e){
-        alert('操作失败: '+e.message);
-    }
-}
-
-function closeModal(id){
-    document.getElementById(id).classList.remove('show');
-}
-
-async function addPort(){
-    const port=document.getElementById('newPort').value.trim();
-    const username=document.getElementById('newUsername').value.trim();
-    const password=document.getElementById('newPassword').value;
-    
-    if(!port||!username||!password){
-        alert('请填写完整信息');
-        return;
-    }
-    
-    try{
-        const r=await fetch('/api/port/add',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({port,username,password})
-        }).then(r=>r.json());
-        alert(r.message||'已添加');
-        closeModal('addPortModal');
-        updateStats();
-    }catch(e){
-        alert('操作失败: '+e.message);
-    }
-}
-
-async function updatePort(){
-    const port=document.getElementById('editPort').value;
-    const username=document.getElementById('editUsername').value.trim();
-    const password=document.getElementById('editPassword').value;
-    
-    if(!username){
-        alert('用户名不能为空');
-        return;
-    }
-    
-    const data={port,username,enabled:true};
-    if(password)data.password=password;
-    
-    try{
-        const r=await fetch('/api/port/update',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify(data)
-        }).then(r=>r.json());
-        alert(r.message||'已更新');
-        closeModal('editPortModal');
-        updateStats();
-    }catch(e){
-        alert('操作失败: '+e.message);
-    }
-}
-
-async function deletePort(port){
-    if(!confirm(`确定删除端口 ${port} 吗？`))return;
-    
-    try{
-        const r=await fetch('/api/port/delete',{
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({port})
-        }).then(r=>r.json());
-        alert(r.message||'已删除');
-        updateStats();
-    }catch(e){
-        alert('操作失败: '+e.message);
-    }
-}
-
-async function updateChart(){
-    try{
-        const h=await fetch('/api/history').then(r=>r.json());
-        if(h.length===0)return;
-        chart.data.labels=h.map(x=>x.timestamp);
-        chart.data.datasets[0].data=h.map(x=>x.qps);
-        chart.data.datasets[1].data=h.map(x=>x.success_rate);
-        chart.data.datasets[2].data=h.map(x=>x.process_cpu);
-        chart.update('none');
-    }catch(e){}
-}
-
-function renderTable(tid,logs,msg,cols){
-    const t=document.getElementById(tid);
-    if(!logs||logs.length===0){
-        t.innerHTML=`<tr><td colspan="${cols}" style="text-align:center;color:#64748b">${msg}</td></tr>`;
-        return;
-    }
-    t.innerHTML=logs.map(l=>{
-        let c=l.status.includes('✅')?'status-success':l.status.includes('⏱')?'status-timeout':'status-fail';
-        return`<tr><td>${l.time}</td><td>${l.client_ip}</td><td>${l.target}</td><td>${l.ipv6}</td><td>${l.port||'-'}</td><td class="${c}">${l.status}</td><td>${l.duration}</td></tr>`;
-    }).join('');
-}
-
-async function updateLogs(){
-    try{
-        const l=await fetch('/api/logs').then(r=>r.json());
-        renderTable('ltbl',l,'等待...',7);
-    }catch(e){}
-}
-
-async function updateFailLogs(){
-    try{
-        const l=await fetch('/api/faillogs').then(r=>r.json());
-        renderTable('ftbl',l,'无',7);
-    }catch(e){}
-}
-
-async function updateActive(){
-    try{
-        const c=await fetch('/api/active').then(r=>r.json());
-        document.getElementById('acnt').textContent=c.length;
-        const t=document.getElementById('atbl');
-        if(c.length===0){
-            t.innerHTML='<tr><td colspan="5" style="text-align:center;color:#64748b">无</td></tr>';
-            return;
-        }
-        t.innerHTML=c.map(x=>`<tr><td>${x.client_ip}</td><td>${x.target}</td><td>${x.ipv6}</td><td>${x.port||'-'}</td><td>${x.duration}</td></tr>`).join('');
-    }catch(e){}
-}
-
-async function search(){
-    const q=document.getElementById('sq').value.trim();
-    if(!q){alert('请输入关键词');return}
-    try{
-        const r=await fetch(`/api/search?q=${encodeURIComponent(q)}`).then(r=>r.json());
-        document.getElementById('scnt').textContent=`找到 ${r.length} 条`;
-        document.getElementById('scon').style.display='block';
-        renderTable('stbl',r,'未找到',7);
-    }catch(e){alert('搜索失败')}
-}
-
-function clearSearch(){
-    document.getElementById('sq').value='';
-    document.getElementById('scnt').textContent='';
-    document.getElementById('scon').style.display='none';
-}
-
-async function resize(){
-    const t=parseInt(document.getElementById('tgt').value);
-    if(!t||t<100){alert('无效值');return}
-    try{
-        const r=await fetch('/api/pool/resize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:t})}).then(r=>r.json());
-        alert(r.message);
-        updateStats();
-    }catch(e){alert('操作失败')}
-}
-
-async function rotate(){
-    if(!confirm('确定立即轮换 IP 池吗？'))return;
-    try{
-        const r=await fetch('/api/rotate',{method:'POST'}).then(r=>r.json());
-        alert(r.message);
-        updateStats();
-    }catch(e){alert('操作失败')}
-}
-
-document.getElementById('sq').addEventListener('keypress',(e)=>{if(e.key==='Enter')search()});
-document.querySelectorAll('.modal').forEach(m=>m.addEventListener('click',(e)=>{if(e.target===m)closeModal(m.id)}));
-
-// 获取当前进程 PID（用于禁用杀死当前进程的按钮）
-let currentPID = null;
-fetch('/api/processes').then(r=>r.json()).then(d=>{
-    if(d.processes&&d.processes.length>0){
-        currentPID=d.processes[d.processes.length-1].pid; // 最新的进程是当前进程
-    }
+async function killProc(pid){
+if(!confirm(`确定要杀死进程 PID=${pid} 吗？`))return;
+try{
+await fetch('/api/process/kill',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({pid})
 });
+alert('已杀死进程');
+refreshProc();
+}catch(e){alert('操作失败')};
+}
 
-initChart();
-setInterval(updateStats,3000);
-setInterval(updateChart,5000);
-setInterval(updateLogs,5000);
-setInterval(updateFailLogs,5000);
-setInterval(updateActive,3000);
-setInterval(updateProcessCount,5000);
-updateStats();
-updateChart();
-updateLogs();
-updateFailLogs();
-updateActive();
-updateProcessCount();
+setInterval(update,5000);
+update();
 </script>
 </body>
 </html>
 HTMLEOF
+echo "✅ Web 界面创建完成"
 
-echo "✅ HTML 界面完成（包含进程管理面板）"
-
-# --- 编译 ---
-echo "--- 步骤 5: 编译 Go 程序 ---"
-cd "$BUILD_DIR"
-/usr/local/go/bin/go mod init ipv6-proxy >/dev/null 2>&1
-/usr/local/go/bin/go mod tidy >/dev/null
-CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy .
-echo "✅ 编译完成"
-
-# --- 安装 ---
-echo "--- 步骤 6: 安装到系统 ---"
+# 安装
 mkdir -p "$INSTALL_DIR"
-mv ipv6-proxy "$INSTALL_DIR/"
-mv index.html "$INSTALL_DIR/"
+mv ipv6-proxy index.html "$INSTALL_DIR/"
 cd /
 rm -rf "$BUILD_DIR"
-echo "✅ 安装完成"
+echo "✅ 安装到 $INSTALL_DIR"
 
-# --- systemd 服务 ---
-echo "--- 步骤 7: 创建 systemd 服务 ---"
-cat > /etc/systemd/system/ipv6-proxy.service << SERVICEEOF
+# systemd 服务
+cat > /etc/systemd/system/ipv6-proxy.service << 'SERVICEEOF'
 [Unit]
 Description=IPv6 Proxy v8.0 Final Plus
 After=network-online.target
@@ -2378,10 +1900,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/ipv6-proxy
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+WorkingDirectory=/opt/ipv6-proxy
+ExecStart=/opt/ipv6-proxy/ipv6-proxy
 Restart=always
 RestartSec=5
 LimitNOFILE=1000000
@@ -2393,66 +1913,28 @@ WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
-echo "✅ 服务创建完成"
-
-# --- NDP 定期清理脚本 ---
-echo "--- 步骤 8: NDP 定期清理 ---"
-cat > /usr/local/bin/ndp-cleanup.sh << 'CLEANUPEOF'
-#!/bin/bash
-# NDP 表定期清理脚本
-IFACE=$(ip -6 route | grep default | awk '{print $5}' | head -1)
-if [ -n "$IFACE" ]; then
-    ip -6 neigh flush dev $IFACE 2>/dev/null || true
-fi
-CLEANUPEOF
-
-chmod +x /usr/local/bin/ndp-cleanup.sh
-
-# 添加 cron 任务（每小时清理一次）
-if ! crontab -l 2>/dev/null | grep -q "ndp-cleanup.sh"; then
-    (crontab -l 2>/dev/null; echo "0 * * * * /usr/local/bin/ndp-cleanup.sh >/dev/null 2>&1") | crontab -
-fi
-echo "✅ NDP 自动清理已设置"
-
-# --- 启动服务 ---
-echo "--- 步骤 9: 启动服务 ---"
 systemctl enable ipv6-proxy.service
 systemctl start ipv6-proxy.service
 sleep 3
-systemctl status ipv6-proxy.service --no-pager
 
 echo ""
 echo "============================================="
-echo "=== ✅ IPv6 代理 v8.0 Final Plus 安装完成 ==="
+echo "===        ✅ 安装完成！              ==="
 echo "============================================="
 echo ""
-echo "📌 服务状态:"
-echo "   systemctl status ipv6-proxy"
-echo ""
-echo "📌 查看日志:"
-echo "   journalctl -u ipv6-proxy -f"
-echo ""
-echo "📌 配置文件:"
-echo "   $INSTALL_DIR/config.json"
-echo ""
-echo "📌 Web 管理面板:"
+echo "📌 Web 管理:"
 echo "   http://$(hostname -I | awk '{print $1}'):8080"
-echo "   (默认账号: admin / admin123)"
+echo "   账号: admin / admin123"
 echo ""
-echo "🎉 新增功能:"
-echo "   🔥 自动清理多余进程（>5个自动杀最旧的）"
-echo "   🔥 进程管理面板（点击CPU卡片查看）"
-echo "   🔥 手动杀死进程按钮"
+echo "📌 服务管理:"
+echo "   状态: systemctl status ipv6-proxy"
+echo "   日志: journalctl -u ipv6-proxy -f"
+echo "   重启: systemctl restart ipv6-proxy"
 echo ""
-echo "✅ 完整功能:"
-echo "   🎨 卡片式配置界面"
-echo "   🔌 多端口动态管理"
-echo "   ⚡ 5分钟强制超时"
+echo "🎉 功能特性:"
+echo "   ✅ 自动进程管理（最多5个）"
+echo "   ✅ 手动杀死进程"
+echo "   ✅ 5分钟连接超时"
 echo "   ✅ 完整泄漏修复"
-echo "   ✅ 无锁随机优化"
-echo "   ✅ 批量删除优化"
-echo "   ✅ NDP 自动清理"
-echo "   ✅ 僵尸连接清理（每2分钟）"
-echo "   ✅ 并发限制 2000"
+echo "   ✅ 多端口支持"
 echo ""
-echo "============================================="
