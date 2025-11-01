@@ -44,7 +44,8 @@
 ## 📦 一键部署
 
 ```bash
-# 30秒完成部署
+# 直接下载并运行安装脚本
+wget -O install.sh https://raw.githubusercontent.com/kenanjun001/ipv6-rotating-proxy/main/install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
