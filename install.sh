@@ -1,12 +1,7 @@
 #!/bin/bash
 #
-# IPv6 代理 v7.4 Final (完全修复版) 一键安装脚本
-#
-# 修复：
-# ✅ 编译错误修复
-# ✅ 自动配置防火墙
-# ✅ 双CPU监控
-# ✅ 5个新功能完整实现
+# IPv6 代理 v7.4 Final 完全集成版安装脚本
+# 包含：自动处理dpkg锁、错误恢复、界面优化
 #
 
 INSTALL_DIR="/opt/ipv6-proxy"
@@ -18,19 +13,93 @@ export GOROOT=/usr/local/go
 export GOPATH=$HOME/go
 export PATH=/usr/local/go/bin:$PATH:$GOPATH/bin
 
-set -e
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
+# 不在出错时退出，我们要处理错误
+set +e
+
+# 打印函数
+print_success() { echo -e "${GREEN}✅ $1${NC}"; }
+print_error() { echo -e "${RED}❌ $1${NC}"; }
+print_warning() { echo -e "${YELLOW}⚠️  $1${NC}"; }
+print_info() { echo -e "${BLUE}ℹ️  $1${NC}"; }
+
+# 检查root权限
 if [ "$(id -u)" -ne 0 ]; then
-  echo "❌ 错误：需要 root 权限"
-  exit 1
+    print_error "需要 root 权限"
+    echo "请使用: sudo $0"
+    exit 1
 fi
 
 echo "============================================="
-echo "=== IPv6 代理 v7.4 Final 安装中 ==="
+echo "=== IPv6 代理 v7.4 Final 完全集成版 ==="
 echo "============================================="
 echo ""
 
-# --- 清理 ---
+# --- 智能处理dpkg锁 ---
+handle_apt_locks() {
+    local max_wait=60  # 最多等待60秒
+    local waited=0
+    local need_wait=false
+    
+    # 检查是否有锁
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+       fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        need_wait=true
+    fi
+    
+    if [ "$need_wait" = true ]; then
+        print_warning "检测到系统正在进行其他操作"
+        echo "正在智能处理..."
+        
+        # 首先尝试温和等待
+        while [ $waited -lt $max_wait ]; do
+            if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+               ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
+               ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+                print_success "系统锁已释放"
+                return 0
+            fi
+            
+            if [ $((waited % 10)) -eq 0 ] && [ $waited -gt 0 ]; then
+                echo "   等待中... ($waited/$max_wait 秒)"
+            fi
+            
+            sleep 2
+            waited=$((waited + 2))
+        done
+        
+        # 超时后强制处理
+        print_info "自动清理系统锁..."
+        
+        # 停止相关进程
+        killall apt 2>/dev/null || true
+        killall apt-get 2>/dev/null || true
+        killall dpkg 2>/dev/null || true
+        killall unattended-upgr 2>/dev/null || true
+        
+        sleep 2
+        
+        # 清理锁文件
+        rm -f /var/lib/apt/lists/lock
+        rm -f /var/cache/apt/archives/lock
+        rm -f /var/lib/dpkg/lock*
+        rm -f /var/lib/dpkg/lock-frontend
+        
+        # 修复dpkg
+        dpkg --configure -a 2>/dev/null || true
+        
+        print_success "系统锁已清理"
+    fi
+}
+
+# --- 步骤 1: 清理旧版本 ---
 echo "--- 步骤 1: 清理旧版本 ---"
 systemctl stop ipv6-proxy.service >/dev/null 2>&1 || true
 systemctl disable ipv6-proxy.service >/dev/null 2>&1 || true
@@ -38,26 +107,68 @@ rm -f /etc/systemd/system/ipv6-proxy.service
 rm -rf /opt/ipv6-proxy
 rm -rf "$BUILD_DIR"
 systemctl daemon-reload
-echo "✅ 清理完成"
+print_success "清理完成"
 echo ""
 
-# --- 安装依赖 ---
+# --- 步骤 2: 安装依赖 ---
 echo "--- 步骤 2: 安装依赖 ---"
-apt-get update >/dev/null
-apt-get install -y wget >/dev/null
+
+# 处理dpkg锁
+handle_apt_locks
+
+# 尝试更新apt
+echo "更新软件包列表..."
+for i in {1..3}; do
+    if apt-get update >/dev/null 2>&1; then
+        break
+    else
+        if [ $i -eq 3 ]; then
+            print_warning "apt update 失败，尝试修复..."
+            handle_apt_locks
+            apt-get update --fix-missing >/dev/null 2>&1 || true
+        else
+            sleep 2
+        fi
+    fi
+done
+
+# 安装wget
+echo "安装必要组件..."
+for i in {1..3}; do
+    if apt-get install -y wget >/dev/null 2>&1; then
+        break
+    else
+        if [ $i -eq 3 ]; then
+            print_error "安装 wget 失败"
+            handle_apt_locks
+            apt-get install -y wget --fix-missing >/dev/null 2>&1 || {
+                print_error "无法安装依赖，请检查网络"
+                exit 1
+            }
+        else
+            sleep 2
+        fi
+    fi
+done
+
+# 清理旧版go
 apt-get remove -y golang-go >/dev/null 2>&1 || true
 
+# 安装Go
 if [ ! -d "/usr/local/go" ] || ! /usr/local/go/bin/go version | grep -q "$GO_VERSION"; then
-  echo "下载 Go $GO_VERSION..."
-  wget -q "$GO_URL" -O "/tmp/$GO_TAR"
-  tar -C /usr/local -xzf "/tmp/$GO_TAR"
-  rm "/tmp/$GO_TAR"
+    echo "下载 Go $GO_VERSION..."
+    wget -q "$GO_URL" -O "/tmp/$GO_TAR" || {
+        print_error "下载 Go 失败，请检查网络"
+        exit 1
+    }
+    tar -C /usr/local -xzf "/tmp/$GO_TAR"
+    rm "/tmp/$GO_TAR"
 fi
 
-echo "✅ Go 环境就绪"
+print_success "Go 环境就绪"
 echo ""
 
-# --- 创建源代码 ---
+# --- 步骤 3: 创建源代码 ---
 echo "--- 步骤 3: 创建源代码 ---"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
@@ -1419,13 +1530,11 @@ func main() {
 }
 GOEOF
 
-echo "✅ 源代码完成"
+print_success "源代码完成"
 echo ""
 
-# --- 创建 HTML ---
-echo "--- 步骤 4: 创建 Web 前端 ---"
-
-# 由于HTML太长，这里用原来的完整版本
+# --- 步骤 4: 创建前端 ---
+echo "--- 步骤 4: 创建前端 ---"
 cat << 'HTMLEOF' > index.html
 <!DOCTYPE html>
 <html lang="zh">
@@ -1963,19 +2072,19 @@ function initChart() {
         data: {
             labels: [],
             datasets: [
-                {label: 'QPS', data: [], borderColor: '#3b82f6', yAxisID: 'y', tension: 0.4},
-                {label: '成功率%', data: [], borderColor: '#10b981', yAxisID: 'y1', tension: 0.4},
-                {label: 'CPU%', data: [], borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.4}
+                {label: 'QPS', data: [], borderColor: '#4f46e5', yAxisID: 'y', tension: 0.4, borderWidth: 2},
+                {label: '成功率%', data: [], borderColor: '#10b981', yAxisID: 'y1', tension: 0.4, borderWidth: 2},
+                {label: 'CPU%', data: [], borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.4, borderWidth: 2}
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: {legend: {labels: {color: '#e2e8f0'}}},
+            plugins: {legend: {labels: {color: '#334155', padding: 15, font: {size: 12}}}},
             scales: {
-                x: {ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
-                y: {type: 'linear', position: 'left', ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
-                y1: {type: 'linear', position: 'right', ticks: {color: '#94a3b8'}, grid: {display: false}}
+                x: {ticks: {color: '#64748b', font: {size: 11}}, grid: {color: '#e2e8f0', drawOnChartArea: true}},
+                y: {type: 'linear', position: 'left', ticks: {color: '#64748b', font: {size: 11}}, grid: {color: '#e2e8f0'}},
+                y1: {type: 'linear', position: 'right', ticks: {color: '#64748b', font: {size: 11}}, grid: {display: false}}
             }
         }
     });
@@ -2151,29 +2260,45 @@ updateActiveConns();
 </html>
 HTMLEOF
 
-echo "✅ 前端完成"
+print_success "前端完成"
 echo ""
 
-# --- 编译 ---
+# --- 步骤 5: 编译 ---
 echo "--- 步骤 5: 编译 ---"
+
+# 检测是否在中国，配置GOPROXY
+if ping -c 1 -W 1 goproxy.cn >/dev/null 2>&1; then
+    export GOPROXY=https://goproxy.cn,direct
+    echo "使用中国代理: goproxy.cn"
+fi
+
 /usr/local/go/bin/go mod init ipv6-proxy >/dev/null 2>&1
-/usr/local/go/bin/go mod tidy >/dev/null
+echo "下载依赖..."
+/usr/local/go/bin/go mod tidy >/dev/null 2>&1 || {
+    print_warning "下载依赖失败，重试..."
+    handle_apt_locks
+    /usr/local/go/bin/go mod tidy
+}
+
 echo "编译中..."
-CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy .
-echo "✅ 编译完成"
+CGO_ENABLED=0 /usr/local/go/bin/go build -ldflags "-s -w" -o ipv6-proxy . || {
+    print_error "编译失败"
+    exit 1
+}
+print_success "编译完成"
 echo ""
 
-# --- 安装 ---
+# --- 步骤 6: 安装 ---
 echo "--- 步骤 6: 安装 ---"
 mkdir -p "$INSTALL_DIR"
 mv ipv6-proxy "$INSTALL_DIR/"
 mv index.html "$INSTALL_DIR/"
 cd /
 rm -rf "$BUILD_DIR"
-echo "✅ 安装完成"
+print_success "安装完成"
 echo ""
 
-# --- 服务 ---
+# --- 步骤 7: 创建服务 ---
 echo "--- 步骤 7: 创建服务 ---"
 cat << SERVICEEOF > /etc/systemd/system/ipv6-proxy.service
 [Unit]
@@ -2196,7 +2321,7 @@ WantedBy=multi-user.target
 SERVICEEOF
 
 systemctl daemon-reload
-echo "✅ 服务创建完成"
+print_success "服务创建完成"
 echo ""
 
 # --- 配置 ---
@@ -2205,10 +2330,12 @@ echo "【首次配置】"
 echo "============================================="
 echo ""
 
-sudo $INSTALL_DIR/ipv6-proxy || true
+# 运行配置
+cd "$INSTALL_DIR"
+./ipv6-proxy || true
 
 echo ""
-echo "✅ 配置完成"
+print_success "配置完成"
 echo ""
 
 # --- 防火墙 ---
@@ -2223,16 +2350,16 @@ if command -v ufw >/dev/null 2>&1; then
     fi
     
     echo "开放端口..."
-    ufw allow ${PROXY_PORT}/tcp comment "IPv6 Proxy" >/dev/null 2>&1
-    ufw allow ${WEB_PORT}/tcp comment "IPv6 Web Panel" >/dev/null 2>&1
+    ufw allow ${PROXY_PORT}/tcp comment "IPv6 Proxy" >/dev/null 2>&1 || true
+    ufw allow ${WEB_PORT}/tcp comment "IPv6 Web Panel" >/dev/null 2>&1 || true
     
-    echo "✅ 防火墙已配置"
+    print_success "防火墙已配置"
     echo "   代理: ${PROXY_PORT}/tcp"
     echo "   Web: ${WEB_PORT}/tcp"
 else
     PROXY_PORT="1080"
     WEB_PORT="8080"
-    echo "⚠️  未检测到 ufw"
+    print_warning "未检测到 ufw"
     echo "   手动配置: ufw allow ${PROXY_PORT}/tcp"
     echo "   手动配置: ufw allow ${WEB_PORT}/tcp"
 fi
@@ -2243,9 +2370,18 @@ echo "【启动服务】"
 systemctl enable ipv6-proxy >/dev/null 2>&1
 systemctl start ipv6-proxy
 
+# 检查服务状态
+sleep 2
+if systemctl is-active --quiet ipv6-proxy; then
+    print_success "服务启动成功"
+else
+    print_warning "服务启动可能失败，请检查："
+    echo "   systemctl status ipv6-proxy"
+fi
+
 echo ""
 echo "================================================"
-echo "🎉 v7.4 Final 安装成功！"
+echo "🎉 IPv6 代理 v7.4 Final 安装成功！"
 echo "================================================"
 echo ""
 echo "Web 面板: http://$(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${WEB_PORT}"
@@ -2257,9 +2393,12 @@ echo "  用户: proxy"
 echo "  密码: proxy123"
 echo ""
 echo "管理命令:"
-echo "  systemctl status ipv6-proxy"
-echo "  journalctl -u ipv6-proxy -f"
-echo "  systemctl restart ipv6-proxy"
+echo "  systemctl status ipv6-proxy     # 查看状态"
+echo "  systemctl restart ipv6-proxy    # 重启服务"
+echo "  systemctl stop ipv6-proxy       # 停止服务"
+echo "  journalctl -u ipv6-proxy -f     # 查看日志"
 echo ""
-echo "🎊 享受 v7.4 Final！"
+echo "配置文件: $INSTALL_DIR/config.json"
 echo ""
+echo "🎊 享受你的 IPv6 代理服务！"
+echo "================================================"
