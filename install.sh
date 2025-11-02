@@ -149,6 +149,7 @@ type Config struct {
 	TargetPool        int    `json:"target_pool"`
 	AutoRotate        bool   `json:"auto_rotate"`
 	AutoRotateHours   int    `json:"auto_rotate_hours"`
+	AutoClean         bool   `json:"auto_clean"`
 }
 
 type Stats struct {
@@ -343,6 +344,10 @@ func runInteractiveSetup() error {
 	if config.AutoRotate {
 		config.AutoRotateHours = readUserInt("间隔(小时)", 6)
 	}
+	
+	log.Println("\n--- 自清理 ---")
+	autoClean := readUserString("启用失败IPv6自动清理? (y/n)", "y")
+	config.AutoClean = strings.ToLower(autoClean) == "y"
 	
 	return nil
 }
@@ -755,7 +760,7 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 		}
 		atomic.AddInt64(&stats.FailedConns, 1)
 		
-		if shouldDiscard {
+		if config.AutoClean && shouldDiscard {
 			select {
 			case discardQueue <- ip:
 			default:
@@ -1032,6 +1037,7 @@ func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 		"auto_rotate":     atomic.LoadInt32(&autoRotateEnabled) == 1,
 		"rotate_interval": atomic.LoadInt64(&autoRotateInterval),
 		"next_rotate":     nextRotate,
+		"auto_clean":      config.AutoClean,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
@@ -1220,6 +1226,27 @@ func handleAPIAutoRotate(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "设置已更新"})
 }
 
+func handleAPIAutoClean(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	config.AutoClean = req.Enabled
+	saveConfigToFile()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "自清理设置已更新"})
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	html, err := os.ReadFile(indexHTMLPath)
 	if err != nil {
@@ -1257,6 +1284,7 @@ func startWebServer(ctx context.Context) *http.Server {
 	mux.HandleFunc("/api/rotate", basicAuth(handleAPIRotate(ctx)))
 	mux.HandleFunc("/api/config", basicAuth(handleAPIUpdateConfig))
 	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))
+	mux.HandleFunc("/api/autoclean", basicAuth(handleAPIAutoClean))
 
 	srv := &http.Server{
 		Addr:    ":" + config.WebPort,
@@ -1407,7 +1435,7 @@ cat << 'HTMLEOF' > index.html
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * {margin:0;padding:0;box-sizing:border-box}
-        body {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#0f172a;color:#e2e8f0;padding:10px}
+        body {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#0f172a url('https://pub-bc6dc5bd52c141569ce1f7da2fc4c5f5.r2.dev/bandicam%202025-06-29%2000-48-32-513.png') no-repeat center center fixed;background-size:cover;color:#e2e8f0;padding:10px}
         .container {max-width:1600px;margin:0 auto}
         h1 {font-size:24px;margin-bottom:20px;color:#60a5fa}
         .grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}
@@ -1487,6 +1515,16 @@ cat << 'HTMLEOF' > index.html
             <span id="auto-rotate-status"></span>
         </div>
         <div id="next-rotate-info" style="font-size:13px;color:#94a3b8"></div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">🧹 自清理</div>
+        <div class="input-group">
+            <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="auto-clean-enabled" style="width:auto">启用失败IPv6自动删除补入</label>
+            <button onclick="saveAutoClean()">保存</button>
+            <span id="auto-clean-status"></span>
+        </div>
+        <div style="font-size:13px;color:#94a3b8">开启后，连接失败的IPv6地址将自动删除并补充新地址</div>
     </div>
 
     <div class="section">
@@ -1589,6 +1627,10 @@ async function updateStats() {
             document.getElementById('auto-rotate-hours').value = d.rotate_interval;
             document.getElementById('next-rotate-info').innerHTML = `⏰ 下次: <strong>${d.next_rotate}</strong>`;
         }
+        
+        if (d.auto_clean !== undefined) {
+            document.getElementById('auto-clean-enabled').checked = d.auto_clean;
+        }
     } catch (e) {}
 }
 
@@ -1681,6 +1723,15 @@ async function saveAutoRotate() {
         const r = await fetch('/api/autorotate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled, interval: hours})}).then(r => r.json());
         document.getElementById('auto-rotate-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
         setTimeout(() => {document.getElementById('auto-rotate-status').textContent = ''; updateStats();}, 2000);
+    } catch (e) {alert('失败');}
+}
+
+async function saveAutoClean() {
+    const enabled = document.getElementById('auto-clean-enabled').checked;
+    try {
+        const r = await fetch('/api/autoclean', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})}).then(r => r.json());
+        document.getElementById('auto-clean-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
+        setTimeout(() => {document.getElementById('auto-clean-status').textContent = ''; updateStats();}, 2000);
     } catch (e) {alert('失败');}
 }
 
