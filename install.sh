@@ -272,445 +272,460 @@ func selectInterface() (netlink.Link, error) {
 	return validLinks[choice-1], nil
 }
 
-func selectIPv6Prefix(iface netlink.Link) (string, error) {
-	addrs, err := netlink.AddrList(iface, netlink.FAMILY_V6)
+func getInterface() error {
+	log.Println("获取网卡信息...")
+	l, err := selectInterface()
 	if err != nil {
-		return "", err
+		return err
 	}
-	prefixMap := make(map[string]bool)
-	for _, addr := range addrs {
-		if addr.IPNet != nil && addr.IPNet.IP.IsGlobalUnicast() {
-			ones, bits := addr.IPNet.Mask.Size()
-			if bits == 128 && ones <= 64 {
-				ip64 := addr.IPNet.IP.Mask(net.CIDRMask(64, 128))
-				prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-					ip64[0], ip64[1], ip64[2], ip64[3], ip64[4], ip64[5], ip64[6], ip64[7])
-				prefixMap[prefixStr] = true
-			}
+	iface = l
+	config.Interface = iface.Attrs().Name
+	log.Printf("✅ 选择网卡: %s", config.Interface)
+	
+	for i := 0; i < 3; i++ {
+		if err := checkIPv6(); err == nil {
+			return nil
 		}
+		log.Printf("检查 IPv6 (%d/3)...", i+1)
+		time.Sleep(2 * time.Second)
 	}
-	if len(prefixMap) == 0 {
-		log.Println("请输入 IPv6 /64 前缀:")
-		reader := bufio.NewReader(os.Stdin)
-		text, _ := reader.ReadString('\n')
-		return strings.TrimSpace(text), nil
-	}
-	var validPrefixes []string
-	for prefix := range prefixMap {
-		validPrefixes = append(validPrefixes, prefix)
-	}
-	log.Println("IPv6 前缀:")
-	for i, prefix := range validPrefixes {
-		log.Printf("  %d: %s", i+1, prefix)
-	}
-	choice := readUserChoice(len(validPrefixes))
-	return validPrefixes[choice-1], nil
+	return errors.New("无法验证 IPv6 地址，请手动输入")
 }
 
-func runInteractiveSetup() error {
-	log.Println("--- Web 设置 ---")
-	config.WebUsername = readUserString("Web账号", "admin")
-	config.WebPassword = readUserPassword("Web密码", "admin123")
+func checkIPv6() error {
+	addrs, err := netlink.AddrList(iface, netlink.FAMILY_V6)
+	if err != nil {
+		return err
+	}
+	for _, addr := range addrs {
+		ip := addr.IP
+		if ip.IsGlobalUnicast() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsPrivate() {
+			config.IPv6Prefix = addr.IPNet.String()
+			log.Printf("✅ 自动检测 IPv6 前缀: %s", config.IPv6Prefix)
+			prefixIP, prefixNet, _ = net.ParseCIDR(config.IPv6Prefix)
+			return nil
+		}
+	}
+	return errors.New("未检测到有效的公网 IPv6 地址")
+}
+
+func setupConfig() error {
+	log.Println()
+	log.Println("【配置向导】")
+	log.Println("====================")
 	
-	log.Println("\n--- 代理设置 ---")
 	config.Port = readUserString("代理端口", "1080")
-	config.WebPort = readUserString("Web端口", "8080")
 	config.Username = readUserString("代理用户名", "proxy")
 	config.Password = readUserPassword("代理密码", "proxy123")
-
-	log.Println("\n--- 网络 ---")
-	selectedIface, err := selectInterface()
-	if err != nil {
-		return err
-	}
-	config.Interface = selectedIface.Attrs().Name
-
-	selectedPrefix, err := selectIPv6Prefix(selectedIface)
-	if err != nil {
-		return err
-	}
-	config.IPv6Prefix = selectedPrefix
-
-	log.Println("\n--- IP 池 ---")
-	config.InitialPool = readUserInt("初始池", 10000)
-	config.TargetPool = readUserInt("目标池", 100000)
-	if config.TargetPool < config.InitialPool {
-		config.TargetPool = config.InitialPool
+	
+	log.Println()
+	config.WebPort = readUserString("Web 端口", "8080")
+	config.WebUsername = readUserString("Web 用户名", "admin")
+	config.WebPassword = readUserPassword("Web 密码", "admin123")
+	
+	log.Println()
+	if err := getInterface(); err != nil {
+		config.IPv6Prefix = readUserString("IPv6 前缀 (如 2a0e:aa07:e038::/64)", "")
+		if config.IPv6Prefix == "" {
+			return errors.New("IPv6 前缀不能为空")
+		}
+		var err error
+		prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix)
+		if err != nil {
+			return fmt.Errorf("无效的 IPv6 前缀: %v", err)
+		}
 	}
 	
-	log.Println("\n--- 自动轮换 ---")
-	autoRotate := readUserString("启用? (y/n)", "n")
-	config.AutoRotate = strings.ToLower(autoRotate) == "y"
+	log.Println()
+	config.InitialPool = readUserInt("初始池大小", 500)
+	config.TargetPool = readUserInt("目标池大小", 1000)
+	config.AutoRotate = readUserInt("自动轮换 (1=开启, 0=关闭)", 1) == 1
 	if config.AutoRotate {
-		config.AutoRotateHours = readUserInt("间隔(小时)", 6)
+		config.AutoRotateHours = readUserInt("轮换间隔(小时)", 6)
+		log.Printf("✅ 自动轮换: 每 %d 小时", config.AutoRotateHours)
+	}
+	config.AutoClean = readUserInt("自动清理失效IP (1=开启, 0=关闭)", 1) == 1
+	if config.AutoClean {
+		log.Println("✅ 自动清理: 已启用")
 	}
 	
-	log.Println("\n--- 自清理 ---")
-	autoClean := readUserString("启用失败IPv6自动清理? (y/n)", "y")
-	config.AutoClean = strings.ToLower(autoClean) == "y"
-	
+	configData, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(configFilePath, configData, 0644); err != nil {
+		return err
+	}
+	log.Println()
+	log.Printf("✅ 配置已保存: %s", configFilePath)
 	return nil
 }
 
-func saveConfigToFile() error {
-	data, err := json.MarshalIndent(config, "", "  ")
+func loadConfig() error {
+	configData, err := os.ReadFile(configFilePath)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configFilePath, data, 0644)
-}
-
-func loadConfigFromFile() error {
-	data, err := os.ReadFile(configFilePath)
-	if err != nil {
+	if err := json.Unmarshal(configData, &config); err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &config)
+	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix)
+	if err != nil {
+		return fmt.Errorf("配置文件中的 IPv6 前缀无效: %v", err)
+	}
+	l, err := netlink.LinkByName(config.Interface)
+	if err != nil {
+		return fmt.Errorf("找不到网卡 %s: %v", config.Interface, err)
+	}
+	iface = l
+	log.Printf("✅ 已加载配置: %s", configFilePath)
+	return nil
 }
 
-func generateRandomIP() net.IP {
-	ip := make(net.IP, 16)
+func addIPToInterface(ipStr string) error {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return fmt.Errorf("无效的 IP: %s", ipStr)
+	}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(128, 128),
+		},
+		Label: "",
+	}
+	if err := netlink.AddrAdd(iface, addr); err != nil && !strings.Contains(err.Error(), "exists") {
+		return err
+	}
+	return nil
+}
+
+func removeIPFromInterface(ipStr string) error {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return fmt.Errorf("无效的 IP: %s", ipStr)
+	}
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(128, 128),
+		},
+	}
+	if err := netlink.AddrDel(iface, addr); err != nil && !strings.Contains(err.Error(), "cannot assign") {
+		return err
+	}
+	return nil
+}
+
+func generateRandomIPv6() net.IP {
+	ip := make(net.IP, len(prefixIP))
 	copy(ip, prefixIP)
-	if _, err := rand.Read(ip[8:]); err != nil {
-		binary.BigEndian.PutUint64(ip[8:], mrand.Uint64())
+	rngLock.Lock()
+	for i := 8; i < 16; i++ {
+		ip[i] = byte(rng.Intn(256))
 	}
+	rngLock.Unlock()
 	return ip
 }
 
-func delIPv6(ip net.IP) {
-	addr, _ := netlink.ParseAddr(ip.String() + "/128")
-	netlink.AddrDel(iface, addr)
+func isUniqueIP(ip net.IP) bool {
+	poolLock.RLock()
+	defer poolLock.RUnlock()
+	_, exists := ipv6PoolIndex[ip.String()]
+	return !exists
 }
 
-func addIPv6(ip net.IP) error {
-	addr, _ := netlink.ParseAddr(ip.String() + "/128")
-	return netlink.AddrAdd(iface, addr)
-}
-
-func addConnLog(clientIP, target, ipv6, status string, duration time.Duration) {
-	connLog := &ConnLog{
-		Time:     time.Now().Format("15:04:05"),
-		ClientIP: clientIP,
-		Target:   target,
-		IPv6:     ipv6,
-		Status:   status,
-		Duration: fmt.Sprintf("%.2fs", duration.Seconds()),
-	}
-	
-	connLogsLock.Lock()
-	if len(connLogs) >= maxLogs {
-		connLogs = connLogs[1:]
-	}
-	connLogs = append(connLogs, connLog)
-	connLogsLock.Unlock()
-	
-	if !strings.Contains(status, "✅") {
-		failLogsLock.Lock()
-		if len(failLogs) >= maxLogs {
-			failLogs = failLogs[1:]
-		}
-		failLogs = append(failLogs, connLog)
-		failLogsLock.Unlock()
-	}
-}
-
-func populateIPPool(numToAdd int) ([]net.IP, int) {
-	newIPs := make([]net.IP, 0, numToAdd)
-	success := 0
-	
-	for i := 0; i < numToAdd; i++ {
-		ip := generateRandomIP()
-		if addIPv6(ip) == nil {
-			newIPs = append(newIPs, ip)
-			success++
-		}
-		if term.IsTerminal(int(syscall.Stdin)) && ((i+1)%100 == 0 || (i+1) == numToAdd) {
-			fmt.Printf("\r   进度: %d/%d ", i+1, numToAdd)
-		}
-	}
-	if term.IsTerminal(int(syscall.Stdin)) && numToAdd > 0 {
-		fmt.Println()
-	}
-	return newIPs, success
-}
-
-func initIPv6Pool() error {
-	log.Printf("初始化: %d 个IP", config.InitialPool)
-	if config.InitialPool == 0 {
-		return nil
-	}
-
-	newIPs, success := populateIPPool(config.InitialPool)
-	ipv6Pool = newIPs
-	ipv6PoolIndex = make(map[string]int, success)
-	for i, ip := range newIPs {
-		ipv6PoolIndex[ip.String()] = i
-	}
-	atomic.StoreInt64(&stats.PoolSize, int64(success))
-
-	if success == 0 {
-		return fmt.Errorf("初始化失败")
-	}
-	return nil
-}
-
-func backgroundAddTask(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	
+func generateUniqueIPv6() net.IP {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if atomic.LoadInt32(&backgroundRunning) == 0 {
-				continue
-			}
-			
-			currentSize := int(atomic.LoadInt64(&stats.PoolSize))
-			if currentSize >= config.TargetPool {
-				atomic.StoreInt32(&backgroundRunning, 0)
-				continue
-			}
-			
-			for i := 0; i < 50 && currentSize < config.TargetPool; i++ {
-				ip := generateRandomIP()
-				if addIPv6(ip) == nil {
-					poolLock.Lock()
-					ipv6Pool = append(ipv6Pool, ip)
-					ipv6PoolIndex[ip.String()] = len(ipv6Pool) - 1
-					poolLock.Unlock()
-					atomic.AddInt64(&stats.PoolSize, 1)
-					atomic.AddInt64(&backgroundAdded, 1)
-					currentSize++
-				}
-			}
+		ip := generateRandomIPv6()
+		if isUniqueIP(ip) {
+			return ip
 		}
 	}
 }
 
-func discardWorker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	batch := make([]net.IP, 0, 1000)
-	
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ip := <-discardQueue:
-			batch = append(batch, ip)
-			if len(batch) >= 100 {
-				processBatch(batch)
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				processBatch(batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
-
-func processBatch(ips []net.IP) {
-	if len(ips) == 0 {
-		return
-	}
-	
-	for _, ip := range ips {
-		delIPv6(ip)
-	}
-	
+func initPool() {
 	poolLock.Lock()
-	for _, ip := range ips {
-		ipString := ip.String()
-		if index, ok := ipv6PoolIndex[ipString]; ok {
-			lastIP := ipv6Pool[len(ipv6Pool)-1]
-			ipv6Pool[index] = lastIP
-			ipv6PoolIndex[lastIP.String()] = index
-			ipv6Pool = ipv6Pool[:len(ipv6Pool)-1]
-			delete(ipv6PoolIndex, ipString)
+	defer poolLock.Unlock()
+	
+	ipv6Pool = make([]net.IP, 0)
+	ipv6PoolIndex = make(map[string]int)
+	
+	poolSize := config.InitialPool
+	if poolSize < 100 {
+		poolSize = 100
+	}
+	
+	log.Printf("初始化 IP 池 (大小: %d)...", poolSize)
+	addedCount := 0
+	for addedCount < poolSize {
+		ip := generateUniqueIPv6()
+		if err := addIPToInterface(ip.String()); err == nil {
+			ipv6Pool = append(ipv6Pool, ip)
+			ipv6PoolIndex[ip.String()] = len(ipv6Pool) - 1
+			addedCount++
+			if addedCount%100 == 0 {
+				log.Printf("  已添加 %d/%d IP", addedCount, poolSize)
+			}
 		}
 	}
-	poolLock.Unlock()
-	
-	newSize := atomic.AddInt64(&stats.PoolSize, -int64(len(ips)))
-	if int(newSize) < config.TargetPool {
-		atomic.StoreInt32(&backgroundRunning, 1)
+	atomic.StoreInt64(&stats.PoolSize, int64(len(ipv6Pool)))
+	log.Printf("✅ IP 池初始化完成 (有效: %d)", len(ipv6Pool))
+}
+
+func backgroundAddIP() {
+	for atomic.LoadInt32(&backgroundRunning) == 1 {
+		targetPool := config.TargetPool
+		if targetPool < 100 {
+			targetPool = 100
+		}
+		
+		poolLock.RLock()
+		currentSize := len(ipv6Pool)
+		poolLock.RUnlock()
+		
+		if currentSize >= targetPool {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		
+		ip := generateUniqueIPv6()
+		if err := addIPToInterface(ip.String()); err == nil {
+			poolLock.Lock()
+			ipv6Pool = append(ipv6Pool, ip)
+			ipv6PoolIndex[ip.String()] = len(ipv6Pool) - 1
+			poolLock.Unlock()
+			
+			atomic.AddInt64(&backgroundAdded, 1)
+			atomic.StoreInt64(&stats.PoolSize, int64(currentSize+1))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func backgroundCleanup() {
+	for {
+		time.Sleep(10 * time.Second)
+		cleanupStaleIPs()
+	}
+}
+
+func cleanupStaleIPs() {
+	select {
+	case staleIP := <-discardQueue:
+		ipStr := staleIP.String()
+		poolLock.Lock()
+		if idx, exists := ipv6PoolIndex[ipStr]; exists {
+			removeIPFromInterface(ipStr)
+			ipv6Pool = append(ipv6Pool[:idx], ipv6Pool[idx+1:]...)
+			delete(ipv6PoolIndex, ipStr)
+			for i := idx; i < len(ipv6Pool); i++ {
+				ipv6PoolIndex[ipv6Pool[i].String()] = i
+			}
+		}
+		poolLock.Unlock()
+		atomic.StoreInt64(&stats.PoolSize, int64(len(ipv6Pool)))
+	default:
+	}
+}
+
+func startBackground() {
+	if atomic.CompareAndSwapInt32(&backgroundRunning, 0, 1) {
+		go backgroundAddIP()
+		log.Println("✅ 后台 IP 生成已启动")
+	}
+}
+
+func stopBackground() {
+	atomic.StoreInt32(&backgroundRunning, 0)
+	log.Println("⏸ 后台 IP 生成已停止")
 }
 
 func getRandomIP() net.IP {
 	poolLock.RLock()
+	defer poolLock.RUnlock()
+	
 	if len(ipv6Pool) == 0 {
-		poolLock.RUnlock()
 		return nil
 	}
+	
 	rngLock.Lock()
-	index := rng.Intn(len(ipv6Pool))
+	idx := rng.Intn(len(ipv6Pool))
 	rngLock.Unlock()
-	ip := ipv6Pool[index]
-	poolLock.RUnlock()
-	return ip
+	
+	return ipv6Pool[idx]
 }
 
-func checkAuth(user, pass string) bool {
-	return user == config.Username && pass == config.Password
-}
-
-func transfer(dst net.Conn, src net.Conn, wg *sync.WaitGroup) {
-	defer wg.Done()
-	deadline := time.Now().Add(120 * time.Second)
-	src.SetReadDeadline(deadline)
-	dst.SetWriteDeadline(deadline)
-	buf := make([]byte, 64*1024)
-	io.CopyBuffer(dst, src, buf)
-}
-
-func handleSOCKS5(conn net.Conn) {
-	defer conn.Close()
-	defer atomic.AddInt64(&stats.ActiveConns, -1)
-	buf := make([]byte, 512)
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return
+func rotateAllIPs() {
+	log.Println("🔄 开始轮换所有 IP...")
+	
+	poolLock.Lock()
+	oldPool := ipv6Pool
+	ipv6Pool = make([]net.IP, 0)
+	ipv6PoolIndex = make(map[string]int)
+	poolLock.Unlock()
+	
+	for _, ip := range oldPool {
+		removeIPFromInterface(ip.String())
 	}
-	nmethods := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:nmethods]); err != nil {
-		return
+	log.Printf("已移除 %d 个旧 IP", len(oldPool))
+	
+	targetSize := len(oldPool)
+	if targetSize < config.TargetPool {
+		targetSize = config.TargetPool
 	}
-	conn.Write([]byte{5, 2})
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return
-	}
-	ulen := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:ulen]); err != nil {
-		return
-	}
-	username := string(buf[:ulen])
-	if _, err := io.ReadFull(conn, buf[:1]); err != nil {
-		return
-	}
-	plen := int(buf[0])
-	if _, err := io.ReadFull(conn, buf[:plen]); err != nil {
-		return
-	}
-	password := string(buf[:plen])
-	if !checkAuth(username, password) {
-		conn.Write([]byte{1, 1})
-		atomic.AddInt64(&stats.FailedConns, 1)
-		return
-	}
-	conn.Write([]byte{1, 0})
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		return
-	}
-	var host string
-	var port uint16
-	atyp := buf[3]
-	switch atyp {
-	case 1:
-		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
-			return
-		}
-		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
-		port = binary.BigEndian.Uint16(buf[4:6])
-	case 3:
-		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
-			return
-		}
-		dlen := int(buf[0])
-		if _, err := io.ReadFull(conn, buf[:dlen+2]); err != nil {
-			return
-		}
-		host = string(buf[:dlen])
-		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
-	default:
-		conn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	connectAndProxy(conn, host, port, true)
-}
-
-func handleHTTP(conn net.Conn, firstByte byte) {
-	defer conn.Close()
-	defer atomic.AddInt64(&stats.ActiveConns, -1)
-	buf := make([]byte, 4096)
-	buf[0] = firstByte
-	n, err := conn.Read(buf[1:])
-	if err != nil {
-		return
-	}
-	request := string(buf[:n+1])
-	lines := strings.Split(request, "\r\n")
-	if len(lines) < 1 {
-		return
-	}
-	parts := strings.Fields(lines[0])
-	if len(parts) < 3 {
-		return
-	}
-	method := parts[0]
-	target := parts[1]
-	authorized := false
-	for _, line := range lines {
-		if strings.HasPrefix(strings.ToLower(line), "proxy-authorization: basic ") {
-			encoded := strings.TrimSpace(line[27:])
-			if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
-				credentials := strings.SplitN(string(decoded), ":", 2)
-				if len(credentials) == 2 && checkAuth(credentials[0], credentials[1]) {
-					authorized = true
-					break
-				}
+	
+	addedCount := 0
+	for addedCount < targetSize {
+		ip := generateUniqueIPv6()
+		if err := addIPToInterface(ip.String()); err == nil {
+			poolLock.Lock()
+			ipv6Pool = append(ipv6Pool, ip)
+			ipv6PoolIndex[ip.String()] = len(ipv6Pool) - 1
+			poolLock.Unlock()
+			addedCount++
+			if addedCount%100 == 0 {
+				log.Printf("  已轮换 %d/%d IP", addedCount, targetSize)
 			}
 		}
 	}
-	if !authorized {
-		conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
-		atomic.AddInt64(&stats.FailedConns, 1)
-		return
-	}
-	if method != "CONNECT" {
-		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
-		return
-	}
-	hostPort := strings.Split(target, ":")
-	if len(hostPort) != 2 {
-		return
-	}
-	host := hostPort[0]
-	var port uint16
-	fmt.Sscanf(hostPort[1], "%d", &port)
-	connectAndProxy(conn, host, port, false)
+	
+	atomic.StoreInt64(&stats.PoolSize, int64(len(ipv6Pool)))
+	log.Printf("✅ 轮换完成 (新池: %d IP)", len(ipv6Pool))
 }
 
-func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool) {
-	startTime := time.Now()
-	clientIP := clientConn.RemoteAddr().String()
-	target := fmt.Sprintf("%s:%d", host, port)
-
-	ip := getRandomIP()
-	if ip == nil {
-		addConnLog(clientIP, target, "N/A", "❌ 无IP", time.Since(startTime))
-		if isSocks {
-			clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+func autoRotateWorker() {
+	for {
+		if atomic.LoadInt32(&autoRotateEnabled) == 1 {
+			interval := time.Duration(atomic.LoadInt64(&autoRotateInterval)) * time.Hour
+			nextRotateTimeLock.Lock()
+			nextRotateTime = time.Now().Add(interval)
+			nextRotateTimeLock.Unlock()
+			
+			time.Sleep(interval)
+			
+			if atomic.LoadInt32(&autoRotateEnabled) == 1 {
+				log.Println("⏰ 自动轮换触发")
+				rotateAllIPs()
+			}
 		} else {
-			clientConn.Write([]byte("HTTP/1.1 503 Unavailable\r\n\r\n"))
+			time.Sleep(10 * time.Second)
 		}
-		atomic.AddInt64(&stats.FailedConns, 1)
+	}
+}
+
+func autoCleanWorker() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		if !config.AutoClean {
+			continue
+		}
+		
+		failLogsLock.RLock()
+		failCount := make(map[string]int)
+		for _, log := range failLogs {
+			failCount[log.IPv6]++
+		}
+		failLogsLock.RUnlock()
+		
+		poolLock.Lock()
+		for ipStr, count := range failCount {
+			if count >= 5 {
+				if idx, exists := ipv6PoolIndex[ipStr]; exists {
+					log.Printf("🧹 清理失效 IP: %s (失败 %d 次)", ipStr, count)
+					removeIPFromInterface(ipStr)
+					ipv6Pool = append(ipv6Pool[:idx], ipv6Pool[idx+1:]...)
+					delete(ipv6PoolIndex, ipStr)
+					for i := idx; i < len(ipv6Pool); i++ {
+						ipv6PoolIndex[ipv6Pool[i].String()] = i
+					}
+				}
+			}
+		}
+		poolLock.Unlock()
+		atomic.StoreInt64(&stats.PoolSize, int64(len(ipv6Pool)))
+	}
+}
+
+func collectStats() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	lastTotal := int64(0)
+	lastSuccess := int64(0)
+	
+	for range ticker.C {
+		nowTotal := atomic.LoadInt64(&stats.TotalConns)
+		nowSuccess := atomic.LoadInt64(&stats.SuccessConns)
+		
+		qps := float64(nowTotal-lastTotal) / 5.0
+		successRate := 0.0
+		if nowTotal-lastTotal > 0 {
+			successRate = float64(nowSuccess-lastSuccess) / float64(nowTotal-lastTotal) * 100
+		}
+		
+		processCPU := float64(atomic.LoadInt64(&stats.ProcessCPUPercent))
+		systemCPU := float64(atomic.LoadInt64(&stats.SystemCPUPercent))
+		activeConns := atomic.LoadInt64(&stats.ActiveConns)
+		
+		snapshot := &StatsSnapshot{
+			Timestamp:   time.Now().Format("15:04:05"),
+			QPS:         qps,
+			SuccessRate: successRate,
+			ProcessCPU:  processCPU,
+			SystemCPU:   systemCPU,
+			ActiveConns: activeConns,
+		}
+		
+		statsHistoryLock.Lock()
+		statsHistory = append(statsHistory, snapshot)
+		if len(statsHistory) > maxHistory {
+			statsHistory = statsHistory[1:]
+		}
+		statsHistoryLock.Unlock()
+		
+		lastTotal = nowTotal
+		lastSuccess = nowSuccess
+	}
+}
+
+func collectCPUMetrics() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	
+	pid := int32(os.Getpid())
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		log.Printf("无法获取进程: %v", err)
 		return
 	}
-
-	ipv6String := ip.String()
 	
-	connID := fmt.Sprintf("%s-%d", clientIP, time.Now().UnixNano())
+	for range ticker.C {
+		if cpuPercent, err := p.CPUPercent(); err == nil {
+			atomic.StoreInt64(&stats.ProcessCPUPercent, int64(cpuPercent))
+		}
+		
+		if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
+			atomic.StoreInt64(&stats.SystemCPUPercent, int64(percents[0]))
+		}
+	}
+}
+
+func handleSOCKS5(clientConn net.Conn) {
+	defer clientConn.Close()
+	
+	connID := fmt.Sprintf("%d", time.Now().UnixNano())
+	clientAddr := clientConn.RemoteAddr().String()
+	clientIP := strings.Split(clientAddr, ":")[0]
+	
 	activeConn := &ActiveConn{
 		ID:        connID,
 		ClientIP:  clientIP,
-		Target:    target,
-		IPv6:      ipv6String,
-		StartTime: startTime,
+		StartTime: time.Now(),
 	}
+	
 	activeConnectionsLock.Lock()
 	activeConnections[connID] = activeConn
 	activeConnectionsLock.Unlock()
@@ -719,886 +734,1508 @@ func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool
 		activeConnectionsLock.Lock()
 		delete(activeConnections, connID)
 		activeConnectionsLock.Unlock()
+		atomic.AddInt64(&stats.ActiveConns, -1)
 	}()
 	
-	localAddr := &net.TCPAddr{IP: ip}
-	dialer := &net.Dialer{
-		LocalAddr: localAddr,
-		Timeout:   15 * time.Second,
+	atomic.AddInt64(&stats.TotalConns, 1)
+	atomic.AddInt64(&stats.ActiveConns, 1)
+	
+	startTime := time.Now()
+	
+	clientConn.SetDeadline(time.Now().Add(30 * time.Second))
+	
+	buf := make([]byte, 256)
+	n, err := clientConn.Read(buf)
+	if err != nil || n < 2 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	remoteConn, err := dialer.DialContext(ctx, "tcp", target)
+	
+	if buf[0] != 0x05 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	
+	numMethods := int(buf[1])
+	if n < 2+numMethods {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	
+	hasAuth := false
+	for i := 0; i < numMethods; i++ {
+		if buf[2+i] == 0x02 {
+			hasAuth = true
+			break
+		}
+	}
+	
+	if config.Username != "" && config.Password != "" {
+		if !hasAuth {
+			clientConn.Write([]byte{0x05, 0xff})
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		clientConn.Write([]byte{0x05, 0x02})
+		
+		n, err = clientConn.Read(buf)
+		if err != nil || n < 3 || buf[0] != 0x01 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		
+		ulen := int(buf[1])
+		if n < 3+ulen {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		username := string(buf[2 : 2+ulen])
+		
+		plen := int(buf[2+ulen])
+		if n < 3+ulen+plen {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		password := string(buf[3+ulen : 3+ulen+plen])
+		
+		usernameMatch := subtle.ConstantTimeCompare([]byte(username), []byte(config.Username)) == 1
+		passwordMatch := subtle.ConstantTimeCompare([]byte(password), []byte(config.Password)) == 1
+		
+		if !usernameMatch || !passwordMatch {
+			clientConn.Write([]byte{0x01, 0x01})
+			atomic.AddInt64(&stats.FailedConns, 1)
+			logConn(&ConnLog{
+				Time:     time.Now().Format("15:04:05"),
+				ClientIP: clientIP,
+				Target:   "N/A",
+				IPv6:     "N/A",
+				Status:   "❌ 认证失败",
+				Duration: fmt.Sprintf("%dms", time.Since(startTime).Milliseconds()),
+			}, true)
+			return
+		}
+		clientConn.Write([]byte{0x01, 0x00})
+	} else {
+		clientConn.Write([]byte{0x05, 0x00})
+	}
+	
+	n, err = clientConn.Read(buf)
+	if err != nil || n < 10 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	
+	if buf[1] != 0x01 {
+		clientConn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	
+	var targetHost string
+	var targetPort uint16
+	
+	switch buf[3] {
+	case 0x01:
+		if n < 10 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		targetHost = net.IPv4(buf[4], buf[5], buf[6], buf[7]).String()
+		targetPort = binary.BigEndian.Uint16(buf[8:10])
+	case 0x03:
+		domainLen := int(buf[4])
+		if n < 5+domainLen+2 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		targetHost = string(buf[5 : 5+domainLen])
+		targetPort = binary.BigEndian.Uint16(buf[5+domainLen : 7+domainLen])
+	case 0x04:
+		if n < 22 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			return
+		}
+		targetHost = net.IP(buf[4:20]).String()
+		targetPort = binary.BigEndian.Uint16(buf[20:22])
+	default:
+		clientConn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		return
+	}
+	
+	targetAddr := fmt.Sprintf("%s:%d", targetHost, targetPort)
+	activeConn.Target = targetAddr
+	
+	selectedIP := getRandomIP()
+	if selectedIP == nil {
+		clientConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		logConn(&ConnLog{
+			Time:     time.Now().Format("15:04:05"),
+			ClientIP: clientIP,
+			Target:   targetAddr,
+			IPv6:     "N/A",
+			Status:   "❌ 无可用 IP",
+			Duration: fmt.Sprintf("%dms", time.Since(startTime).Milliseconds()),
+		}, true)
+		return
+	}
+	
+	activeConn.IPv6 = selectedIP.String()
+	
+	dialer := &net.Dialer{
+		LocalAddr: &net.TCPAddr{
+			IP: selectedIP,
+		},
+		Timeout: 10 * time.Second,
+	}
+	
+	remoteConn, err := dialer.Dial("tcp", targetAddr)
 	if err != nil {
-		var status string
-		shouldDiscard := false
-		
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = "⏱️ 总超时"
-			atomic.AddInt64(&stats.TimeoutConns, 1)
-			shouldDiscard = true
-		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			status = "⏱️ 连接超时"
-			atomic.AddInt64(&stats.TimeoutConns, 1)
-		} else {
-			errMsg := err.Error()
-			if len(errMsg) > 30 {
-				errMsg = errMsg[:30]
-			}
-			status = fmt.Sprintf("❌ %s", errMsg)
-			shouldDiscard = strings.Contains(err.Error(), "refused") ||
-				strings.Contains(err.Error(), "unreachable")
-		}
-		
-		addConnLog(clientIP, target, ipv6String, status, time.Since(startTime))
-		if isSocks {
-			clientConn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
-		} else {
-			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		}
+		clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		atomic.AddInt64(&stats.FailedConns, 1)
 		
-		if config.AutoClean && shouldDiscard {
+		status := "❌ 连接失败"
+		if strings.Contains(err.Error(), "timeout") {
+			status = "⏱ 超时"
+			atomic.AddInt64(&stats.TimeoutConns, 1)
+		}
+		
+		logConn(&ConnLog{
+			Time:     time.Now().Format("15:04:05"),
+			ClientIP: clientIP,
+			Target:   targetAddr,
+			IPv6:     selectedIP.String(),
+			Status:   status,
+			Duration: fmt.Sprintf("%dms", time.Since(startTime).Milliseconds()),
+		}, true)
+		
+		if config.AutoClean && strings.Contains(err.Error(), "timeout") {
 			select {
-			case discardQueue <- ip:
+			case discardQueue <- selectedIP:
 			default:
 			}
 		}
 		return
 	}
 	defer remoteConn.Close()
-
+	
+	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	clientConn.SetDeadline(time.Time{})
+	
 	atomic.AddInt64(&stats.SuccessConns, 1)
-	duration := time.Since(startTime)
-	atomic.AddInt64(&stats.TotalDuration, duration.Nanoseconds())
-	addConnLog(clientIP, target, ipv6String, "✅ 成功", duration)
-
-	if isSocks {
-		clientConn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-	} else {
-		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
+	
+	logConn(&ConnLog{
+		Time:     time.Now().Format("15:04:05"),
+		ClientIP: clientIP,
+		Target:   targetAddr,
+		IPv6:     selectedIP.String(),
+		Status:   "✅ 成功",
+		Duration: fmt.Sprintf("%dms", time.Since(startTime).Milliseconds()),
+	}, false)
+	
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go transfer(remoteConn, clientConn, &wg)
-	go transfer(clientConn, remoteConn, &wg)
+	
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := clientConn.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := remoteConn.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+	}()
+	
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := remoteConn.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := clientConn.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+	}()
+	
 	wg.Wait()
+	
+	duration := time.Since(startTime)
+	atomic.AddInt64(&stats.TotalDuration, duration.Milliseconds())
 }
 
-func handleConnection(conn net.Conn) {
-	atomic.AddInt64(&stats.ActiveConns, 1)
-	atomic.AddInt64(&stats.TotalConns, 1)
-	firstByte := make([]byte, 1)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := conn.Read(firstByte)
-	if err != nil {
-		conn.Close()
-		atomic.AddInt64(&stats.ActiveConns, -1)
-		return
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	if n == 1 && firstByte[0] == 0x05 {
-		handleSOCKS5(conn)
-	} else if n == 1 {
-		handleHTTP(conn, firstByte[0])
-	} else {
-		conn.Close()
-		atomic.AddInt64(&stats.ActiveConns, -1)
-	}
-}
-
-func statsCPURoutine(ctx context.Context) {
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		return
+func logConn(log *ConnLog, isFailed bool) {
+	if isFailed {
+		failLogsLock.Lock()
+		failLogs = append([]*ConnLog{log}, failLogs...)
+		if len(failLogs) > maxLogs {
+			failLogs = failLogs[:maxLogs]
+		}
+		failLogsLock.Unlock()
 	}
 	
-	p.CPUPercent()
-	time.Sleep(10 * time.Second)
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			processCPU, err := p.CPUPercent()
-			if err == nil {
-				atomic.StoreInt64(&stats.ProcessCPUPercent, int64(processCPU*100))
-			}
-			
-			systemCPU, err := cpu.Percent(0, false)
-			if err == nil && len(systemCPU) > 0 {
-				atomic.StoreInt64(&stats.SystemCPUPercent, int64(systemCPU[0]*100))
-			}
-		}
+	connLogsLock.Lock()
+	connLogs = append([]*ConnLog{log}, connLogs...)
+	if len(connLogs) > maxLogs {
+		connLogs = connLogs[:maxLogs]
 	}
-}
-
-func statsHistoryRoutine(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			uptime := time.Since(stats.StartTime)
-			total := atomic.LoadInt64(&stats.TotalConns)
-			qps := 0.0
-			if uptime.Seconds() > 0 {
-				qps = float64(total) / uptime.Seconds()
-			}
-
-			successConns := atomic.LoadInt64(&stats.SuccessConns)
-			successRate := 0.0
-			if total > 0 {
-				successRate = float64(successConns) * 100 / float64(total)
-			}
-
-			snapshot := &StatsSnapshot{
-				Timestamp:   time.Now().Format("15:04:05"),
-				QPS:         qps,
-				SuccessRate: successRate,
-				ProcessCPU:  float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100.0,
-				SystemCPU:   float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100.0,
-				ActiveConns: atomic.LoadInt64(&stats.ActiveConns),
-			}
-
-			statsHistoryLock.Lock()
-			if len(statsHistory) >= maxHistory {
-				statsHistory = statsHistory[1:]
-			}
-			statsHistory = append(statsHistory, snapshot)
-			statsHistoryLock.Unlock()
-		}
-	}
-}
-
-func statsRoutine(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			log.Printf("📊 活跃:%d 总:%d 成功:%d 失败:%d 池:%d",
-				atomic.LoadInt64(&stats.ActiveConns),
-				atomic.LoadInt64(&stats.TotalConns),
-				atomic.LoadInt64(&stats.SuccessConns),
-				atomic.LoadInt64(&stats.FailedConns),
-				atomic.LoadInt64(&stats.PoolSize))
-		}
-	}
-}
-
-func logClearRoutine(ctx context.Context) {
-	ticker := time.NewTicker(12 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			connLogsLock.Lock()
-			connLogs = []*ConnLog{}
-			connLogsLock.Unlock()
-			failLogsLock.Lock()
-			failLogs = []*ConnLog{}
-			failLogsLock.Unlock()
-		}
-	}
-}
-
-func autoRotateRoutine(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if atomic.LoadInt32(&autoRotateEnabled) == 0 {
-				continue
-			}
-
-			nextRotateTimeLock.RLock()
-			shouldRotate := time.Now().After(nextRotateTime)
-			nextRotateTimeLock.RUnlock()
-
-			if shouldRotate {
-				log.Printf("自动轮换...")
-				rotateIPPool(ctx)
-				
-				hours := atomic.LoadInt64(&autoRotateInterval)
-				nextRotateTimeLock.Lock()
-				nextRotateTime = time.Now().Add(time.Duration(hours) * time.Hour)
-				nextRotateTimeLock.Unlock()
-			}
-		}
-	}
-}
-
-func rotateIPPool(ctx context.Context) {
-	atomic.StoreInt32(&backgroundRunning, 0)
-	time.Sleep(100 * time.Millisecond)
-
-	newIPs, success := populateIPPool(config.InitialPool)
-	if success == 0 {
-		if config.TargetPool > int(atomic.LoadInt64(&stats.PoolSize)) {
-			atomic.StoreInt32(&backgroundRunning, 1)
-		}
-		return
-	}
-	
-	newIPMap := make(map[string]int, success)
-	for i, ip := range newIPs {
-		newIPMap[ip.String()] = i
-	}
-	
-	poolLock.Lock()
-	oldIPs := ipv6Pool
-	ipv6Pool = newIPs
-	ipv6PoolIndex = newIPMap
-	poolLock.Unlock()
-	
-	atomic.StoreInt64(&stats.PoolSize, int64(success))
-	log.Printf("✅ 轮换: %d IP", success)
-
-	go cleanupOldIPs(oldIPs)
-	
-	if config.TargetPool > success {
-		atomic.StoreInt32(&backgroundRunning, 1)
-	}
-}
-
-func cleanupOldIPs(oldIPs []net.IP) {
-	time.Sleep(30 * time.Minute)
-	for _, ip := range oldIPs {
-		delIPv6(ip)
-	}
-}
-
-func handleAPIStats(w http.ResponseWriter, r *http.Request) {
-	uptime := time.Since(stats.StartTime)
-	total := atomic.LoadInt64(&stats.TotalConns)
-	qps := 0.0
-	if uptime.Seconds() > 0 {
-		qps = float64(total) / uptime.Seconds()
-	}
-	currentPool := atomic.LoadInt64(&stats.PoolSize)
-	targetPool := int64(config.TargetPool)
-	progress := 0.0
-	if targetPool > 0 {
-		progress = float64(currentPool) * 100 / float64(targetPool)
-		if progress > 100 {
-			progress = 100
-		}
-	}
-
-	var avgDurationMs float64
-	successConns := atomic.LoadInt64(&stats.SuccessConns)
-	if successConns > 0 {
-		avgDurationMs = float64(atomic.LoadInt64(&stats.TotalDuration)) / float64(successConns) / float64(time.Millisecond)
-	}
-
-	processCPU := float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100.0
-	systemCPU := float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100.0
-
-	nextRotateTimeLock.RLock()
-	nextRotate := nextRotateTime.Format("2006-01-02 15:04:05")
-	nextRotateTimeLock.RUnlock()
-
-	data := map[string]interface{}{
-		"active":          atomic.LoadInt64(&stats.ActiveConns),
-		"total":           total,
-		"success":         successConns,
-		"failed":          atomic.LoadInt64(&stats.FailedConns),
-		"timeout":         atomic.LoadInt64(&stats.TimeoutConns),
-		"pool":            currentPool,
-		"target":          targetPool,
-		"progress":        progress,
-		"bg_running":      atomic.LoadInt32(&backgroundRunning) == 1,
-		"bg_added":        atomic.LoadInt64(&backgroundAdded),
-		"qps":             qps,
-		"uptime":          fmt.Sprintf("%dd %dh %dm", int(uptime.Hours())/24, int(uptime.Hours())%24, int(uptime.Minutes())%60),
-		"avg_duration":    avgDurationMs,
-		"process_cpu":     processCPU,
-		"system_cpu":      systemCPU,
-		"auto_rotate":     atomic.LoadInt32(&autoRotateEnabled) == 1,
-		"rotate_interval": atomic.LoadInt64(&autoRotateInterval),
-		"next_rotate":     nextRotate,
-		"auto_clean":      config.AutoClean,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
-}
-
-func handleAPILogs(w http.ResponseWriter, r *http.Request) {
-	connLogsLock.RLock()
-	logs := make([]*ConnLog, len(connLogs))
-	copy(logs, connLogs)
-	connLogsLock.RUnlock()
-
-	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
-		logs[i], logs[j] = logs[j], logs[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
-}
-
-func handleAPIFailLogs(w http.ResponseWriter, r *http.Request) {
-	failLogsLock.RLock()
-	logs := make([]*ConnLog, len(failLogs))
-	copy(logs, failLogs)
-	failLogsLock.RUnlock()
-
-	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
-		logs[i], logs[j] = logs[j], logs[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
-}
-
-func handleAPISearchLogs(w http.ResponseWriter, r *http.Request) {
-	query := strings.ToLower(r.URL.Query().Get("q"))
-	if query == "" {
-		http.Error(w, `{"error":"缺少搜索关键词"}`, http.StatusBadRequest)
-		return
-	}
-
-	connLogsLock.RLock()
-	allLogs := make([]*ConnLog, len(connLogs))
-	copy(allLogs, connLogs)
-	connLogsLock.RUnlock()
-
-	var results []*ConnLog
-	for _, log := range allLogs {
-		if strings.Contains(strings.ToLower(log.ClientIP), query) ||
-			strings.Contains(strings.ToLower(log.Target), query) ||
-			strings.Contains(strings.ToLower(log.IPv6), query) ||
-			strings.Contains(strings.ToLower(log.Status), query) {
-			results = append(results, log)
-		}
-	}
-
-	for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
-		results[i], results[j] = results[j], results[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
-}
-
-func handleAPIActiveConns(w http.ResponseWriter, r *http.Request) {
-	activeConnectionsLock.RLock()
-	conns := make([]*ActiveConn, 0, len(activeConnections))
-	for _, conn := range activeConnections {
-		connCopy := *conn
-		connCopy.Duration = fmt.Sprintf("%.1fs", time.Since(conn.StartTime).Seconds())
-		conns = append(conns, &connCopy)
-	}
-	activeConnectionsLock.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(conns)
-}
-
-func handleAPIHistory(w http.ResponseWriter, r *http.Request) {
-	statsHistoryLock.RLock()
-	history := make([]*StatsSnapshot, len(statsHistory))
-	copy(history, statsHistory)
-	statsHistoryLock.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(history)
-}
-
-func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Target int `json:"target"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Target < 100 {
-		http.Error(w, `{"error":"目标值至少100"}`, http.StatusBadRequest)
-		return
-	}
-
-	config.TargetPool = req.Target
-	saveConfigToFile()
-	
-	if atomic.LoadInt64(&stats.PoolSize) < int64(config.TargetPool) {
-		atomic.StoreInt32(&backgroundRunning, 1)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置: %d", req.Target)})
-}
-
-func handleAPIRotate(ctx context.Context) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		
-		go rotateIPPool(ctx)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "轮换已开始"})
-	}
-}
-
-func handleAPIUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var newConfig Config
-	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
-		http.Error(w, `{"error":"无效配置"}`, http.StatusBadRequest)
-		return
-	}
-
-	newConfig.IPv6Prefix = config.IPv6Prefix
-	newConfig.Interface = config.Interface
-
-	config = newConfig
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存失败"}`, http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "配置已更新，需重启生效"})
-}
-
-func handleAPIAutoRotate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Enabled  bool `json:"enabled"`
-		Interval int  `json:"interval"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Interval < 1 {
-		req.Interval = 6
-	}
-
-	config.AutoRotate = req.Enabled
-	config.AutoRotateHours = req.Interval
-	saveConfigToFile()
-
-	if req.Enabled {
-		atomic.StoreInt32(&autoRotateEnabled, 1)
-		atomic.StoreInt64(&autoRotateInterval, int64(req.Interval))
-		nextRotateTimeLock.Lock()
-		nextRotateTime = time.Now().Add(time.Duration(req.Interval) * time.Hour)
-		nextRotateTimeLock.Unlock()
-	} else {
-		atomic.StoreInt32(&autoRotateEnabled, 0)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "设置已更新"})
-}
-
-func handleAPIAutoClean(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	config.AutoClean = req.Enabled
-	saveConfigToFile()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "自清理设置已更新"})
-}
-
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	html, err := os.ReadFile(indexHTMLPath)
-	if err != nil {
-		http.Error(w, "index.html not found", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(html)
+	connLogsLock.Unlock()
 }
 
 func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(config.WebUsername)) != 1 || 
-		   subtle.ConstantTimeCompare([]byte(pass), []byte(config.WebPassword)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Unauthorized\n"))
+		if !ok || user != config.WebUsername || pass != config.WebPassword {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Admin Panel"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
 }
 
-func startWebServer(ctx context.Context) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", basicAuth(handleIndex))
-	mux.HandleFunc("/api/stats", basicAuth(handleAPIStats))
-	mux.HandleFunc("/api/logs", basicAuth(handleAPILogs))
-	mux.HandleFunc("/api/faillogs", basicAuth(handleAPIFailLogs))
-	mux.HandleFunc("/api/search", basicAuth(handleAPISearchLogs))
-	mux.HandleFunc("/api/active", basicAuth(handleAPIActiveConns))
-	mux.HandleFunc("/api/history", basicAuth(handleAPIHistory))
-	mux.HandleFunc("/api/pool/resize", basicAuth(handleAPIPoolResize))
-	mux.HandleFunc("/api/rotate", basicAuth(handleAPIRotate(ctx)))
-	mux.HandleFunc("/api/config", basicAuth(handleAPIUpdateConfig))
-	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))
-	mux.HandleFunc("/api/autoclean", basicAuth(handleAPIAutoClean))
-
-	srv := &http.Server{
-		Addr:    ":" + config.WebPort,
-		Handler: mux,
-	}
-
-	log.Printf("Web: http://0.0.0.0:%s", config.WebPort)
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Web失败: %v", err)
-		}
-	}()
-	return srv
-}
-
-func cleanupIPs() {
-	poolLock.RLock()
-	ipsToClean := make([]net.IP, len(ipv6Pool))
-	copy(ipsToClean, ipv6Pool)
-	poolLock.RUnlock()
-
-	for _, ip := range ipsToClean {
-		delIPv6(ip)
-	}
-}
-
-func main() {
-	mrand.Seed(time.Now().UnixNano())
+func handleWebStats(w http.ResponseWriter, r *http.Request) {
+	total := atomic.LoadInt64(&stats.TotalConns)
+	active := atomic.LoadInt64(&stats.ActiveConns)
+	success := atomic.LoadInt64(&stats.SuccessConns)
+	failed := atomic.LoadInt64(&stats.FailedConns)
+	timeout := atomic.LoadInt64(&stats.TimeoutConns)
+	poolSize := atomic.LoadInt64(&stats.PoolSize)
+	totalDuration := atomic.LoadInt64(&stats.TotalDuration)
+	processCPU := atomic.LoadInt64(&stats.ProcessCPUPercent)
+	systemCPU := atomic.LoadInt64(&stats.SystemCPUPercent)
 	
-	log.Printf("IPv6 代理 v7.4 Final")
-
-	stats.StartTime = time.Now()
-
-	exePath, err := os.Executable()
-	if err != nil {
-		log.Fatalf("无法获取路径: %v", err)
-	}
-	exeDir := filepath.Dir(exePath)
-	configFilePath = filepath.Join(exeDir, "config.json")
-	indexHTMLPath = filepath.Join(exeDir, "index.html")
-
-	isInteractive := term.IsTerminal(int(syscall.Stdin))
-
-	if isInteractive {
-		if err := runInteractiveSetup(); err != nil {
-			log.Fatalf("设置失败: %v", err)
-		}
-		if err := saveConfigToFile(); err != nil {
-			log.Fatalf("保存失败: %v", err)
-		}
-	} else {
-		if err := loadConfigFromFile(); err != nil {
-			log.Fatalf("加载失败: %v", err)
-		}
-	}
-
-	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix + "::/64")
-	if err != nil {
-		log.Fatalf("无法解析前缀: %v", err)
-	}
-	iface, err = netlink.LinkByName(config.Interface)
-	if err != nil {
-		log.Fatalf("无法找到网卡: %v", err)
-	}
-
-	log.Printf("")
-	log.Printf("配置: 代理:%s Web:%s", config.Port, config.WebPort)
-	log.Printf("网络: %s::/64 @ %s", config.IPv6Prefix, config.Interface)
-	log.Printf("IP池: %d → %d", config.InitialPool, config.TargetPool)
-	if config.AutoRotate {
-		log.Printf("轮换: 每 %d 小时", config.AutoRotateHours)
-	}
-	log.Printf("")
-
-	if err := initIPv6Pool(); err != nil {
-		log.Fatalf("初始化失败: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	if config.TargetPool > config.InitialPool {
-		atomic.StoreInt32(&backgroundRunning, 1) 
+	uptime := time.Since(stats.StartTime)
+	uptimeStr := fmt.Sprintf("%dd %dh %dm", int(uptime.Hours())/24, int(uptime.Hours())%24, int(uptime.Minutes())%60)
+	
+	successRate := float64(0)
+	if total > 0 {
+		successRate = float64(success) / float64(total) * 100
 	}
 	
-	discardQueue = make(chan net.IP, 5000)
+	avgDuration := int64(0)
+	if success > 0 {
+		avgDuration = totalDuration / success
+	}
+	
+	targetPool := config.TargetPool
+	progress := float64(poolSize) / float64(targetPool) * 100
+	if progress > 100 {
+		progress = 100
+	}
+	
+	nextRotateTimeLock.RLock()
+	nextRotate := "未启用"
+	if atomic.LoadInt32(&autoRotateEnabled) == 1 {
+		nextRotate = nextRotateTime.Format("15:04:05")
+	}
+	nextRotateTimeLock.RUnlock()
+	
+	data := map[string]interface{}{
+		"total":           total,
+		"active":          active,
+		"success":         success,
+		"failed":          failed,
+		"timeout":         timeout,
+		"pool":            poolSize,
+		"target":          targetPool,
+		"progress":        progress,
+		"success_rate":    successRate,
+		"process_cpu":     processCPU,
+		"system_cpu":      systemCPU,
+		"avg_duration":    avgDuration,
+		"uptime":          uptimeStr,
+		"bg_running":      atomic.LoadInt32(&backgroundRunning) == 1,
+		"bg_added":        atomic.LoadInt64(&backgroundAdded),
+		"auto_rotate":     atomic.LoadInt32(&autoRotateEnabled) == 1,
+		"rotate_interval": atomic.LoadInt64(&autoRotateInterval),
+		"next_rotate":     nextRotate,
+		"auto_clean":      config.AutoClean,
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
 
-	if config.AutoRotate {
+func handleWebHistory(w http.ResponseWriter, r *http.Request) {
+	statsHistoryLock.RLock()
+	history := make([]*StatsSnapshot, len(statsHistory))
+	copy(history, statsHistory)
+	statsHistoryLock.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(history)
+}
+
+func handleWebLogs(w http.ResponseWriter, r *http.Request) {
+	connLogsLock.RLock()
+	logs := make([]*ConnLog, len(connLogs))
+	copy(logs, connLogs)
+	connLogsLock.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
+func handleWebFailLogs(w http.ResponseWriter, r *http.Request) {
+	failLogsLock.RLock()
+	logs := make([]*ConnLog, len(failLogs))
+	copy(logs, failLogs)
+	failLogsLock.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs)
+}
+
+func handleWebActive(w http.ResponseWriter, r *http.Request) {
+	activeConnectionsLock.RLock()
+	conns := make([]*ActiveConn, 0, len(activeConnections))
+	for _, conn := range activeConnections {
+		c := *conn
+		c.Duration = fmt.Sprintf("%.1fs", time.Since(conn.StartTime).Seconds())
+		conns = append(conns, &c)
+	}
+	activeConnectionsLock.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(conns)
+}
+
+func handleWebSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		json.NewEncoder(w).Encode([]ConnLog{})
+		return
+	}
+	
+	connLogsLock.RLock()
+	results := make([]*ConnLog, 0)
+	for _, log := range connLogs {
+		if strings.Contains(log.ClientIP, query) ||
+		   strings.Contains(log.Target, query) ||
+		   strings.Contains(log.IPv6, query) {
+			results = append(results, log)
+		}
+	}
+	connLogsLock.RUnlock()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+func handleWebConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var newConfig struct {
+		Port     string `json:"port"`
+		WebPort  string `json:"web_port"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	if newConfig.Port != "" {
+		config.Port = newConfig.Port
+	}
+	if newConfig.WebPort != "" {
+		config.WebPort = newConfig.WebPort
+	}
+	if newConfig.Username != "" {
+		config.Username = newConfig.Username
+	}
+	if newConfig.Password != "" {
+		config.Password = newConfig.Password
+	}
+	
+	configData, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFilePath, configData, 0644)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "配置已保存，重启后生效",
+	})
+}
+
+func handleWebRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	go rotateAllIPs()
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "IP 轮换已开始",
+	})
+}
+
+func handleWebPoolResize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		Target int `json:"target"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	if req.Target < 100 {
+		req.Target = 100
+	}
+	
+	config.TargetPool = req.Target
+	configData, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFilePath, configData, 0644)
+	
+	if atomic.LoadInt32(&backgroundRunning) == 0 {
+		startBackground()
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": fmt.Sprintf("目标池大小已设为 %d", req.Target),
+	})
+}
+
+func handleWebAutoRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		Enabled  bool `json:"enabled"`
+		Interval int  `json:"interval"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	config.AutoRotate = req.Enabled
+	if req.Interval > 0 {
+		config.AutoRotateHours = req.Interval
+	}
+	
+	if req.Enabled {
 		atomic.StoreInt32(&autoRotateEnabled, 1)
 		atomic.StoreInt64(&autoRotateInterval, int64(config.AutoRotateHours))
-		nextRotateTime = time.Now().Add(time.Duration(config.AutoRotateHours) * time.Hour)
+	} else {
+		atomic.StoreInt32(&autoRotateEnabled, 0)
 	}
+	
+	configData, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFilePath, configData, 0644)
+	
+	status := "已关闭"
+	if req.Enabled {
+		status = fmt.Sprintf("已启用 (每 %d 小时)", config.AutoRotateHours)
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": fmt.Sprintf("自动轮换 %s", status),
+	})
+}
 
-	go backgroundAddTask(ctx)
-	go discardWorker(ctx)
-	go statsRoutine(ctx)
-	go statsCPURoutine(ctx)
-	go statsHistoryRoutine(ctx)
-	go logClearRoutine(ctx)
-	go autoRotateRoutine(ctx)
+func handleWebAutoClean(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	
+	config.AutoClean = req.Enabled
+	
+	configData, _ := json.MarshalIndent(config, "", "  ")
+	os.WriteFile(configFilePath, configData, 0644)
+	
+	status := "已关闭"
+	if req.Enabled {
+		status = "已启用"
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": fmt.Sprintf("自动清理 %s", status),
+	})
+}
 
-	webServer := startWebServer(ctx)
+func handleWebIndex(w http.ResponseWriter, r *http.Request) {
+	data, err := os.ReadFile(indexHTMLPath)
+	if err != nil {
+		http.Error(w, "页面未找到", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(data)
+}
 
-	listener, err := net.Listen("tcp", ":"+config.Port)
+func startWebServer() {
+	http.HandleFunc("/", basicAuth(handleWebIndex))
+	http.HandleFunc("/api/stats", basicAuth(handleWebStats))
+	http.HandleFunc("/api/history", basicAuth(handleWebHistory))
+	http.HandleFunc("/api/logs", basicAuth(handleWebLogs))
+	http.HandleFunc("/api/faillogs", basicAuth(handleWebFailLogs))
+	http.HandleFunc("/api/active", basicAuth(handleWebActive))
+	http.HandleFunc("/api/search", basicAuth(handleWebSearch))
+	http.HandleFunc("/api/config", basicAuth(handleWebConfig))
+	http.HandleFunc("/api/rotate", basicAuth(handleWebRotate))
+	http.HandleFunc("/api/pool/resize", basicAuth(handleWebPoolResize))
+	http.HandleFunc("/api/autorotate", basicAuth(handleWebAutoRotate))
+	http.HandleFunc("/api/autoclean", basicAuth(handleWebAutoClean))
+	
+	addr := fmt.Sprintf(":%s", config.WebPort)
+	log.Printf("✅ Web 面板已启动: http://0.0.0.0%s", addr)
+	log.Printf("   用户名: %s", config.WebUsername)
+	log.Printf("   密码: %s", config.WebPassword)
+	
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Printf("Web 服务器错误: %v", err)
+	}
+}
+
+func startProxyServer() {
+	addr := fmt.Sprintf(":%s", config.Port)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("监听失败: %v", err)
 	}
-
-	log.Printf("✅ 服务就绪")
-
-	shutdownChan := make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if strings.Contains(err.Error(), "closed network connection") {
-					break
-				}
-				continue
-			}
-			go handleConnection(conn)
+	defer listener.Close()
+	
+	log.Printf("✅ SOCKS5 代理已启动: 0.0.0.0%s", addr)
+	if config.Username != "" && config.Password != "" {
+		log.Printf("   认证已启用 (用户: %s)", config.Username)
+	} else {
+		log.Println("   ⚠️  认证未启用")
+	}
+	
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
 		}
-	}()
+		go handleSOCKS5(conn)
+	}
+}
 
-	<-shutdownChan
-	log.Printf("\n关闭中...")
-	cancel()
-	webServer.Shutdown(context.Background())
-	listener.Close()
-	cleanupIPs()
-	log.Printf("✅ 已关闭")
+func printBanner() {
+	fmt.Println()
+	fmt.Println("╔════════════════════════════════════════╗")
+	fmt.Println("║       IPv6 代理 v7.4 Final              ║")
+	fmt.Println("║       高性能 SOCKS5 代理服务器          ║")
+	fmt.Println("╚════════════════════════════════════════╝")
+	fmt.Println()
+}
+
+func main() {
+	printBanner()
+	
+	configFilePath = filepath.Join(filepath.Dir(os.Args[0]), "config.json")
+	indexHTMLPath = filepath.Join(filepath.Dir(os.Args[0]), "index.html")
+	
+	if _, err := os.Stat(configFilePath); os.IsNotExist(err) {
+		log.Println("配置文件不存在，启动配置向导...")
+		if err := setupConfig(); err != nil {
+			log.Fatalf("配置失败: %v", err)
+		}
+		log.Println()
+		log.Println("✅ 配置完成！请重新运行程序启动服务。")
+		os.Exit(0)
+	}
+	
+	if err := loadConfig(); err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+	
+	stats.StartTime = time.Now()
+	discardQueue = make(chan net.IP, 100)
+	
+	initPool()
+	
+	poolLock.RLock()
+	currentSize := len(ipv6Pool)
+	poolLock.RUnlock()
+	
+	if currentSize < config.TargetPool {
+		startBackground()
+	}
+	
+	if config.AutoRotate {
+		atomic.StoreInt32(&autoRotateEnabled, 1)
+		atomic.StoreInt64(&autoRotateInterval, int64(config.AutoRotateHours))
+		go autoRotateWorker()
+		log.Printf("✅ 自动轮换已启用 (每 %d 小时)", config.AutoRotateHours)
+	}
+	
+	if config.AutoClean {
+		go autoCleanWorker()
+		log.Println("✅ 自动清理已启用")
+	}
+	
+	go backgroundCleanup()
+	go collectStats()
+	go collectCPUMetrics()
+	
+	go startWebServer()
+	
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("\n正在清理...")
+		stopBackground()
+		
+		poolLock.RLock()
+		for _, ip := range ipv6Pool {
+			removeIPFromInterface(ip.String())
+		}
+		poolLock.RUnlock()
+		
+		log.Println("✅ 清理完成，退出")
+		os.Exit(0)
+	}()
+	
+	startProxyServer()
 }
 GOEOF
 
-echo "✅ 源代码完成"
+echo "✅ 源码创建完成"
 echo ""
 
-# --- 创建 HTML ---
-echo "--- 步骤 4: 创建 Web 前端 ---"
-
-# 由于HTML太长，这里用原来的完整版本
+# --- 创建前端 ---
+echo "--- 步骤 4: 创建前端 ---"
 cat << 'HTMLEOF' > index.html
 <!DOCTYPE html>
-<html>
+<html lang="zh">
 <head>
-    <meta charset="UTF-8">
-    <title>IPv6 代理管理面板 v7.4</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * {margin:0;padding:0;box-sizing:border-box}
-        body {font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;background:#0f172a url('https://pub-bc6dc5bd52c141569ce1f7da2fc4c5f5.r2.dev/bandicam%202025-06-29%2000-48-32-513.png') no-repeat center center fixed;background-size:cover;color:#e2e8f0;padding:10px}
-        .container {max-width:1600px;margin:0 auto}
-        h1 {font-size:24px;margin-bottom:20px;color:#60a5fa}
-        .grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin-bottom:20px}
-        @media (max-width:600px) {.grid {grid-template-columns:1fr} h1 {font-size:20px}}
-        .card {background:#1e293b;border-radius:12px;padding:20px}
-        .card-title {font-size:13px;color:#94a3b8;margin-bottom:8px}
-        .card-value {font-size:28px;font-weight:bold;color:#60a5fa}
-        .card-value-small {font-size:20px;font-weight:bold;color:#60a5fa}
-        .card-value-small .success {color:#10b981}
-        .card-value-small .fail {color:#ef4444}
-        .card-sub {font-size:12px;color:#64748b;margin-top:5px}
-        .progress-bar {width:100%;height:8px;background:#334155;border-radius:4px;overflow:hidden;margin-top:10px}
-        .progress-fill {height:100%;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .3s}
-        .section {background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px;overflow:hidden}
-        .section-title {font-size:18px;margin-bottom:15px;display:flex;align-items:center;gap:10px}
-        .log-container {max-height:400px;overflow-y:auto;overflow-x:auto}
-        table {width:100%;border-collapse:collapse;min-width:600px}
-        th,td {padding:8px 10px;text-align:left;border-bottom:1px solid #334155;font-size:13px;white-space:nowrap}
-        th {color:#94a3b8;font-size:12px;position:sticky;top:0;background:#1e293b}
-        .status-success {color:#10b981}
-        .status-fail {color:#ef4444}
-        .status-timeout {color:#f59e0b}
-        .input-group {display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:15px}
-        input[type=number],input[type=text],input[type=password],select {background:#334155;border:1px solid #475569;color:#e2e8f0;padding:8px 12px;border-radius:6px;min-width:120px}
-        button {background:#3b82f6;color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;transition:background .2s;font-size:14px}
-        button:hover {background:#2563eb}
-        button:disabled {background:#334155;cursor:not-allowed}
-        button.warning {background:#f59e0b}
-        button.warning:hover {background:#d97706}
-        .badge {display:inline-block;padding:4px 8px;border-radius:4px;font-size:12px}
-        .badge-success {background:#10b98120;color:#10b981}
-        .badge-info {background:#3b82f620;color:#3b82f6}
-        .chart-container {height:200px;margin-top:15px}
-        canvas {max-height:200px}
-        .config-row {display:grid;grid-template-columns:150px 1fr;gap:10px;margin-bottom:10px;align-items:center}
-        .config-label {color:#94a3b8;font-size:14px}
-        @media (max-width:600px) {.config-row {grid-template-columns:1fr}}
-    </style>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IPv6 代理管理面板</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root {
+    --primary: #4f46e5;
+    --primary-dark: #4338ca;
+    --secondary: #06b6d4;
+    --success: #10b981;
+    --warning: #f59e0b;
+    --danger: #ef4444;
+    --dark: #1e293b;
+    --light: #f1f5f9;
+    --border: #e2e8f0;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    color: #334155;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.header {
+    background: rgba(255, 255, 255, 0.98);
+    border-radius: 16px;
+    padding: 25px 30px;
+    margin-bottom: 25px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    backdrop-filter: blur(10px);
+}
+
+.header h1 {
+    font-size: 28px;
+    color: var(--dark);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.header h1::before {
+    content: '🚀';
+    font-size: 32px;
+}
+
+.dashboard {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 20px;
+    margin-bottom: 25px;
+}
+
+.card {
+    background: rgba(255, 255, 255, 0.98);
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+.card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
+}
+
+.card-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    margin-bottom: 15px;
+}
+
+.card-icon.blue { background: linear-gradient(135deg, #667eea, #764ba2); }
+.card-icon.green { background: linear-gradient(135deg, #10b981, #059669); }
+.card-icon.orange { background: linear-gradient(135deg, #f59e0b, #d97706); }
+.card-icon.red { background: linear-gradient(135deg, #ef4444, #dc2626); }
+.card-icon.purple { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
+.card-icon.cyan { background: linear-gradient(135deg, #06b6d4, #0891b2); }
+
+.stat-label {
+    font-size: 13px;
+    color: #64748b;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+}
+
+.stat-value {
+    font-size: 32px;
+    font-weight: 700;
+    color: var(--dark);
+    line-height: 1;
+}
+
+.stat-unit {
+    font-size: 14px;
+    color: #94a3b8;
+    margin-left: 4px;
+}
+
+.progress-bar {
+    height: 8px;
+    background: var(--light);
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 12px;
+}
+
+.progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary), var(--secondary));
+    border-radius: 4px;
+    transition: width 0.5s ease;
+}
+
+.chart-container {
+    background: rgba(255, 255, 255, 0.98);
+    border-radius: 12px;
+    padding: 25px;
+    margin-bottom: 25px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.section {
+    background: rgba(255, 255, 255, 0.98);
+    border-radius: 12px;
+    padding: 25px;
+    margin-bottom: 25px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    padding-bottom: 15px;
+    border-bottom: 2px solid var(--border);
+}
+
+.section-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--dark);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.section-title::before {
+    font-size: 24px;
+}
+
+.controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.btn-primary {
+    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    color: white;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+}
+
+.btn-success {
+    background: linear-gradient(135deg, var(--success), #059669);
+    color: white;
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, var(--danger), #dc2626);
+    color: white;
+}
+
+.btn-secondary {
+    background: var(--light);
+    color: var(--dark);
+    border: 1px solid var(--border);
+}
+
+.table-wrapper {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    background: white;
+}
+
+th {
+    background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+    padding: 12px 15px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--dark);
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 2px solid var(--border);
+}
+
+td {
+    padding: 12px 15px;
+    border-bottom: 1px solid #f1f5f9;
+    font-size: 14px;
+    color: #475569;
+}
+
+tr:hover {
+    background: #f8fafc;
+}
+
+tr:last-child td {
+    border-bottom: none;
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 500;
+    color: var(--dark);
+    font-size: 14px;
+}
+
+.form-control {
+    width: 100%;
+    padding: 10px 15px;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    font-size: 14px;
+    transition: all 0.3s ease;
+    background: white;
+}
+
+.form-control:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+}
+
+.form-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+}
+
+.checkbox-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.checkbox-group input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    cursor: pointer;
+}
+
+.badge {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.badge-success {
+    background: rgba(16, 185, 129, 0.1);
+    color: var(--success);
+}
+
+.badge-danger {
+    background: rgba(239, 68, 68, 0.1);
+    color: var(--danger);
+}
+
+.badge-warning {
+    background: rgba(245, 158, 11, 0.1);
+    color: var(--warning);
+}
+
+.badge-info {
+    background: rgba(6, 182, 212, 0.1);
+    color: var(--secondary);
+}
+
+.search-box {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.search-box input {
+    flex: 1;
+}
+
+.tabs {
+    display: flex;
+    gap: 5px;
+    margin-bottom: 20px;
+    border-bottom: 2px solid var(--border);
+}
+
+.tab {
+    padding: 12px 24px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    font-weight: 500;
+    font-size: 14px;
+    transition: all 0.3s ease;
+    position: relative;
+}
+
+.tab.active {
+    color: var(--primary);
+}
+
+.tab.active::after {
+    content: '';
+    position: absolute;
+    bottom: -2px;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--primary);
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+.status-success { color: var(--success); font-weight: 600; }
+.status-fail { color: var(--danger); font-weight: 600; }
+.status-timeout { color: var(--warning); font-weight: 600; }
+
+.loading {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border: 3px solid rgba(0, 0, 0, 0.1);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.empty-state {
+    text-align: center;
+    padding: 40px;
+    color: #94a3b8;
+}
+
+.empty-state::before {
+    content: '📭';
+    font-size: 48px;
+    display: block;
+    margin-bottom: 15px;
+    opacity: 0.5;
+}
+
+@media (max-width: 768px) {
+    .container {
+        padding: 15px;
+    }
+    
+    .dashboard {
+        grid-template-columns: 1fr;
+    }
+    
+    .header h1 {
+        font-size: 22px;
+    }
+    
+    .controls {
+        flex-direction: column;
+    }
+    
+    .btn {
+        width: 100%;
+        justify-content: center;
+    }
+    
+    .form-row {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
 </head>
 <body>
 <div class="container">
-    <h1>🚀 IPv6 代理管理面板 v7.4 Final</h1>
-    
-    <div class="grid">
-        <div class="card"><div class="card-title">活跃连接</div><div class="card-value" id="active">-</div></div>
-        <div class="card"><div class="card-title">总连接数</div><div class="card-value" id="total">-</div><div class="card-sub">QPS: <span id="qps">-</span></div></div>
-        <div class="card"><div class="card-title">连接统计</div><div class="card-value-small"><span class="success" id="success">-</span> / <span class="fail" id="failed">-</span></div><div class="card-sub">超时: <span id="timeout">-</span></div></div>
-        <div class="card"><div class="card-title">进程 CPU</div><div class="card-value" id="process-cpu">- %</div><div class="card-sub">ipv6-proxy</div></div>
-        <div class="card"><div class="card-title">系统 CPU</div><div class="card-value" id="system-cpu">- %</div><div class="card-sub">服务器</div></div>
-        <div class="card"><div class="card-title">平均耗时</div><div class="card-value" id="avg-duration">- ms</div></div>
-        <div class="card"><div class="card-title">IPv6 池</div><div class="card-value" id="pool-size">-</div><div class="card-sub">目标: <span id="pool-target">-</span></div><div class="progress-bar"><div class="progress-fill" id="pool-progress"></div></div></div>
-        <div class="card"><div class="card-title">运行时间</div><div class="card-value" id="uptime" style="font-size:20px">-</div></div>
+    <div class="header">
+        <h1>IPv6 代理管理面板</h1>
     </div>
 
-    <div class="section">
-        <div class="section-title">📊 可视化图表 <span class="badge badge-info">实时</span></div>
-        <div class="chart-container"><canvas id="statsChart"></canvas></div>
-    </div>
-
-    <div class="section">
-        <div class="section-title">⚙️ 在线配置</div>
-        <div class="config-row"><div class="config-label">代理端口:</div><input type="text" id="cfg-port" placeholder="1080"></div>
-        <div class="config-row"><div class="config-label">Web端口:</div><input type="text" id="cfg-web-port" placeholder="8080"></div>
-        <div class="config-row"><div class="config-label">代理用户名:</div><input type="text" id="cfg-username" placeholder="proxy"></div>
-        <div class="config-row"><div class="config-label">代理密码:</div><input type="password" id="cfg-password" placeholder="******"></div>
-        <div class="input-group"><button onclick="saveConfig()">💾 保存配置</button><span id="config-status"></span></div>
-        <div style="padding:10px;background:#f59e0b20;border-radius:6px;font-size:13px;color:#f59e0b">⚠️ 需重启服务: <code>systemctl restart ipv6-proxy</code></div>
-    </div>
-
-    <div class="section">
-        <div class="section-title">🔄 自动轮换</div>
-        <div class="input-group">
-            <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="auto-rotate-enabled" style="width:auto">启用</label>
-            <label>间隔: <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" style="width:80px">小时</label>
-            <button onclick="saveAutoRotate()">保存</button>
-            <span id="auto-rotate-status"></span>
+    <!-- 数据统计卡片 -->
+    <div class="dashboard">
+        <div class="card">
+            <div class="card-icon blue">📊</div>
+            <div class="stat-label">总连接数</div>
+            <div class="stat-value" id="total-conns">0</div>
         </div>
-        <div id="next-rotate-info" style="font-size:13px;color:#94a3b8"></div>
-    </div>
-
-    <div class="section">
-        <div class="section-title">🧹 自清理</div>
-        <div class="input-group">
-            <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" id="auto-clean-enabled" style="width:auto">启用失败IPv6自动删除补入</label>
-            <button onclick="saveAutoClean()">保存</button>
-            <span id="auto-clean-status"></span>
+        
+        <div class="card">
+            <div class="card-icon green">✅</div>
+            <div class="stat-label">成功连接</div>
+            <div class="stat-value" id="success-conns">0</div>
         </div>
-        <div style="font-size:13px;color:#94a3b8">开启后，连接失败的IPv6地址将自动删除并补充新地址</div>
-    </div>
-
-    <div class="section">
-        <div class="section-title">📊 IP 池管理</div>
-        <div class="input-group">
-            <label>目标:</label>
-            <input type="number" id="new-target" placeholder="100000" min="100" step="1000">
-            <button onclick="resizePool()">应用</button>
-            <span id="pool-status"></span>
-            <button class="warning" onclick="rotateIPs()">🔄 立即轮换</button>
+        
+        <div class="card">
+            <div class="card-icon red">❌</div>
+            <div class="stat-label">失败连接</div>
+            <div class="stat-value" id="failed-conns">0</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-icon orange">⏱</div>
+            <div class="stat-label">超时连接</div>
+            <div class="stat-value" id="timeout-conns">0</div>
         </div>
     </div>
 
-    <div class="section">
-        <div class="section-title">👥 实时连接 <span class="badge badge-info" id="active-count">0</span></div>
-        <div class="log-container">
-            <table><thead><tr><th>客户端</th><th>目标</th><th>IPv6</th><th>时长</th></tr></thead>
-            <tbody id="active-table"><tr><td colspan="4" style="text-align:center;color:#64748b">无连接</td></tr></tbody></table>
+    <!-- 状态监控卡片 -->
+    <div class="dashboard">
+        <div class="card">
+            <div class="card-icon purple">🔗</div>
+            <div class="stat-label">活动连接</div>
+            <div class="stat-value" id="active-conns">0</div>
+        </div>
+        
+        <div class="card">
+            <div class="card-icon cyan">📈</div>
+            <div class="stat-label">成功率</div>
+            <div class="stat-value">
+                <span id="success-rate">0</span><span class="stat-unit">%</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-icon blue">💻</div>
+            <div class="stat-label">进程 CPU / 系统 CPU</div>
+            <div class="stat-value">
+                <span id="process-cpu">0</span> / <span id="system-cpu">0</span><span class="stat-unit">%</span>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-icon green">⚡</div>
+            <div class="stat-label">平均延迟</div>
+            <div class="stat-value">
+                <span id="avg-duration">0</span><span class="stat-unit">ms</span>
+            </div>
         </div>
     </div>
 
-    <div class="section">
-        <div class="section-title">🔍 搜索</div>
-        <div class="input-group">
-            <input type="text" id="search-query" placeholder="IP / 域名..." style="flex:1">
-            <button onclick="searchLogs()">搜索</button>
-            <button onclick="clearSearch()">清除</button>
-            <span id="search-results-count"></span>
+    <!-- 功能控制区 -->
+    <div class="dashboard">
+        <div class="card">
+            <div class="stat-label">🔧 基础配置</div>
+            <div class="form-row">
+                <input type="text" class="form-control" id="cfg-port" placeholder="代理端口">
+                <input type="text" class="form-control" id="cfg-web-port" placeholder="Web端口">
+            </div>
+            <div class="form-row" style="margin-top: 10px;">
+                <input type="text" class="form-control" id="cfg-username" placeholder="用户名">
+                <input type="password" class="form-control" id="cfg-password" placeholder="密码">
+            </div>
+            <button class="btn btn-primary" style="margin-top: 15px; width: 100%;" onclick="saveConfig()">
+                💾 保存配置
+            </button>
+            <div id="config-status" style="margin-top: 10px;"></div>
         </div>
-        <div class="log-container" id="search-results-container" style="display:none">
-            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-            <tbody id="search-results-table"></tbody></table>
+
+        <div class="card">
+            <div class="stat-label">🔄 自动轮换</div>
+            <div class="checkbox-group">
+                <input type="checkbox" id="auto-rotate-enabled">
+                <label for="auto-rotate-enabled">启用自动轮换</label>
+            </div>
+            <div class="form-group">
+                <label>轮换间隔 (小时)</label>
+                <input type="number" class="form-control" id="auto-rotate-hours" value="6" min="1">
+            </div>
+            <button class="btn btn-success" style="width: 100%;" onclick="saveAutoRotate()">
+                ⏰ 更新设置
+            </button>
+            <div id="next-rotate-info" style="margin-top: 10px;"></div>
+            <div id="auto-rotate-status" style="margin-top: 5px;"></div>
+        </div>
+
+        <div class="card">
+            <div class="stat-label">🧹 自动清理</div>
+            <div class="checkbox-group">
+                <input type="checkbox" id="auto-clean-enabled">
+                <label for="auto-clean-enabled">启用失效IP自动清理</label>
+            </div>
+            <p style="font-size: 12px; color: #64748b; margin: 10px 0;">
+                自动移除连续失败5次的IP地址
+            </p>
+            <button class="btn btn-success" style="width: 100%;" onclick="saveAutoClean()">
+                🗑️ 更新设置
+            </button>
+            <div id="auto-clean-status" style="margin-top: 10px;"></div>
+        </div>
+
+        <div class="card">
+            <div class="stat-label">🎯 池管理</div>
+            <div style="margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                    <span>当前: <strong id="pool-size">0</strong></span>
+                    <span>目标: <strong id="pool-target">0</strong></span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="pool-progress"></div>
+                </div>
+                <div id="pool-status" style="margin-top: 8px; text-align: center;"></div>
+            </div>
+            <div class="form-group">
+                <label>新目标大小</label>
+                <input type="number" class="form-control" id="new-target" placeholder="1000" min="100">
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                <button class="btn btn-primary" onclick="resizePool()">📏 调整</button>
+                <button class="btn btn-danger" onclick="rotateIPs()">🔄 轮换</button>
+            </div>
         </div>
     </div>
 
-    <div class="section">
-        <div class="section-title">📝 最近连接</div>
-        <div class="log-container">
-            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-            <tbody id="logs-table"><tr><td colspan="6" style="text-align:center;color:#64748b">等待...</td></tr></tbody></table>
+    <!-- 可视化图表 -->
+    <div class="chart-container">
+        <div class="section-title" style="margin-bottom: 20px;">
+            <span>📊</span> 性能监控
         </div>
+        <canvas id="stats-chart" height="80"></canvas>
     </div>
 
+    <!-- 日志记录 -->
     <div class="section">
-        <div class="section-title">❌ 失败日志</div>
-        <div class="log-container">
-            <table><thead><tr><th>时间</th><th>客户端</th><th>目标</th><th>IPv6</th><th>状态</th><th>耗时</th></tr></thead>
-            <tbody id="fail-logs-table"><tr><td colspan="6" style="text-align:center;color:#64748b">无失败</td></tr></tbody></table>
+        <div class="section-header">
+            <div class="section-title">
+                <span>📝</span> 日志记录
+            </div>
+            <div class="controls">
+                <span style="margin-right: 10px;">
+                    <span>运行时间: </span>
+                    <strong id="uptime">0d 0h 0m</strong>
+                </span>
+                <span>
+                    <span>活动: </span>
+                    <strong id="active-count">0</strong>
+                </span>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab(event, 'logs-tab')">最近连接</button>
+            <button class="tab" onclick="switchTab(event, 'fail-tab')">失败记录</button>
+            <button class="tab" onclick="switchTab(event, 'active-tab')">活动连接</button>
+            <button class="tab" onclick="switchTab(event, 'search-tab')">搜索</button>
+        </div>
+
+        <div id="logs-tab" class="tab-content active">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>客户端</th>
+                            <th>目标</th>
+                            <th>IPv6</th>
+                            <th>状态</th>
+                            <th>耗时</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logs-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="fail-tab" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>客户端</th>
+                            <th>目标</th>
+                            <th>IPv6</th>
+                            <th>状态</th>
+                            <th>耗时</th>
+                        </tr>
+                    </thead>
+                    <tbody id="fail-logs-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="active-tab" class="tab-content">
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>客户端</th>
+                            <th>目标</th>
+                            <th>IPv6</th>
+                            <th>持续时间</th>
+                        </tr>
+                    </thead>
+                    <tbody id="active-table"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="search-tab" class="tab-content">
+            <div class="search-box">
+                <input type="text" class="form-control" id="search-query" placeholder="搜索 IP、目标或 IPv6...">
+                <button class="btn btn-primary" onclick="searchLogs()">🔍 搜索</button>
+                <button class="btn btn-secondary" onclick="clearSearch()">清空</button>
+            </div>
+            <div id="search-results-container" style="display:none;">
+                <div style="margin-bottom: 10px;">
+                    <span id="search-results-count"></span>
+                </div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>客户端</th>
+                                <th>目标</th>
+                                <th>IPv6</th>
+                                <th>状态</th>
+                                <th>耗时</th>
+                            </tr>
+                        </thead>
+                        <tbody id="search-results-table"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
     </div>
 </div>
 
 <script>
 let statsChart;
+
+function switchTab(event, tabName) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    event.target.classList.add('active');
+    document.getElementById(tabName).classList.add('active');
+}
+
 function initChart() {
-    const ctx = document.getElementById('statsChart').getContext('2d');
+    const ctx = document.getElementById('stats-chart').getContext('2d');
     statsChart = new Chart(ctx, {
         type: 'line',
         data: {
             labels: [],
             datasets: [
-                {label: 'QPS', data: [], borderColor: '#3b82f6', yAxisID: 'y', tension: 0.4},
-                {label: '成功率%', data: [], borderColor: '#10b981', yAxisID: 'y1', tension: 0.4},
-                {label: 'CPU%', data: [], borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.4}
+                {
+                    label: 'QPS',
+                    data: [],
+                    borderColor: '#4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                    tension: 0.3,
+                    yAxisID: 'y'
+                },
+                {
+                    label: '成功率 (%)',
+                    data: [],
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    tension: 0.3,
+                    yAxisID: 'y1'
+                },
+                {
+                    label: 'CPU (%)',
+                    data: [],
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                    tension: 0.3,
+                    yAxisID: 'y1'
+                }
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: {legend: {labels: {color: '#e2e8f0'}}},
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top'
+                }
+            },
             scales: {
-                x: {ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
-                y: {type: 'linear', position: 'left', ticks: {color: '#94a3b8'}, grid: {color: '#334155'}},
-                y1: {type: 'linear', position: 'right', ticks: {color: '#94a3b8'}, grid: {display: false}}
+                x: {
+                    display: true,
+                    grid: {
+                        display: false
+                    }
+                },
+                y: {
+                    type: 'linear',
+                    display: true,
+                    position: 'left',
+                    title: {
+                        display: true,
+                        text: 'QPS'
+                    }
+                },
+                y1: {
+                    type: 'linear',
+                    display: true,
+                    position: 'right',
+                    title: {
+                        display: true,
+                        text: '百分比 (%)'
+                    },
+                    grid: {
+                        drawOnChartArea: false
+                    }
+                }
             }
         }
     });
@@ -1607,15 +2244,15 @@ function initChart() {
 async function updateStats() {
     try {
         const d = await fetch('/api/stats').then(r => r.json());
-        document.getElementById('active').textContent = d.active;
-        document.getElementById('total').textContent = d.total;
-        document.getElementById('qps').textContent = d.qps.toFixed(2);
-        document.getElementById('success').textContent = d.success;
-        document.getElementById('failed').textContent = d.failed;
-        document.getElementById('timeout').textContent = d.timeout;
-        document.getElementById('process-cpu').textContent = d.process_cpu.toFixed(1) + ' %';
-        document.getElementById('system-cpu').textContent = d.system_cpu.toFixed(1) + ' %';
-        document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0) + ' ms';
+        document.getElementById('total-conns').textContent = d.total;
+        document.getElementById('success-conns').textContent = d.success;
+        document.getElementById('failed-conns').textContent = d.failed;
+        document.getElementById('timeout-conns').textContent = d.timeout;
+        document.getElementById('active-conns').textContent = d.active;
+        document.getElementById('success-rate').textContent = d.success_rate.toFixed(1);
+        document.getElementById('process-cpu').textContent = d.process_cpu.toFixed(1);
+        document.getElementById('system-cpu').textContent = d.system_cpu.toFixed(1);
+        document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0);
         document.getElementById('pool-size').textContent = d.pool;
         document.getElementById('pool-target').textContent = d.target;
         document.getElementById('pool-progress').style.width = d.progress.toFixed(1) + '%';
