@@ -248,19 +248,20 @@ var (
 )
 
 type Config struct {
-	Port              string `json:"port"`
-	WebPort           string `json:"web_port"`
-	WebUsername       string `json:"web_username"`
-	WebPassword       string `json:"web_password"`
-	Username          string `json:"username"`
-	Password          string `json:"password"`
-	IPv6Prefix        string `json:"ipv6_prefix"`
-	Interface         string `json:"interface"`
-	InitialPool       int    `json:"initial_pool"`
-	TargetPool        int    `json:"target_pool"`
-	AutoRotate        bool   `json:"auto_rotate"`
-	AutoRotateHours   int    `json:"auto_rotate_hours"`
-	AutoClean         bool   `json:"auto_clean"`
+	Port              string       `json:"port"`
+	WebPort           string       `json:"web_port"`
+	WebUsername       string       `json:"web_username"`
+	WebPassword       string       `json:"web_password"`
+	Username          string       `json:"username"`
+	Password          string       `json:"password"`
+	IPv6Prefix        string       `json:"ipv6_prefix"`
+	Interface         string       `json:"interface"`
+	InitialPool       int          `json:"initial_pool"`
+	TargetPool        int          `json:"target_pool"`
+	AutoRotate        bool         `json:"auto_rotate"`
+	AutoRotateHours   int          `json:"auto_rotate_hours"`
+	AutoClean         bool         `json:"auto_clean"`
+	Ports             []PortConfig `json:"ports"` // 多端口配置
 }
 
 type Stats struct {
@@ -1467,20 +1468,326 @@ func handleAPIChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 更新配置
+	// 查找并更新端口配置
+	updated := false
+	
+	// 检查是否是主端口
 	if req.Port == config.Port {
 		config.Username = req.Username
 		config.Password = req.Password
-		if err := saveConfigToFile(); err != nil {
-			http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		updated = true
+	} else {
+		// 检查是否在Ports数组中
+		for i := range config.Ports {
+			if config.Ports[i].Port == req.Port {
+				config.Ports[i].Username = req.Username
+				config.Ports[i].Password = req.Password
+				updated = true
+				break
+			}
+		}
+	}
+	
+	if !updated {
+		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
+		return
+	}
+	
+	if err := saveConfigToFile(); err != nil {
+		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "密码已更新，重启服务后生效"})
+}
+
+// 新增：获取端口列表
+func handleAPIPortList(w http.ResponseWriter, r *http.Request) {
+	type PortInfo struct {
+		Port      string `json:"port"`
+		Username  string `json:"username"`
+		Enabled   bool   `json:"enabled"`
+		IsPrimary bool   `json:"is_primary"`
+		Created   string `json:"created"`
+	}
+	
+	var ports []PortInfo
+	
+	// 添加主端口
+	ports = append(ports, PortInfo{
+		Port:      config.Port,
+		Username:  config.Username,
+		Enabled:   true,
+		IsPrimary: true,
+		Created:   "主端口",
+	})
+	
+	// 添加其他端口
+	for _, p := range config.Ports {
+		ports = append(ports, PortInfo{
+			Port:      p.Port,
+			Username:  p.Username,
+			Enabled:   p.Enabled,
+			IsPrimary: false,
+			Created:   p.Created,
+		})
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ports)
+}
+
+// 新增：添加端口
+func handleAPIAddPort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Port     string `json:"port"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Port == "" || req.Username == "" || req.Password == "" {
+		http.Error(w, `{"error":"端口、用户名和密码不能为空"}`, http.StatusBadRequest)
+		return
+	}
+	
+	// 检查端口是否已存在
+	if req.Port == config.Port {
+		http.Error(w, `{"error":"端口已存在（主端口）"}`, http.StatusBadRequest)
+		return
+	}
+	for _, p := range config.Ports {
+		if p.Port == req.Port {
+			http.Error(w, `{"error":"端口已存在"}`, http.StatusBadRequest)
 			return
 		}
-		
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "密码已更新，重启服务后生效"})
-	} else {
-		http.Error(w, `{"error":"端口不匹配"}`, http.StatusBadRequest)
 	}
+	
+	// 添加新端口
+	newPort := PortConfig{
+		Port:     req.Port,
+		Username: req.Username,
+		Password: req.Password,
+		Enabled:  true,
+		Created:  time.Now().Format("2006-01-02 15:04:05"),
+	}
+	
+	config.Ports = append(config.Ports, newPort)
+	
+	if err := saveConfigToFile(); err != nil {
+		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "端口已添加，重启服务后生效"})
+}
+
+// 新增：批量添加端口
+func handleAPIBatchAddPorts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		StartPort int    `json:"start_port"`
+		EndPort   int    `json:"end_port"`
+		Username  string `json:"username"`
+		Password  string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.StartPort <= 0 || req.EndPort <= 0 || req.StartPort > req.EndPort {
+		http.Error(w, `{"error":"端口范围无效"}`, http.StatusBadRequest)
+		return
+	}
+	
+	if req.EndPort - req.StartPort > 100 {
+		http.Error(w, `{"error":"一次最多添加100个端口"}`, http.StatusBadRequest)
+		return
+	}
+	
+	if req.Username == "" || req.Password == "" {
+		http.Error(w, `{"error":"用户名和密码不能为空"}`, http.StatusBadRequest)
+		return
+	}
+	
+	added := 0
+	skipped := 0
+	now := time.Now().Format("2006-01-02 15:04:05")
+	
+	for port := req.StartPort; port <= req.EndPort; port++ {
+		portStr := fmt.Sprintf("%d", port)
+		
+		// 检查端口是否已存在
+		exists := false
+		if portStr == config.Port {
+			exists = true
+		} else {
+			for _, p := range config.Ports {
+				if p.Port == portStr {
+					exists = true
+					break
+				}
+			}
+		}
+		
+		if exists {
+			skipped++
+			continue
+		}
+		
+		// 添加新端口
+		newPort := PortConfig{
+			Port:     portStr,
+			Username: req.Username,
+			Password: req.Password,
+			Enabled:  true,
+			Created:  now,
+		}
+		config.Ports = append(config.Ports, newPort)
+		added++
+	}
+	
+	if err := saveConfigToFile(); err != nil {
+		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		return
+	}
+	
+	message := fmt.Sprintf("成功添加%d个端口", added)
+	if skipped > 0 {
+		message += fmt.Sprintf("，跳过%d个已存在端口", skipped)
+	}
+	message += "，重启服务后生效"
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message": message,
+		"added":   added,
+		"skipped": skipped,
+	})
+}
+
+// 新增：删除端口
+func handleAPIDeletePort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Port string `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Port == "" {
+		http.Error(w, `{"error":"端口不能为空"}`, http.StatusBadRequest)
+		return
+	}
+	
+	// 不能删除主端口
+	if req.Port == config.Port {
+		http.Error(w, `{"error":"不能删除主端口"}`, http.StatusBadRequest)
+		return
+	}
+	
+	// 查找并删除端口
+	found := false
+	newPorts := []PortConfig{}
+	for _, p := range config.Ports {
+		if p.Port == req.Port {
+			found = true
+			continue
+		}
+		newPorts = append(newPorts, p)
+	}
+	
+	if !found {
+		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
+		return
+	}
+	
+	config.Ports = newPorts
+	
+	if err := saveConfigToFile(); err != nil {
+		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": "端口已删除，重启服务后生效"})
+}
+
+// 新增：切换端口启用状态
+func handleAPITogglePort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Port    string `json:"port"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Port == "" {
+		http.Error(w, `{"error":"端口不能为空"}`, http.StatusBadRequest)
+		return
+	}
+	
+	// 主端口始终启用
+	if req.Port == config.Port {
+		http.Error(w, `{"error":"主端口始终启用"}`, http.StatusBadRequest)
+		return
+	}
+	
+	// 查找并更新端口状态
+	found := false
+	for i := range config.Ports {
+		if config.Ports[i].Port == req.Port {
+			config.Ports[i].Enabled = req.Enabled
+			found = true
+			break
+		}
+	}
+	
+	if !found {
+		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
+		return
+	}
+	
+	if err := saveConfigToFile(); err != nil {
+		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+		return
+	}
+	
+	status := "禁用"
+	if req.Enabled {
+		status = "启用"
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("端口已%s，重启服务后生效", status)})
 }
 
 
@@ -1523,6 +1830,12 @@ func startWebServer(ctx context.Context) *http.Server {
 	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))
 	mux.HandleFunc("/api/autoclean", basicAuth(handleAPIAutoClean))
 	mux.HandleFunc("/api/changepassword", basicAuth(handleAPIChangePassword))
+	// 新增：端口管理API
+	mux.HandleFunc("/api/ports", basicAuth(handleAPIPortList))
+	mux.HandleFunc("/api/ports/add", basicAuth(handleAPIAddPort))
+	mux.HandleFunc("/api/ports/batch", basicAuth(handleAPIBatchAddPorts))
+	mux.HandleFunc("/api/ports/delete", basicAuth(handleAPIDeletePort))
+	mux.HandleFunc("/api/ports/toggle", basicAuth(handleAPITogglePort))
 
 	srv := &http.Server{
 		Addr:    ":" + config.WebPort,
@@ -2307,19 +2620,6 @@ input[type=checkbox] {
 
     <!-- 功能控制卡片 -->
     <div class="grid">
-        <!-- 在线配置卡片 -->
-        <div class="card config-card">
-            <div class="card-title">⚙️ 在线配置</div>
-            <div class="compact-form">
-                <input type="text" id="cfg-port" placeholder="代理端口" class="compact-input">
-                <input type="text" id="cfg-web-port" placeholder="Web端口" class="compact-input">
-                <input type="text" id="cfg-username" placeholder="用户名" class="compact-input">
-                <input type="password" id="cfg-password" placeholder="密码" class="compact-input">
-                <button onclick="saveConfig()" class="compact-btn">💾 保存配置</button>
-                <div id="config-status" class="status-text"></div>
-            </div>
-        </div>
-
         <!-- 自动轮换卡片 -->
         <div class="card config-card">
             <div class="card-title">🔄 自动轮换</div>
@@ -2365,15 +2665,16 @@ input[type=checkbox] {
             </div>
         </div>
         
-        <!-- 新增：端口管理卡片 -->
+        <!-- 增强：端口管理卡片 -->
         <div class="card config-card">
             <div class="card-title">🔌 端口管理</div>
             <div class="compact-form">
                 <div class="info-text" style="margin-bottom:8px">
-                    当前端口: <strong id="current-port-display">-</strong>
+                    总端口数: <strong id="total-ports-display">-</strong>
                 </div>
-                <button onclick="showPortManager()" class="compact-btn">⚙️ 管理端口</button>
-                <button onclick="showPasswordChange()" class="compact-btn warning">🔑 修改密码</button>
+                <button onclick="showPortList()" class="compact-btn">📋 端口列表</button>
+                <button onclick="showAddPort()" class="compact-btn">➕ 新增端口</button>
+                <button onclick="showBatchAddPort()" class="compact-btn warning">📦 批量新增</button>
                 <div id="port-status" class="status-text"></div>
             </div>
         </div>
@@ -2484,59 +2785,119 @@ input[type=checkbox] {
     </div>
 </div>
 
-<!-- 密码修改弹窗 -->
-<div id="passwordModal" class="modal">
-    <div class="modal-content">
+<!-- 端口列表弹窗 -->
+<div id="portListModal" class="modal">
+    <div class="modal-content" style="max-width:800px">
         <div class="modal-header">
-            <h2 class="modal-title">🔑 修改端口密码</h2>
-            <span class="modal-close" onclick="closePasswordModal()">&times;</span>
+            <h2 class="modal-title">📋 端口列表</h2>
+            <span class="modal-close" onclick="closePortListModal()">&times;</span>
         </div>
         <div class="modal-body">
-            <label class="modal-label">端口</label>
-            <input type="text" id="modal-port" class="modal-input" readonly>
-            
-            <label class="modal-label">用户名</label>
-            <input type="text" id="modal-username" class="modal-input" placeholder="输入新用户名">
-            
-            <label class="modal-label">密码</label>
-            <input type="password" id="modal-password" class="modal-input" placeholder="输入新密码">
-            
-            <div id="password-modal-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+            <div class="log-container" style="max-height:500px">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>端口</th>
+                            <th>用户名</th>
+                            <th>状态</th>
+                            <th>类型</th>
+                            <th>创建时间</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="port-list-table">
+                        <tr><td colspan="6" style="text-align:center;color:#64748b">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
         <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closePasswordModal()">取消</button>
-            <button class="modal-btn modal-btn-primary" onclick="savePasswordChange()">保存修改</button>
+            <button class="modal-btn modal-btn-secondary" onclick="closePortListModal()">关闭</button>
         </div>
     </div>
 </div>
 
-<!-- 端口管理弹窗 -->
-<div id="portManagerModal" class="modal">
+<!-- 新增端口弹窗 -->
+<div id="addPortModal" class="modal">
     <div class="modal-content">
         <div class="modal-header">
-            <h2 class="modal-title">🔌 端口管理</h2>
-            <span class="modal-close" onclick="closePortManagerModal()">&times;</span>
+            <h2 class="modal-title">➕ 新增端口</h2>
+            <span class="modal-close" onclick="closeAddPortModal()">&times;</span>
         </div>
         <div class="modal-body">
-            <div style="margin-bottom:20px;padding:16px;background:var(--bg-secondary);border-radius:8px">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                    <span style="color:var(--text-secondary);font-size:13px">当前运行端口</span>
-                    <span style="color:var(--primary-light);font-size:16px;font-weight:600" id="modal-current-port">-</span>
-                </div>
-                <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span style="color:var(--text-secondary);font-size:13px">认证用户</span>
-                    <span style="color:var(--text-primary);font-size:14px" id="modal-current-user">-</span>
-                </div>
-            </div>
+            <label class="modal-label">端口号</label>
+            <input type="number" id="add-port-number" class="modal-input" placeholder="例如: 1081" min="1" max="65535">
             
-            <div style="color:var(--text-muted);font-size:12px;padding:12px;background:rgba(59,130,246,0.1);border-radius:8px;border-left:3px solid var(--primary)">
-                <strong style="color:var(--primary-light)">提示：</strong>修改配置需要重启服务才能生效。如需添加多个端口，请手动修改配置文件。
-            </div>
+            <label class="modal-label">用户名</label>
+            <input type="text" id="add-port-username" class="modal-input" placeholder="输入用户名">
             
-            <div id="port-manager-status" style="color:var(--success);margin-top:12px;font-size:13px"></div>
+            <label class="modal-label">密码</label>
+            <input type="password" id="add-port-password" class="modal-input" placeholder="输入密码">
+            
+            <div id="add-port-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
         </div>
         <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closePortManagerModal()">关闭</button>
+            <button class="modal-btn modal-btn-secondary" onclick="closeAddPortModal()">取消</button>
+            <button class="modal-btn modal-btn-primary" onclick="saveAddPort()">添加</button>
+        </div>
+    </div>
+</div>
+
+<!-- 批量新增端口弹窗 -->
+<div id="batchAddPortModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2 class="modal-title">📦 批量新增端口</h2>
+            <span class="modal-close" onclick="closeBatchAddPortModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <label class="modal-label">起始端口</label>
+            <input type="number" id="batch-start-port" class="modal-input" placeholder="例如: 10000" min="1" max="65535">
+            
+            <label class="modal-label">结束端口</label>
+            <input type="number" id="batch-end-port" class="modal-input" placeholder="例如: 10100" min="1" max="65535">
+            
+            <label class="modal-label">用户名（统一）</label>
+            <input type="text" id="batch-username" class="modal-input" placeholder="所有端口使用相同用户名">
+            
+            <label class="modal-label">密码（统一）</label>
+            <input type="password" id="batch-password" class="modal-input" placeholder="所有端口使用相同密码">
+            
+            <div style="color:var(--warning);font-size:12px;margin-top:10px;padding:10px;background:rgba(245,158,11,0.1);border-radius:6px">
+                ⚠️ 一次最多添加100个端口
+            </div>
+            
+            <div id="batch-add-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+        </div>
+        <div class="modal-footer">
+            <button class="modal-btn modal-btn-secondary" onclick="closeBatchAddPortModal()">取消</button>
+            <button class="modal-btn modal-btn-primary" onclick="saveBatchAddPort()">批量添加</button>
+        </div>
+    </div>
+</div>
+
+<!-- 修改端口信息弹窗 -->
+<div id="editPortModal" class="modal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2 class="modal-title">✏️ 修改端口信息</h2>
+            <span class="modal-close" onclick="closeEditPortModal()">&times;</span>
+        </div>
+        <div class="modal-body">
+            <label class="modal-label">端口号</label>
+            <input type="text" id="edit-port-number" class="modal-input" readonly style="background:var(--bg-primary)">
+            
+            <label class="modal-label">用户名</label>
+            <input type="text" id="edit-port-username" class="modal-input" placeholder="输入新用户名">
+            
+            <label class="modal-label">密码</label>
+            <input type="password" id="edit-port-password" class="modal-input" placeholder="输入新密码">
+            
+            <div id="edit-port-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+        </div>
+        <div class="modal-footer">
+            <button class="modal-btn modal-btn-secondary" onclick="closeEditPortModal()">取消</button>
+            <button class="modal-btn modal-btn-primary" onclick="saveEditPort()">保存修改</button>
         </div>
     </div>
 </div>
@@ -2769,34 +3130,172 @@ async function rotateIPs() {
     } catch (e) {alert('失败');}
 }
 
-// 新增：弹窗管理函数
-function showPasswordModal() {
-    const modal = document.getElementById('passwordModal');
-    const portInput = document.getElementById('modal-port');
-    const usernameInput = document.getElementById('modal-username');
-    const passwordInput = document.getElementById('modal-password');
+// 新增：端口管理弹窗函数
+async function showPortList() {
+    const modal = document.getElementById('portListModal');
+    modal.style.display = 'block';
+    
+    try {
+        const ports = await fetch('/api/ports').then(r => r.json());
+        const tbody = document.getElementById('port-list-table');
+        
+        if (!ports || ports.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无端口</td></tr>';
+            return;
+        }
+        
+        tbody.innerHTML = ports.map(p => {
+            const statusBadge = p.enabled ? 
+                '<span style="color:var(--success)">✓ 启用</span>' : 
+                '<span style="color:var(--text-muted)">✗ 禁用</span>';
+            const typeBadge = p.is_primary ? 
+                '<span class="badge badge-info">主端口</span>' : 
+                '<span class="badge badge-success">次端口</span>';
+            const actions = p.is_primary ? 
+                `<button onclick="editPort('${p.port}')" class="compact-btn" style="padding:4px 8px;font-size:12px">✏️ 编辑</button>` :
+                `<button onclick="editPort('${p.port}')" class="compact-btn" style="padding:4px 8px;font-size:12px">✏️ 编辑</button>
+                 <button onclick="deletePort('${p.port}')" class="compact-btn warning" style="padding:4px 8px;font-size:12px;margin-left:4px">🗑️ 删除</button>`;
+            
+            return `<tr>
+                <td><strong>${p.port}</strong></td>
+                <td>${p.username}</td>
+                <td>${statusBadge}</td>
+                <td>${typeBadge}</td>
+                <td>${p.created}</td>
+                <td>${actions}</td>
+            </tr>`;
+        }).join('');
+        
+        // 更新总端口数
+        document.getElementById('total-ports-display').textContent = ports.length;
+    } catch (e) {
+        alert('加载端口列表失败');
+    }
+}
+
+function closePortListModal() {
+    document.getElementById('portListModal').style.display = 'none';
+}
+
+function showAddPort() {
+    const modal = document.getElementById('addPortModal');
+    document.getElementById('add-port-number').value = '';
+    document.getElementById('add-port-username').value = '';
+    document.getElementById('add-port-password').value = '';
+    document.getElementById('add-port-status').textContent = '';
+    modal.style.display = 'block';
+}
+
+function closeAddPortModal() {
+    document.getElementById('addPortModal').style.display = 'none';
+}
+
+async function saveAddPort() {
+    const port = document.getElementById('add-port-number').value;
+    const username = document.getElementById('add-port-username').value;
+    const password = document.getElementById('add-port-password').value;
+    
+    if (!port || !username || !password) {
+        alert('请填写所有字段');
+        return;
+    }
+    
+    try {
+        const r = await fetch('/api/ports/add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({port, username, password})
+        }).then(r => r.json());
+        
+        document.getElementById('add-port-status').textContent = '✅ ' + r.message;
+        setTimeout(() => {
+            closeAddPortModal();
+            showPortList(); // 刷新列表
+        }, 1500);
+    } catch (e) {
+        alert('添加失败');
+    }
+}
+
+function showBatchAddPort() {
+    const modal = document.getElementById('batchAddPortModal');
+    document.getElementById('batch-start-port').value = '';
+    document.getElementById('batch-end-port').value = '';
+    document.getElementById('batch-username').value = '';
+    document.getElementById('batch-password').value = '';
+    document.getElementById('batch-add-status').textContent = '';
+    modal.style.display = 'block';
+}
+
+function closeBatchAddPortModal() {
+    document.getElementById('batchAddPortModal').style.display = 'none';
+}
+
+async function saveBatchAddPort() {
+    const startPort = parseInt(document.getElementById('batch-start-port').value);
+    const endPort = parseInt(document.getElementById('batch-end-port').value);
+    const username = document.getElementById('batch-username').value;
+    const password = document.getElementById('batch-password').value;
+    
+    if (!startPort || !endPort || !username || !password) {
+        alert('请填写所有字段');
+        return;
+    }
+    
+    if (startPort > endPort) {
+        alert('起始端口不能大于结束端口');
+        return;
+    }
+    
+    if (endPort - startPort > 100) {
+        alert('一次最多添加100个端口');
+        return;
+    }
+    
+    try {
+        const r = await fetch('/api/ports/batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({start_port: startPort, end_port: endPort, username, password})
+        }).then(r => r.json());
+        
+        document.getElementById('batch-add-status').textContent = '✅ ' + r.message;
+        setTimeout(() => {
+            closeBatchAddPortModal();
+            showPortList(); // 刷新列表
+        }, 2000);
+    } catch (e) {
+        alert('批量添加失败');
+    }
+}
+
+function editPort(port) {
+    const modal = document.getElementById('editPortModal');
+    document.getElementById('edit-port-number').value = port;
+    document.getElementById('edit-port-status').textContent = '';
     
     // 获取当前端口信息
-    fetch('/api/stats')
+    fetch('/api/ports')
         .then(r => r.json())
-        .then(d => {
-            portInput.value = d.current_port || '';
-            usernameInput.value = d.current_username || '';
-            passwordInput.value = '';
+        .then(ports => {
+            const portInfo = ports.find(p => p.port === port);
+            if (portInfo) {
+                document.getElementById('edit-port-username').value = portInfo.username;
+                document.getElementById('edit-port-password').value = '';
+            }
         });
     
     modal.style.display = 'block';
 }
 
-function closePasswordModal() {
-    document.getElementById('passwordModal').style.display = 'none';
-    document.getElementById('password-modal-status').textContent = '';
+function closeEditPortModal() {
+    document.getElementById('editPortModal').style.display = 'none';
 }
 
-async function savePasswordChange() {
-    const port = document.getElementById('modal-port').value;
-    const username = document.getElementById('modal-username').value;
-    const password = document.getElementById('modal-password').value;
+async function saveEditPort() {
+    const port = document.getElementById('edit-port-number').value;
+    const username = document.getElementById('edit-port-username').value;
+    const password = document.getElementById('edit-port-password').value;
     
     if (!username || !password) {
         alert('请输入用户名和密码');
@@ -2810,44 +3309,52 @@ async function savePasswordChange() {
             body: JSON.stringify({port, username, password})
         }).then(r => r.json());
         
-        document.getElementById('password-modal-status').textContent = '✅ ' + r.message;
+        document.getElementById('edit-port-status').textContent = '✅ ' + r.message;
         setTimeout(() => {
-            closePasswordModal();
-            updateStats();
-        }, 2000);
+            closeEditPortModal();
+            showPortList(); // 刷新列表
+        }, 1500);
     } catch (e) {
         alert('保存失败');
     }
 }
 
-function showPortManager() {
-    const modal = document.getElementById('portManagerModal');
+async function deletePort(port) {
+    if (!confirm(`确定要删除端口 ${port} 吗？`)) {
+        return;
+    }
     
-    // 获取当前端口信息
-    fetch('/api/stats')
-        .then(r => r.json())
-        .then(d => {
-            document.getElementById('modal-current-port').textContent = d.current_port || '-';
-            document.getElementById('modal-current-user').textContent = d.current_username || '-';
-        });
-    
-    modal.style.display = 'block';
+    try {
+        const r = await fetch('/api/ports/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({port})
+        }).then(r => r.json());
+        
+        alert(r.message);
+        showPortList(); // 刷新列表
+    } catch (e) {
+        alert('删除失败');
+    }
 }
 
-function closePortManagerModal() {
-    document.getElementById('portManagerModal').style.display = 'none';
+// 更新总端口数显示
+async function updatePortCount() {
+    try {
+        const ports = await fetch('/api/ports').then(r => r.json());
+        document.getElementById('total-ports-display').textContent = ports.length;
+    } catch (e) {}
 }
 
 // 点击弹窗外部关闭
 window.onclick = function(event) {
-    const passwordModal = document.getElementById('passwordModal');
-    const portManagerModal = document.getElementById('portManagerModal');
-    if (event.target === passwordModal) {
-        closePasswordModal();
-    }
-    if (event.target === portManagerModal) {
-        closePortManagerModal();
-    }
+    const modals = ['portListModal', 'addPortModal', 'batchAddPortModal', 'editPortModal'];
+    modals.forEach(modalId => {
+        const modal = document.getElementById(modalId);
+        if (event.target === modal) {
+            modal.style.display = 'none';
+        }
+    });
 }
 
 document.getElementById('search-query').addEventListener('keypress', (e) => {
@@ -2860,11 +3367,13 @@ setInterval(updateChart, 5000);
 setInterval(updateLogs, 5000);
 setInterval(updateFailLogs, 5000);
 setInterval(updateActiveConns, 3000);
+setInterval(updatePortCount, 10000); // 每10秒更新一次端口数量
 updateStats();
 updateChart();
 updateLogs();
 updateFailLogs();
 updateActiveConns();
+updatePortCount(); // 初始化时更新端口数量
 </script>
 </body>
 </html>
