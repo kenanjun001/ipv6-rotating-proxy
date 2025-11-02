@@ -1545,24 +1545,28 @@ cat << 'HTMLEOF' > index.html
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root {
-    --primary: #4f46e5;
-    --primary-dark: #4338ca;
+    --bg-primary: #0f172a;
+    --bg-secondary: #1e293b;
+    --bg-card: #1a2332;
+    --primary: #3b82f6;
+    --primary-light: #60a5fa;
     --secondary: #06b6d4;
     --success: #10b981;
     --warning: #f59e0b;
     --danger: #ef4444;
-    --dark: #1e293b;
-    --light: #f1f5f9;
-    --border: #e2e8f0;
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --border: #2d3748;
 }
 
 * {margin:0;padding:0;box-sizing:border-box}
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: linear-gradient(135deg, #0f172a 0%, #1a202c 100%);
     min-height: 100vh;
-    color: #334155;
+    color: var(--text-primary);
 }
 
 .container {
@@ -1572,19 +1576,25 @@ body {
 }
 
 .header {
-    background: rgba(255, 255, 255, 0.98);
-    border-radius: 16px;
+    background: var(--bg-card);
+    border-radius: 12px;
     padding: 25px 30px;
     margin-bottom: 25px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
 }
 
 .header h1 {
-    font-size: 28px;
-    color: var(--dark);
+    font-size: 26px;
+    color: var(--text-primary);
     display: flex;
     align-items: center;
     gap: 12px;
+}
+
+.header h1::before {
+    content: '🚀';
+    font-size: 28px;
 }
 
 .grid {
@@ -1595,49 +1605,40 @@ body {
 }
 
 .card {
-    background: rgba(255, 255, 255, 0.98);
+    background: var(--bg-card);
     border-radius: 12px;
     padding: 20px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
     transition: all 0.3s ease;
     position: relative;
-    overflow: hidden;
 }
 
 .card:hover {
     transform: translateY(-3px);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
-}
-
-.card::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 3px;
-    background: linear-gradient(90deg, var(--primary) 0%, var(--secondary) 100%);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    border-color: var(--primary);
 }
 
 .card-title {
-    font-size: 13px;
-    color: #64748b;
-    font-weight: 500;
+    font-size: 12px;
+    color: var(--text-secondary);
+    font-weight: 400;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    margin-bottom: 8px;
+    margin-bottom: 12px;
 }
 
 .card-value {
-    font-size: 28px;
+    font-size: 32px;
     font-weight: bold;
-    color: var(--dark);
+    color: var(--primary-light);
+    line-height: 1;
 }
 
 .card-value-small {
-    font-size: 20px;
+    font-size: 22px;
     font-weight: bold;
-    color: var(--dark);
 }
 
 .card-value-small .success {color: var(--success)}
@@ -1645,50 +1646,73 @@ body {
 
 .card-sub {
     font-size: 12px;
-    color: #64748b;
-    margin-top: 5px;
+    color: var(--text-muted);
+    margin-top: 8px;
 }
 
 .progress-bar {
     width: 100%;
-    height: 8px;
-    background: var(--light);
-    border-radius: 4px;
+    height: 6px;
+    background: var(--bg-secondary);
+    border-radius: 3px;
     overflow: hidden;
-    margin-top: 10px;
+    margin-top: 12px;
 }
 
 .progress-fill {
     height: 100%;
-    background: linear-gradient(90deg, var(--primary), var(--secondary));
+    background: linear-gradient(90deg, var(--primary), var(--primary-light));
     transition: width 0.5s ease;
 }
 
 .section {
-    background: rgba(255, 255, 255, 0.98);
+    background: var(--bg-card);
     border-radius: 12px;
     padding: 25px;
     margin-bottom: 25px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
-    overflow: hidden;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--border);
 }
 
 .section-title {
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--dark);
+    font-size: 18px;
+    font-weight: 500;
+    color: var(--text-primary);
     display: flex;
     align-items: center;
     gap: 10px;
     margin-bottom: 20px;
     padding-bottom: 15px;
-    border-bottom: 2px solid var(--border);
+    border-bottom: 1px solid var(--border);
 }
 
 .log-container {
     max-height: 400px;
     overflow-y: auto;
     overflow-x: auto;
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 10px;
+}
+
+/* 滚动条样式 */
+.log-container::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+.log-container::-webkit-scrollbar-track {
+    background: var(--bg-secondary);
+    border-radius: 4px;
+}
+
+.log-container::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
+}
+
+.log-container::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
 }
 
 table {
@@ -1698,35 +1722,35 @@ table {
 }
 
 th {
-    background: linear-gradient(135deg, #f8fafc, #f1f5f9);
+    background: var(--bg-primary);
     padding: 12px 15px;
     text-align: left;
-    font-weight: 600;
-    color: var(--dark);
-    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    border-bottom: 2px solid var(--border);
+    border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
     z-index: 10;
 }
 
 td {
-    padding: 12px 15px;
-    border-bottom: 1px solid #f1f5f9;
-    font-size: 14px;
-    color: #475569;
+    padding: 10px 15px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-primary);
     white-space: nowrap;
 }
 
 tr:hover {
-    background: #f8fafc;
+    background: rgba(59, 130, 246, 0.05);
 }
 
-.status-success {color: var(--success); font-weight: 600;}
-.status-fail {color: var(--danger); font-weight: 600;}
-.status-timeout {color: var(--warning); font-weight: 600;}
+.status-success {color: var(--success); font-weight: 500;}
+.status-fail {color: var(--danger); font-weight: 500;}
+.status-timeout {color: var(--warning); font-weight: 500;}
 
 .input-group {
     display: flex;
@@ -1738,22 +1762,27 @@ tr:hover {
 
 input[type=number], input[type=text], input[type=password], select {
     padding: 10px 15px;
-    border: 2px solid var(--border);
+    border: 1px solid var(--border);
     border-radius: 8px;
     font-size: 14px;
     transition: all 0.3s ease;
-    background: white;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
     min-width: 120px;
 }
 
 input[type=number]:focus, input[type=text]:focus, input[type=password]:focus {
     outline: none;
     border-color: var(--primary);
-    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+input[type=number]::placeholder, input[type=text]::placeholder, input[type=password]::placeholder {
+    color: var(--text-muted);
 }
 
 button {
-    background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    background: var(--primary);
     color: white;
     border: none;
     padding: 10px 20px;
@@ -1765,45 +1794,50 @@ button {
 }
 
 button:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+    background: var(--primary-light);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
 }
 
 button.warning {
-    background: linear-gradient(135deg, var(--warning), #d97706);
+    background: var(--warning);
 }
 
 button.warning:hover {
+    background: #d97706;
     box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
 }
 
 .badge {
     display: inline-block;
     padding: 4px 10px;
-    border-radius: 12px;
-    font-size: 12px;
-    font-weight: 600;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 500;
     text-transform: uppercase;
     letter-spacing: 0.5px;
 }
 
 .badge-success {
-    background: rgba(16, 185, 129, 0.1);
+    background: rgba(16, 185, 129, 0.2);
     color: var(--success);
 }
 
 .badge-info {
-    background: rgba(6, 182, 212, 0.1);
-    color: var(--secondary);
+    background: rgba(59, 130, 246, 0.2);
+    color: var(--primary-light);
 }
 
 .chart-container {
     height: 250px;
     margin-top: 15px;
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    padding: 15px;
 }
 
 canvas {
-    max-height: 250px;
+    max-height: 220px;
 }
 
 .config-row {
@@ -1815,15 +1849,43 @@ canvas {
 }
 
 .config-label {
-    color: #64748b;
+    color: var(--text-secondary);
     font-size: 14px;
-    font-weight: 500;
+    font-weight: 400;
+}
+
+/* 提示框样式 */
+.alert {
+    padding: 12px 16px;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid var(--warning);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--warning);
+}
+
+.alert code {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Monaco', 'Menlo', monospace;
+}
+
+/* 标签样式 */
+label {
+    color: var(--text-secondary);
+}
+
+input[type=checkbox] {
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
 }
 
 @media (max-width: 768px) {
     .container {padding: 15px;}
     .grid {grid-template-columns: 1fr;}
-    .header h1 {font-size: 22px;}
+    .header h1 {font-size: 20px;}
     .config-row {grid-template-columns: 1fr;}
 }
 </style>
@@ -1921,7 +1983,7 @@ canvas {
             <button onclick="saveConfig()">💾 保存配置</button>
             <span id="config-status"></span>
         </div>
-        <div style="padding:10px;background:rgba(245,158,11,0.1);border-radius:6px;font-size:13px;color:#f59e0b">
+        <div class="alert">
             ⚠️ 需重启服务: <code>systemctl restart ipv6-proxy</code>
         </div>
     </div>
@@ -2072,19 +2134,43 @@ function initChart() {
         data: {
             labels: [],
             datasets: [
-                {label: 'QPS', data: [], borderColor: '#4f46e5', yAxisID: 'y', tension: 0.4, borderWidth: 2},
-                {label: '成功率%', data: [], borderColor: '#10b981', yAxisID: 'y1', tension: 0.4, borderWidth: 2},
-                {label: 'CPU%', data: [], borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.4, borderWidth: 2}
+                {label: 'QPS', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', yAxisID: 'y', tension: 0.4, borderWidth: 2},
+                {label: '成功率%', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.1)', yAxisID: 'y1', tension: 0.4, borderWidth: 2},
+                {label: 'CPU%', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', yAxisID: 'y1', tension: 0.4, borderWidth: 2}
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: {legend: {labels: {color: '#334155', padding: 15, font: {size: 12}}}},
+            plugins: {
+                legend: {
+                    labels: {
+                        color: '#94a3b8',
+                        padding: 15,
+                        font: {size: 12}
+                    }
+                },
+                grid: {
+                    color: '#2d3748'
+                }
+            },
             scales: {
-                x: {ticks: {color: '#64748b', font: {size: 11}}, grid: {color: '#e2e8f0', drawOnChartArea: true}},
-                y: {type: 'linear', position: 'left', ticks: {color: '#64748b', font: {size: 11}}, grid: {color: '#e2e8f0'}},
-                y1: {type: 'linear', position: 'right', ticks: {color: '#64748b', font: {size: 11}}, grid: {display: false}}
+                x: {
+                    ticks: {color: '#64748b', font: {size: 11}},
+                    grid: {color: '#2d3748', drawOnChartArea: true}
+                },
+                y: {
+                    type: 'linear',
+                    position: 'left',
+                    ticks: {color: '#64748b', font: {size: 11}},
+                    grid: {color: '#2d3748'}
+                },
+                y1: {
+                    type: 'linear',
+                    position: 'right',
+                    ticks: {color: '#64748b', font: {size: 11}},
+                    grid: {display: false}
+                }
             }
         }
     });
