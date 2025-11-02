@@ -1840,37 +1840,7 @@ canvas {
     max-height: 220px;
 }
 
-.config-row {
-    display: grid;
-    grid-template-columns: 150px 1fr;
-    gap: 15px;
-    margin-bottom: 15px;
-    align-items: center;
-}
-
-.config-label {
-    color: var(--text-secondary);
-    font-size: 14px;
-    font-weight: 400;
-}
-
 /* 提示框样式 */
-.alert {
-    padding: 12px 16px;
-    background: rgba(245, 158, 11, 0.1);
-    border: 1px solid var(--warning);
-    border-radius: 8px;
-    font-size: 13px;
-    color: var(--warning);
-}
-
-.alert code {
-    background: rgba(0, 0, 0, 0.2);
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: 'Monaco', 'Menlo', monospace;
-}
-
 /* 标签样式 */
 label {
     color: var(--text-secondary);
@@ -1882,11 +1852,108 @@ input[type=checkbox] {
     cursor: pointer;
 }
 
+/* 紧凑配置卡片样式 */
+.config-card {
+    min-height: 140px;
+    display: flex;
+    flex-direction: column;
+}
+
+.compact-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+}
+
+.compact-input {
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    width: 100%;
+}
+
+.compact-input:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+}
+
+.compact-btn {
+    padding: 6px 12px;
+    font-size: 13px;
+    border-radius: 6px;
+    background: var(--primary);
+    color: white;
+    border: none;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    width: 100%;
+}
+
+.compact-btn:hover {
+    background: var(--primary-light);
+}
+
+.compact-btn.warning {
+    background: var(--warning);
+}
+
+.compact-btn.warning:hover {
+    background: #d97706;
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-primary);
+}
+
+.checkbox-label input {
+    width: 16px;
+    height: 16px;
+}
+
+.input-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.mini-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.unit {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.status-text {
+    font-size: 11px;
+    margin-top: 4px;
+    height: 16px;
+}
+
+.info-text {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
 @media (max-width: 768px) {
     .container {padding: 15px;}
     .grid {grid-template-columns: 1fr;}
     .header h1 {font-size: 20px;}
-    .config-row {grid-template-columns: 1fr;}
+    .config-card {min-height: auto; padding: 15px;}
+    .compact-form {gap: 10px;}
 }
 </style>
 </head>
@@ -1949,6 +2016,67 @@ input[type=checkbox] {
         </div>
     </div>
 
+    <!-- 功能控制卡片 -->
+    <div class="grid">
+        <!-- 在线配置卡片 -->
+        <div class="card config-card">
+            <div class="card-title">⚙️ 在线配置</div>
+            <div class="compact-form">
+                <input type="text" id="cfg-port" placeholder="代理端口" class="compact-input">
+                <input type="text" id="cfg-web-port" placeholder="Web端口" class="compact-input">
+                <input type="text" id="cfg-username" placeholder="用户名" class="compact-input">
+                <input type="password" id="cfg-password" placeholder="密码" class="compact-input">
+                <button onclick="saveConfig()" class="compact-btn">💾 保存配置</button>
+                <div id="config-status" class="status-text"></div>
+            </div>
+        </div>
+
+        <!-- 自动轮换卡片 -->
+        <div class="card config-card">
+            <div class="card-title">🔄 自动轮换</div>
+            <div class="compact-form">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="auto-rotate-enabled">
+                    <span>启用</span>
+                </label>
+                <div class="input-row">
+                    <label class="mini-label">间隔:</label>
+                    <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" class="compact-input">
+                    <span class="unit">小时</span>
+                </div>
+                <button onclick="saveAutoRotate()" class="compact-btn">保存</button>
+                <div id="auto-rotate-status" class="status-text"></div>
+                <div id="next-rotate-info" class="info-text"></div>
+            </div>
+        </div>
+
+        <!-- 自动清理卡片 -->
+        <div class="card config-card">
+            <div class="card-title">🧹 自动清理</div>
+            <div class="compact-form">
+                <label class="checkbox-label">
+                    <input type="checkbox" id="auto-clean-enabled">
+                    <span>启用失效IPv6自动删除补入</span>
+                </label>
+                <button onclick="saveAutoClean()" class="compact-btn">保存</button>
+                <div id="auto-clean-status" class="status-text"></div>
+                <div class="info-text">连接失败的IPv6将自动清理</div>
+            </div>
+        </div>
+
+        <!-- IP池管理卡片 -->
+        <div class="card config-card">
+            <div class="card-title">📊 IP 池管理</div>
+            <div class="compact-form">
+                <label class="mini-label">目标:</label>
+                <input type="number" id="new-target" placeholder="100000" min="100" step="1000" class="compact-input">
+                <button onclick="resizePool()" class="compact-btn">应用</button>
+                <button onclick="rotateIPs()" class="compact-btn warning">🔄 立即轮换</button>
+                <div id="pool-status" class="status-text"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- 可视化图表 -->
     <div class="section">
         <div class="section-title">
@@ -1957,77 +2085,6 @@ input[type=checkbox] {
         </div>
         <div class="chart-container">
             <canvas id="statsChart"></canvas>
-        </div>
-    </div>
-
-    <!-- 配置管理 -->
-    <div class="section">
-        <div class="section-title">⚙️ 在线配置</div>
-        <div class="config-row">
-            <div class="config-label">代理端口:</div>
-            <input type="text" id="cfg-port" placeholder="1080">
-        </div>
-        <div class="config-row">
-            <div class="config-label">Web端口:</div>
-            <input type="text" id="cfg-web-port" placeholder="8080">
-        </div>
-        <div class="config-row">
-            <div class="config-label">代理用户名:</div>
-            <input type="text" id="cfg-username" placeholder="proxy">
-        </div>
-        <div class="config-row">
-            <div class="config-label">代理密码:</div>
-            <input type="password" id="cfg-password" placeholder="******">
-        </div>
-        <div class="input-group">
-            <button onclick="saveConfig()">💾 保存配置</button>
-            <span id="config-status"></span>
-        </div>
-        <div class="alert">
-            ⚠️ 需重启服务: <code>systemctl restart ipv6-proxy</code>
-        </div>
-    </div>
-
-    <!-- 自动轮换 -->
-    <div class="section">
-        <div class="section-title">🔄 自动轮换</div>
-        <div class="input-group">
-            <label style="display:flex;align-items:center;gap:8px">
-                <input type="checkbox" id="auto-rotate-enabled" style="width:auto">启用
-            </label>
-            <label>间隔: 
-                <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" style="width:80px">小时
-            </label>
-            <button onclick="saveAutoRotate()">保存</button>
-            <span id="auto-rotate-status"></span>
-        </div>
-        <div id="next-rotate-info" style="font-size:13px;color:#64748b"></div>
-    </div>
-
-    <!-- 自动清理 -->
-    <div class="section">
-        <div class="section-title">🧹 自动清理</div>
-        <div class="input-group">
-            <label style="display:flex;align-items:center;gap:8px">
-                <input type="checkbox" id="auto-clean-enabled" style="width:auto">启用失效IPv6自动删除补入
-            </label>
-            <button onclick="saveAutoClean()">保存</button>
-            <span id="auto-clean-status"></span>
-        </div>
-        <div style="font-size:13px;color:#64748b">
-            开启后，连接失败的IPv6地址将自动删除并补充新地址
-        </div>
-    </div>
-
-    <!-- IP池管理 -->
-    <div class="section">
-        <div class="section-title">📊 IP 池管理</div>
-        <div class="input-group">
-            <label>目标:</label>
-            <input type="number" id="new-target" placeholder="100000" min="100" step="1000">
-            <button onclick="resizePool()">应用</button>
-            <span id="pool-status"></span>
-            <button class="warning" onclick="rotateIPs()">🔄 立即轮换</button>
         </div>
     </div>
 
