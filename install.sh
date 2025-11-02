@@ -2543,7 +2543,7 @@ input[type=checkbox] {
 <body>
 <div class="container">
     <div class="header">
-        <h1>🚀 IPv6 代理管理面板 v7.4 Final</h1>
+        <h1> IPv6 代理管理面板 v7.4 Final</h1>
     </div>
     
     <!-- 数据统计卡片 -->
