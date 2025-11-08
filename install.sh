@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# IPv6 代理 v7.4 Final 完全集成版安装脚本
-# 包含：自动处理dpkg锁、错误恢复、界面优化
+# IPv6 代理 v8.1.1 多前缀智能版 完全集成安装脚本
+# v8.1.1 新增：支持空格分隔的前缀选择（1 2 3 或 1,2,3 都可以）
 #
 
 INSTALL_DIR="/opt/ipv6-proxy"
@@ -20,7 +20,6 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 不在出错时退出，我们要处理错误
 set +e
 
 # 打印函数
@@ -37,17 +36,16 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "============================================="
-echo "=== IPv6 代理 v7.4 Final 完全集成版 ==="
+echo "=== IPv6 代理 v8.1 多前缀智能版 ==="
 echo "============================================="
 echo ""
 
 # --- 智能处理dpkg锁 ---
 handle_apt_locks() {
-    local max_wait=60  # 最多等待60秒
+    local max_wait=60
     local waited=0
     local need_wait=false
     
-    # 检查是否有锁
     if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
        fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
        fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
@@ -58,7 +56,6 @@ handle_apt_locks() {
         print_warning "检测到系统正在进行其他操作"
         echo "正在智能处理..."
         
-        # 首先尝试温和等待
         while [ $waited -lt $max_wait ]; do
             if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
                ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
@@ -75,10 +72,7 @@ handle_apt_locks() {
             waited=$((waited + 2))
         done
         
-        # 超时后强制处理
         print_info "自动清理系统锁..."
-        
-        # 停止相关进程
         killall apt 2>/dev/null || true
         killall apt-get 2>/dev/null || true
         killall dpkg 2>/dev/null || true
@@ -86,13 +80,11 @@ handle_apt_locks() {
         
         sleep 2
         
-        # 清理锁文件
         rm -f /var/lib/apt/lists/lock
         rm -f /var/cache/apt/archives/lock
         rm -f /var/lib/dpkg/lock*
         rm -f /var/lib/dpkg/lock-frontend
         
-        # 修复dpkg
         dpkg --configure -a 2>/dev/null || true
         
         print_success "系统锁已清理"
@@ -113,10 +105,8 @@ echo ""
 # --- 步骤 2: 安装依赖 ---
 echo "--- 步骤 2: 安装依赖 ---"
 
-# 处理dpkg锁
 handle_apt_locks
 
-# 尝试更新apt
 echo "更新软件包列表..."
 for i in {1..3}; do
     if apt-get update >/dev/null 2>&1; then
@@ -132,7 +122,6 @@ for i in {1..3}; do
     fi
 done
 
-# 安装wget
 echo "安装必要组件..."
 for i in {1..3}; do
     if apt-get install -y wget >/dev/null 2>&1; then
@@ -151,10 +140,8 @@ for i in {1..3}; do
     fi
 done
 
-# 清理旧版go
 apt-get remove -y golang-go >/dev/null 2>&1 || true
 
-# 安装Go
 if [ ! -d "/usr/local/go" ] || ! /usr/local/go/bin/go version | grep -q "$GO_VERSION"; then
     echo "下载 Go $GO_VERSION..."
     wget -q "$GO_URL" -O "/tmp/$GO_TAR" || {
@@ -181,7 +168,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -235,6 +221,11 @@ var (
 	nextRotateTime     time.Time
 	nextRotateTimeLock sync.RWMutex
 
+	// 多前缀相关变量
+	autoSwitchEnabled  int32
+	nextSwitchTime     time.Time
+	nextSwitchTimeLock sync.RWMutex
+
 	discardQueue chan net.IP
 	rng          = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	rngLock      sync.Mutex
@@ -248,20 +239,24 @@ var (
 )
 
 type Config struct {
-	Port              string       `json:"port"`
-	WebPort           string       `json:"web_port"`
-	WebUsername       string       `json:"web_username"`
-	WebPassword       string       `json:"web_password"`
-	Username          string       `json:"username"`
-	Password          string       `json:"password"`
-	IPv6Prefix        string       `json:"ipv6_prefix"`
-	Interface         string       `json:"interface"`
-	InitialPool       int          `json:"initial_pool"`
-	TargetPool        int          `json:"target_pool"`
-	AutoRotate        bool         `json:"auto_rotate"`
-	AutoRotateHours   int          `json:"auto_rotate_hours"`
-	AutoClean         bool         `json:"auto_clean"`
-	Ports             []PortConfig `json:"ports"` // 多端口配置
+	Port                string       `json:"port"`
+	WebPort             string       `json:"web_port"`
+	WebUsername         string       `json:"web_username"`
+	WebPassword         string       `json:"web_password"`
+	Username            string       `json:"username"`
+	Password            string       `json:"password"`
+	IPv6Prefix          string       `json:"ipv6_prefix"`          // 保留用于向后兼容
+	IPv6Prefixes        []string     `json:"ipv6_prefixes"`        // 新增：多前缀列表
+	ActivePrefixIndex   int          `json:"active_prefix_index"`  // 当前激活的前缀索引
+	AutoSwitchPrefix    bool         `json:"auto_switch_prefix"`   // 是否自动切换前缀
+	SwitchIntervalHours int          `json:"switch_interval_hours"` // 切换间隔（小时）
+	Interface           string       `json:"interface"`
+	InitialPool         int          `json:"initial_pool"`
+	TargetPool          int          `json:"target_pool"`
+	AutoRotate          bool         `json:"auto_rotate"`
+	AutoRotateHours     int          `json:"auto_rotate_hours"`
+	AutoClean           bool         `json:"auto_clean"`
+	Ports               []PortConfig `json:"ports"`
 }
 
 type Stats struct {
@@ -272,11 +267,10 @@ type Stats struct {
 	TotalDuration        int64
 	ProcessCPUPercent    int64
 	SystemCPUPercent     int64
-	// 新增：流量统计
 	TotalBytesRecv       int64
 	TotalBytesSent       int64
-	CurrentRecvRate      int64 // bytes per second
-	CurrentSendRate      int64 // bytes per second
+	CurrentRecvRate      int64
+	CurrentSendRate      int64
 	LastTrafficUpdate    time.Time
 }
 
@@ -307,180 +301,384 @@ type ActiveConn struct {
 	Duration  string    `json:"duration"`
 }
 
-// 新增：端口配置管理
 type PortConfig struct {
 	Port     string `json:"port"`
 	Username string `json:"username"`
 	Password string `json:"password"`
-	Enabled  bool   `json:"enabled"`
-	Created  string `json:"created"`
 }
 
+// ===== 多前缀相关结构 =====
 
-func readUserChoice(maxChoice int) int {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Printf("选择 (1-%d): ", maxChoice)
-		text, _ := reader.ReadString('\n')
-		choice, err := strconv.Atoi(strings.TrimSpace(text))
-		if err != nil || choice < 1 || choice > maxChoice {
-			continue
-		}
-		return choice
-	}
+type PrefixInfo struct {
+	Prefix    string `json:"prefix"`
+	Index     int    `json:"index"`
+	IsActive  bool   `json:"is_active"`
+	IsValid   bool   `json:"is_valid"`
+	ErrorMsg  string `json:"error_msg,omitempty"`
 }
 
-func readUserInt(prompt string, defaultValue int) int {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Printf("%s (默认 %d): ", prompt, defaultValue)
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-		if text == "" {
-			return defaultValue
-		}
-		val, err := strconv.Atoi(text)
-		if err != nil || val < 0 {
-			continue
-		}
-		return val
-	}
+type PrefixStatus struct {
+	Prefixes            []PrefixInfo `json:"prefixes"`
+	ActiveIndex         int          `json:"active_index"`
+	AutoSwitchEnabled   bool         `json:"auto_switch_enabled"`
+	SwitchIntervalHours int          `json:"switch_interval_hours"`
+	NextSwitchTime      string       `json:"next_switch_time"`
+	SecondsUntilSwitch  int64        `json:"seconds_until_switch"`
 }
 
-func readUserString(prompt string, defaultValue string) string {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Printf("%s (默认 %s): ", prompt, defaultValue)
-	text, _ := reader.ReadString('\n')
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return defaultValue
-	}
-	return text
+// 用于自动检测的结构
+type DetectedPrefix struct {
+	Prefix     string
+	Interface  string
+	SampleIP   string
+	PrefixLen  int
 }
 
-func readUserPassword(prompt string, defaultValue string) string {
-	fmt.Printf("%s (默认 %s): ", prompt, defaultValue)
-	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
-	if err != nil {
-		reader := bufio.NewReader(os.Stdin)
-		text, _ := reader.ReadString('\n')
-		text = strings.TrimSpace(text)
-		if text == "" {
-			return defaultValue
-		}
-		return text
-	}
-	text := string(bytePassword)
-	if text == "" {
-		return defaultValue
-	}
-	return text
-}
+// ===== 辅助函数 =====
 
-func selectInterface() (netlink.Link, error) {
+// 检测系统中所有可用的IPv6前缀
+func detectIPv6Prefixes() []DetectedPrefix {
+	var detected []DetectedPrefix
+	seenPrefixes := make(map[string]bool)
+
 	links, err := netlink.LinkList()
 	if err != nil {
-		return nil, err
+		return detected
 	}
-	var validLinks []netlink.Link
+
 	for _, link := range links {
-		if link.Attrs().Flags&net.FlagUp != 0 && link.Attrs().Flags&net.FlagLoopback == 0 {
-			validLinks = append(validLinks, link)
+		// 跳过 loopback 和 down 状态的接口
+		if link.Attrs().Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if link.Attrs().Flags&net.FlagUp == 0 {
+			continue
+		}
+
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V6)
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ip := addr.IPNet.IP
+			
+			// 跳过链路本地地址 (fe80::)
+			if ip.IsLinkLocalUnicast() {
+				continue
+			}
+			
+			// 跳过本地回环地址
+			if ip.IsLoopback() {
+				continue
+			}
+			
+			// 只处理全局单播地址
+			if !ip.IsGlobalUnicast() {
+				continue
+			}
+
+			// 获取前缀长度
+			ones, bits := addr.IPNet.Mask.Size()
+			
+			// 只检测真正的网络前缀，不要单个地址
+			// IPv6网络前缀通常是 /48 到 /64
+			// /128 是单个地址，跳过
+			if ones >= 120 {
+				continue
+			}
+			
+			// 前缀长度必须在合理范围内
+			if ones < 32 || ones > 80 {
+				continue
+			}
+
+			// 生成标准前缀字符串（转换为/64如果是其他长度）
+			// 对于大多数情况，我们使用/64前缀
+			standardPrefixLen := 64
+			if ones <= 64 {
+				standardPrefixLen = ones
+			}
+			
+			// 创建标准前缀（/64或原始前缀长度）
+			standardMask := net.CIDRMask(standardPrefixLen, bits)
+			standardPrefixIP := ip.Mask(standardMask)
+			standardPrefixStr := fmt.Sprintf("%s/%d", standardPrefixIP, standardPrefixLen)
+
+			// 去重
+			if seenPrefixes[standardPrefixStr] {
+				continue
+			}
+			seenPrefixes[standardPrefixStr] = true
+
+			detected = append(detected, DetectedPrefix{
+				Prefix:    standardPrefixStr,
+				Interface: link.Attrs().Name,
+				SampleIP:  ip.String(),
+				PrefixLen: standardPrefixLen,
+			})
 		}
 	}
-	if len(validLinks) == 0 {
-		return nil, errors.New("无可用网卡")
-	}
-	log.Println("可用网卡:")
-	for i, link := range validLinks {
-		log.Printf("  %d: %s", i+1, link.Attrs().Name)
-	}
-	choice := readUserChoice(len(validLinks))
-	return validLinks[choice-1], nil
+
+	return detected
 }
 
-func selectIPv6Prefix(iface netlink.Link) (string, error) {
-	addrs, err := netlink.AddrList(iface, netlink.FAMILY_V6)
-	if err != nil {
-		return "", err
+// 解析用户的选择输入
+func parseSelection(input string, maxNum int) []int {
+	var indices []int
+	seenIndices := make(map[int]bool)
+
+	input = strings.ToLower(strings.TrimSpace(input))
+	
+	// 处理 "all" 情况
+	if input == "all" || input == "a" {
+		for i := 0; i < maxNum; i++ {
+			indices = append(indices, i)
+		}
+		return indices
 	}
-	prefixMap := make(map[string]bool)
-	for _, addr := range addrs {
-		if addr.IPNet != nil && addr.IPNet.IP.IsGlobalUnicast() {
-			ones, bits := addr.IPNet.Mask.Size()
-			if bits == 128 && ones <= 64 {
-				ip64 := addr.IPNet.IP.Mask(net.CIDRMask(64, 128))
-				prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-					ip64[0], ip64[1], ip64[2], ip64[3], ip64[4], ip64[5], ip64[6], ip64[7])
-				prefixMap[prefixStr] = true
+
+	// 统一处理：将空格、制表符替换为逗号，方便统一解析
+	input = strings.ReplaceAll(input, " ", ",")
+	input = strings.ReplaceAll(input, "\t", ",")
+	// 清理连续的逗号
+	for strings.Contains(input, ",,") {
+		input = strings.ReplaceAll(input, ",,", ",")
+	}
+	input = strings.Trim(input, ",")
+
+	// 分割逗号
+	parts := strings.Split(input, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		
+		// 处理范围 (例如: 1-3)
+		if strings.Contains(part, "-") {
+			rangeParts := strings.Split(part, "-")
+			if len(rangeParts) == 2 {
+				start, err1 := strconv.Atoi(strings.TrimSpace(rangeParts[0]))
+				end, err2 := strconv.Atoi(strings.TrimSpace(rangeParts[1]))
+				if err1 == nil && err2 == nil {
+					for i := start; i <= end; i++ {
+						if i >= 1 && i <= maxNum && !seenIndices[i-1] {
+							indices = append(indices, i-1)
+							seenIndices[i-1] = true
+						}
+					}
+				}
+			}
+		} else {
+			// 处理单个数字
+			num, err := strconv.Atoi(part)
+			if err == nil && num >= 1 && num <= maxNum && !seenIndices[num-1] {
+				indices = append(indices, num-1)
+				seenIndices[num-1] = true
 			}
 		}
 	}
-	if len(prefixMap) == 0 {
-		log.Println("请输入 IPv6 /64 前缀:")
-		reader := bufio.NewReader(os.Stdin)
-		text, _ := reader.ReadString('\n')
-		return strings.TrimSpace(text), nil
-	}
-	var validPrefixes []string
-	for prefix := range prefixMap {
-		validPrefixes = append(validPrefixes, prefix)
-	}
-	log.Println("IPv6 前缀:")
-	for i, prefix := range validPrefixes {
-		log.Printf("  %d: %s", i+1, prefix)
-	}
-	choice := readUserChoice(len(validPrefixes))
-	return validPrefixes[choice-1], nil
+
+	return indices
 }
 
-func runInteractiveSetup() error {
-	log.Println("--- Web 设置 ---")
-	config.WebUsername = readUserString("Web账号", "admin")
-	config.WebPassword = readUserPassword("Web密码", "admin123")
-	
-	log.Println("\n--- 代理设置 ---")
-	config.Port = readUserString("代理端口", "1080")
-	config.WebPort = readUserString("Web端口", "8080")
-	config.Username = readUserString("代理用户名", "proxy")
-	config.Password = readUserPassword("代理密码", "proxy123")
+// ===== 初始化和配置加载 =====
 
-	log.Println("\n--- 网络 ---")
-	selectedIface, err := selectInterface()
+func loadOrCreateConfig() error {
+	ex, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	config.Interface = selectedIface.Attrs().Name
+	dir := filepath.Dir(ex)
+	configFilePath = filepath.Join(dir, "config.json")
+	indexHTMLPath = filepath.Join(dir, "index.html")
 
-	selectedPrefix, err := selectIPv6Prefix(selectedIface)
+	if _, err := os.Stat(configFilePath); os.IsNotExist(err) {
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			return errors.New("非交互模式下需要配置文件")
+		}
+
+		reader := bufio.NewReader(os.Stdin)
+		fmt.Println("🎯 首次配置向导")
+		fmt.Println("================")
+
+		port := readInput(reader, "代理端口", "1080")
+		webPort := readInput(reader, "Web管理端口", "8080")
+		webUser := readInput(reader, "Web管理员账号", "admin")
+		webPass := readInput(reader, "Web管理员密码", "admin123")
+		proxyUser := readInput(reader, "代理用户名", "proxy")
+		proxyPass := readInput(reader, "代理密码", "proxy123")
+
+		// 自动检测IPv6前缀
+		fmt.Println("\n📡 自动检测IPv6前缀...")
+		detectedPrefixes := detectIPv6Prefixes()
+		
+		var prefixes []string
+		if len(detectedPrefixes) == 0 {
+			fmt.Println("❌ 未检测到任何IPv6前缀")
+			fmt.Println("💡 请确保：")
+			fmt.Println("   1. 网卡已配置IPv6地址")
+			fmt.Println("   2. IPv6地址不是链路本地地址 (fe80::)")
+			fmt.Println("   3. 使用 'ip -6 addr' 查看IPv6配置")
+			os.Exit(1)
+		}
+		
+		fmt.Printf("\n✅ 检测到 %d 个可用的IPv6前缀:\n\n", len(detectedPrefixes))
+		for i, p := range detectedPrefixes {
+			fmt.Printf("  [%d] %s (网卡: %s)\n", i+1, p.Prefix, p.Interface)
+			fmt.Printf("      示例地址: %s\n", p.SampleIP)
+			fmt.Printf("      前缀长度: /%d\n\n", p.PrefixLen)
+		}
+		
+		fmt.Println("请选择要启用的前缀（支持多选）:")
+		fmt.Println("  格式1: 单个编号，如 1")
+		fmt.Println("  格式2: 逗号分隔，如 1,2,3")
+		fmt.Println("  格式3: 空格分隔，如 1 2 3")
+		fmt.Println("  格式4: 范围选择，如 1-3")
+		fmt.Println("  格式5: 混合使用，如 1 3-5 7")
+		fmt.Println("  格式6: 全选，输入 all")
+		fmt.Print("\n请输入: ")
+		
+		selection, _ := reader.ReadString('\n')
+		selection = strings.TrimSpace(selection)
+		
+		selectedIndices := parseSelection(selection, len(detectedPrefixes))
+		if len(selectedIndices) == 0 {
+			fmt.Println("❌ 未选择任何前缀")
+			os.Exit(1)
+		}
+		
+		for _, idx := range selectedIndices {
+			prefixes = append(prefixes, detectedPrefixes[idx].Prefix)
+			fmt.Printf("✅ 已启用: %s (网卡: %s)\n", 
+				detectedPrefixes[idx].Prefix, detectedPrefixes[idx].Interface)
+		}
+		
+		// 询问是否手动添加更多前缀
+		fmt.Print("\n是否手动添加其他IPv6前缀? (y/n) [n]: ")
+		addMore, _ := reader.ReadString('\n')
+		addMore = strings.ToLower(strings.TrimSpace(addMore))
+		
+		if addMore == "y" || addMore == "yes" {
+			fmt.Println("\n📝 手动添加IPv6前缀")
+			fmt.Println("格式示例: 2001:db8:1234::/64")
+			for {
+				fmt.Print("输入前缀 (留空完成): ")
+				prefix, _ := reader.ReadString('\n')
+				prefix = strings.TrimSpace(prefix)
+				
+				if prefix == "" {
+					break
+				}
+				
+				// 验证前缀格式
+				if _, _, err := net.ParseCIDR(prefix); err != nil {
+					fmt.Printf("❌ 无效格式: %v\n", err)
+					continue
+				}
+				
+				// 检查是否重复
+				duplicate := false
+				for _, p := range prefixes {
+					if p == prefix {
+						fmt.Println("⚠️  该前缀已存在")
+						duplicate = true
+						break
+					}
+				}
+				
+				if !duplicate {
+					prefixes = append(prefixes, prefix)
+					fmt.Printf("✅ 已添加: %s\n", prefix)
+				}
+			}
+		}
+
+		iface := detectedPrefixes[selectedIndices[0]].Interface
+		initialPool := readInput(reader, "初始IP池大小", "100")
+		targetPool := readInput(reader, "目标IP池大小", "1000")
+
+		initialPoolInt, _ := strconv.Atoi(initialPool)
+		targetPoolInt, _ := strconv.Atoi(targetPool)
+
+		config = Config{
+			Port:                port,
+			WebPort:             webPort,
+			WebUsername:         webUser,
+			WebPassword:         webPass,
+			Username:            proxyUser,
+			Password:            proxyPass,
+			IPv6Prefixes:        prefixes,
+			ActivePrefixIndex:   0,
+			AutoSwitchPrefix:    false,
+			SwitchIntervalHours: 24,
+			Interface:           iface,
+			InitialPool:         initialPoolInt,
+			TargetPool:          targetPoolInt,
+			AutoRotate:          false,
+			AutoRotateHours:     24,
+			AutoClean:           false,
+			Ports:               []PortConfig{},
+		}
+
+		fmt.Println("\n" + strings.Repeat("=", 50))
+		fmt.Println("📋 配置摘要")
+		fmt.Println(strings.Repeat("=", 50))
+		fmt.Printf("代理端口: %s\n", port)
+		fmt.Printf("Web端口: %s\n", webPort)
+		fmt.Printf("网络接口: %s\n", iface)
+		fmt.Printf("IPv6前缀数量: %d\n", len(prefixes))
+		fmt.Println("\n已配置的IPv6前缀:")
+		for i, p := range prefixes {
+			if i == 0 {
+				fmt.Printf("  [%d] %s ⭐ (默认启用)\n", i+1, p)
+			} else {
+				fmt.Printf("  [%d] %s\n", i+1, p)
+			}
+		}
+		fmt.Println(strings.Repeat("=", 50) + "\n")
+
+		return saveConfig()
+	}
+
+	data, err := os.ReadFile(configFilePath)
 	if err != nil {
 		return err
 	}
-	config.IPv6Prefix = selectedPrefix
 
-	log.Println("\n--- IP 池 ---")
-	config.InitialPool = readUserInt("初始池", 10000)
-	config.TargetPool = readUserInt("目标池", 100000)
-	if config.TargetPool < config.InitialPool {
-		config.TargetPool = config.InitialPool
+	if err := json.Unmarshal(data, &config); err != nil {
+		return err
 	}
-	
-	log.Println("\n--- 自动轮换 ---")
-	autoRotate := readUserString("启用? (y/n)", "n")
-	config.AutoRotate = strings.ToLower(autoRotate) == "y"
-	if config.AutoRotate {
-		config.AutoRotateHours = readUserInt("间隔(小时)", 6)
+
+	// 向后兼容：如果只有旧的单前缀，迁移到新的多前缀格式
+	if len(config.IPv6Prefixes) == 0 && config.IPv6Prefix != "" {
+		config.IPv6Prefixes = []string{config.IPv6Prefix}
+		config.ActivePrefixIndex = 0
+		saveConfig()
 	}
-	
-	log.Println("\n--- 自清理 ---")
-	autoClean := readUserString("启用失败IPv6自动清理? (y/n)", "y")
-	config.AutoClean = strings.ToLower(autoClean) == "y"
-	
+
+	// 确保至少有一个前缀
+	if len(config.IPv6Prefixes) == 0 {
+		return errors.New("配置中没有IPv6前缀")
+	}
+
+	// 确保索引有效
+	if config.ActivePrefixIndex < 0 || config.ActivePrefixIndex >= len(config.IPv6Prefixes) {
+		config.ActivePrefixIndex = 0
+		saveConfig()
+	}
+
+	// 初始化自动切换时间
+	if config.AutoSwitchPrefix && config.SwitchIntervalHours > 0 {
+		nextSwitchTime = time.Now().Add(time.Duration(config.SwitchIntervalHours) * time.Hour)
+		atomic.StoreInt32(&autoSwitchEnabled, 1)
+	}
+
 	return nil
 }
 
-func saveConfigToFile() error {
+func saveConfig() error {
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
@@ -488,1060 +686,866 @@ func saveConfigToFile() error {
 	return os.WriteFile(configFilePath, data, 0644)
 }
 
-func loadConfigFromFile() error {
-	data, err := os.ReadFile(configFilePath)
-	if err != nil {
-		return err
+func readInput(reader *bufio.Reader, prompt, defaultVal string) string {
+	fmt.Printf("%s [%s]: ", prompt, defaultVal)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return defaultVal
 	}
-	return json.Unmarshal(data, &config)
+	return input
 }
 
-func generateRandomIP() net.IP {
+// ===== 前缀管理功能 =====
+
+// 切换到指定的前缀索引
+func switchToPrefix(index int) error {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	if index < 0 || index >= len(config.IPv6Prefixes) {
+		return fmt.Errorf("无效的前缀索引: %d", index)
+	}
+
+	if index == config.ActivePrefixIndex {
+		return fmt.Errorf("已经在使用前缀 #%d", index)
+	}
+
+	oldPrefix := config.IPv6Prefixes[config.ActivePrefixIndex]
+	newPrefix := config.IPv6Prefixes[index]
+
+	log.Printf("🔄 开始切换前缀: #%d (%s) -> #%d (%s)", 
+		config.ActivePrefixIndex, oldPrefix, index, newPrefix)
+
+	// 清空当前IP池
+	ipv6Pool = make([]net.IP, 0, config.TargetPool)
+	ipv6PoolIndex = make(map[string]int)
+
+	// 尝试初始化新前缀
+	if err := initIPv6WithPrefix(newPrefix); err != nil {
+		log.Printf("❌ 切换到前缀 #%d 失败: %v，回退到 #%d", index, err, config.ActivePrefixIndex)
+		// 回退到原前缀
+		if err2 := initIPv6WithPrefix(oldPrefix); err2 != nil {
+			log.Printf("❌ 严重错误：无法回退到原前缀: %v", err2)
+			return fmt.Errorf("切换失败且无法回退: %v", err)
+		}
+		return fmt.Errorf("切换失败: %v", err)
+	}
+
+	// 更新配置
+	config.ActivePrefixIndex = index
+	if err := saveConfig(); err != nil {
+		log.Printf("⚠️  切换成功但保存配置失败: %v", err)
+	}
+
+	// 重新填充IP池
+	go fillInitialPool()
+
+	log.Printf("✅ 成功切换到前缀 #%d: %s", index, newPrefix)
+	atomic.StoreInt64(&stats.PoolSize, 0)
+
+	return nil
+}
+
+// 自动切换到下一个前缀
+func autoSwitchToNextPrefix() error {
+	if len(config.IPv6Prefixes) <= 1 {
+		return errors.New("只有一个前缀，无法切换")
+	}
+
+	nextIndex := (config.ActivePrefixIndex + 1) % len(config.IPv6Prefixes)
+	return switchToPrefix(nextIndex)
+}
+
+// 添加新前缀
+func addPrefix(prefix string) error {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	// 验证前缀格式
+	if _, _, err := net.ParseCIDR(prefix); err != nil {
+		return fmt.Errorf("无效的IPv6前缀格式: %v", err)
+	}
+
+	// 检查是否已存在
+	for _, p := range config.IPv6Prefixes {
+		if p == prefix {
+			return fmt.Errorf("前缀已存在: %s", prefix)
+		}
+	}
+
+	config.IPv6Prefixes = append(config.IPv6Prefixes, prefix)
+	if err := saveConfig(); err != nil {
+		// 回滚
+		config.IPv6Prefixes = config.IPv6Prefixes[:len(config.IPv6Prefixes)-1]
+		return fmt.Errorf("保存配置失败: %v", err)
+	}
+
+	log.Printf("✅ 添加新前缀: %s", prefix)
+	return nil
+}
+
+// 删除前缀
+func deletePrefix(index int) error {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	if len(config.IPv6Prefixes) <= 1 {
+		return errors.New("至少需要保留一个前缀")
+	}
+
+	if index < 0 || index >= len(config.IPv6Prefixes) {
+		return fmt.Errorf("无效的前缀索引: %d", index)
+	}
+
+	if index == config.ActivePrefixIndex {
+		return errors.New("不能删除当前使用的前缀，请先切换到其他前缀")
+	}
+
+	oldPrefix := config.IPv6Prefixes[index]
+	config.IPv6Prefixes = append(config.IPv6Prefixes[:index], config.IPv6Prefixes[index+1:]...)
+
+	// 调整活动前缀索引
+	if config.ActivePrefixIndex > index {
+		config.ActivePrefixIndex--
+	}
+
+	if err := saveConfig(); err != nil {
+		return fmt.Errorf("保存配置失败: %v", err)
+	}
+
+	log.Printf("✅ 删除前缀: %s", oldPrefix)
+	return nil
+}
+
+// 获取前缀状态
+func getPrefixStatus() PrefixStatus {
+	poolLock.RLock()
+	defer poolLock.RUnlock()
+
+	prefixes := make([]PrefixInfo, len(config.IPv6Prefixes))
+	for i, prefix := range config.IPv6Prefixes {
+		info := PrefixInfo{
+			Prefix:   prefix,
+			Index:    i,
+			IsActive: i == config.ActivePrefixIndex,
+			IsValid:  true,
+		}
+
+		// 验证前缀
+		if _, _, err := net.ParseCIDR(prefix); err != nil {
+			info.IsValid = false
+			info.ErrorMsg = err.Error()
+		}
+
+		prefixes[i] = info
+	}
+
+	nextSwitchTimeLock.RLock()
+	nextSwitch := nextSwitchTime
+	nextSwitchTimeLock.RUnlock()
+
+	var nextSwitchStr string
+	var secondsUntil int64
+	if atomic.LoadInt32(&autoSwitchEnabled) == 1 {
+		nextSwitchStr = nextSwitch.Format("2006-01-02 15:04:05")
+		secondsUntil = int64(time.Until(nextSwitch).Seconds())
+		if secondsUntil < 0 {
+			secondsUntil = 0
+		}
+	}
+
+	return PrefixStatus{
+		Prefixes:            prefixes,
+		ActiveIndex:         config.ActivePrefixIndex,
+		AutoSwitchEnabled:   atomic.LoadInt32(&autoSwitchEnabled) == 1,
+		SwitchIntervalHours: config.SwitchIntervalHours,
+		NextSwitchTime:      nextSwitchStr,
+		SecondsUntilSwitch:  secondsUntil,
+	}
+}
+
+// 设置自动切换
+func setAutoSwitch(enabled bool, intervalHours int) error {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	config.AutoSwitchPrefix = enabled
+	if intervalHours > 0 {
+		config.SwitchIntervalHours = intervalHours
+	}
+
+	if enabled {
+		atomic.StoreInt32(&autoSwitchEnabled, 1)
+		nextSwitchTimeLock.Lock()
+		nextSwitchTime = time.Now().Add(time.Duration(config.SwitchIntervalHours) * time.Hour)
+		nextSwitchTimeLock.Unlock()
+		log.Printf("✅ 启用自动切换前缀，间隔: %d小时", config.SwitchIntervalHours)
+	} else {
+		atomic.StoreInt32(&autoSwitchEnabled, 0)
+		log.Printf("✅ 关闭自动切换前缀")
+	}
+
+	return saveConfig()
+}
+
+// 自动切换监控goroutine
+func startAutoSwitchMonitor() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if atomic.LoadInt32(&autoSwitchEnabled) != 1 {
+				continue
+			}
+
+			nextSwitchTimeLock.RLock()
+			shouldSwitch := time.Now().After(nextSwitchTime)
+			nextSwitchTimeLock.RUnlock()
+
+			if shouldSwitch {
+				log.Printf("⏰ 触发自动切换前缀")
+				if err := autoSwitchToNextPrefix(); err != nil {
+					log.Printf("❌ 自动切换失败: %v", err)
+				} else {
+					// 设置下次切换时间
+					nextSwitchTimeLock.Lock()
+					nextSwitchTime = time.Now().Add(time.Duration(config.SwitchIntervalHours) * time.Hour)
+					nextSwitchTimeLock.Unlock()
+				}
+			}
+		}
+	}()
+}
+
+// ===== IPv6初始化（支持指定前缀） =====
+
+func initIPv6WithPrefix(prefix string) error {
+	var err error
+	
+	// 解析前缀
+	prefixIP, prefixNet, err = net.ParseCIDR(prefix)
+	if err != nil {
+		return fmt.Errorf("无效的IPv6前缀 %s: %v", prefix, err)
+	}
+
+	if prefixIP.To4() != nil {
+		return fmt.Errorf("不是IPv6地址: %s", prefix)
+	}
+
+	prefixIP = prefixIP.To16()
+
+	// 获取网络接口
+	iface, err = netlink.LinkByName(config.Interface)
+	if err != nil {
+		return fmt.Errorf("网络接口 %s 不存在: %v", config.Interface, err)
+	}
+
+	ones, _ := prefixNet.Mask.Size()
+	if ones > 64 {
+		return fmt.Errorf("前缀长度必须 ≤64 (当前: /%d)", ones)
+	}
+
+	log.Printf("✅ IPv6前缀初始化成功: %s on %s", prefix, config.Interface)
+	return nil
+}
+
+func initIPv6() error {
+	activePrefix := config.IPv6Prefixes[config.ActivePrefixIndex]
+	log.Printf("📡 使用IPv6前缀 #%d: %s", config.ActivePrefixIndex, activePrefix)
+	return initIPv6WithPrefix(activePrefix)
+}
+
+func generateIPv6() (net.IP, error) {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	if len(ipv6Pool) == 0 {
+		return nil, errors.New("IP池为空")
+	}
+
+	rngLock.Lock()
+	idx := rng.Intn(len(ipv6Pool))
+	rngLock.Unlock()
+
+	ip := ipv6Pool[idx]
+	ipv6Pool = append(ipv6Pool[:idx], ipv6Pool[idx+1:]...)
+	delete(ipv6PoolIndex, ip.String())
+	atomic.AddInt64(&stats.PoolSize, -1)
+
+	return ip, nil
+}
+
+func addIPToPool(ip net.IP) bool {
+	poolLock.Lock()
+	defer poolLock.Unlock()
+
+	if len(ipv6Pool) >= config.TargetPool {
+		return false
+	}
+
+	key := ip.String()
+	if _, exists := ipv6PoolIndex[key]; exists {
+		return false
+	}
+
+	ipv6Pool = append(ipv6Pool, ip)
+	ipv6PoolIndex[key] = len(ipv6Pool) - 1
+	atomic.AddInt64(&stats.PoolSize, 1)
+	return true
+}
+
+func createRandomIPv6() net.IP {
 	ip := make(net.IP, 16)
 	copy(ip, prefixIP)
-	if _, err := rand.Read(ip[8:]); err != nil {
-		binary.BigEndian.PutUint64(ip[8:], mrand.Uint64())
+
+	ones, _ := prefixNet.Mask.Size()
+	randomBytes := ones / 8
+
+	if ones%8 != 0 {
+		randomBytes++
 	}
+
+	var randData [8]byte
+	rand.Read(randData[:])
+
+	for i := randomBytes; i < 16; i++ {
+		ip[i] = randData[i-randomBytes]
+	}
+
+	if ones%8 != 0 {
+		remainingBits := 8 - (ones % 8)
+		mask := byte((1 << remainingBits) - 1)
+		ip[randomBytes] = (ip[randomBytes] & ^mask) | (randData[0] & mask)
+	}
+
 	return ip
 }
 
-func delIPv6(ip net.IP) {
-	addr, _ := netlink.ParseAddr(ip.String() + "/128")
+func addIPv6ToInterface(ip net.IP) error {
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(128, 128),
+		},
+	}
+
+	if err := netlink.AddrAdd(iface, addr); err != nil {
+		if !strings.Contains(err.Error(), "file exists") {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func deleteIPv6FromInterface(ip net.IP) {
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(128, 128),
+		},
+	}
 	netlink.AddrDel(iface, addr)
 }
 
-func addIPv6(ip net.IP) error {
-	addr, _ := netlink.ParseAddr(ip.String() + "/128")
-	return netlink.AddrAdd(iface, addr)
+func fillInitialPool() {
+	log.Printf("🔄 开始填充初始IP池 (%d个)...", config.InitialPool)
+	start := time.Now()
+
+	wg := sync.WaitGroup{}
+	sem := make(chan struct{}, 50)
+
+	successCount := int64(0)
+	for i := 0; i < config.InitialPool; i++ {
+		if int(atomic.LoadInt64(&stats.PoolSize)) >= config.InitialPool {
+			break
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			ip := createRandomIPv6()
+			if err := addIPv6ToInterface(ip); err == nil {
+				if addIPToPool(ip) {
+					atomic.AddInt64(&successCount, 1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+	log.Printf("✅ IP池填充完成: %d个, 耗时: %v", successCount, elapsed)
+}
+
+func startBackgroundIPManager() {
+	if !atomic.CompareAndSwapInt32(&backgroundRunning, 0, 1) {
+		return
+	}
+
+	discardQueue = make(chan net.IP, 10000)
+
+	go func() {
+		for ip := range discardQueue {
+			deleteIPv6FromInterface(ip)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			currentSize := int(atomic.LoadInt64(&stats.PoolSize))
+			if currentSize >= config.TargetPool {
+				continue
+			}
+
+			batchSize := 10
+			if config.TargetPool-currentSize < batchSize {
+				batchSize = config.TargetPool - currentSize
+			}
+
+			for i := 0; i < batchSize; i++ {
+				go func() {
+					ip := createRandomIPv6()
+					if err := addIPv6ToInterface(ip); err == nil {
+						if addIPToPool(ip) {
+							atomic.AddInt64(&backgroundAdded, 1)
+						}
+					}
+				}()
+			}
+		}
+	}()
+}
+
+// ===== SOCKS5代理核心 =====
+
+func handleClient(clientConn net.Conn, serverIndex int, portCfg *PortConfig) {
+	defer clientConn.Close()
+	startTime := time.Now()
+
+	atomic.AddInt64(&stats.TotalConns, 1)
+	atomic.AddInt64(&stats.ActiveConns, 1)
+	defer atomic.AddInt64(&stats.ActiveConns, -1)
+
+	clientIP := clientConn.RemoteAddr().String()
+
+	var authUser, authPass string
+	if portCfg != nil {
+		authUser = portCfg.Username
+		authPass = portCfg.Password
+	} else {
+		authUser = config.Username
+		authPass = config.Password
+	}
+
+	buf := make([]byte, 256)
+	n, err := clientConn.Read(buf)
+	if err != nil || n < 2 || buf[0] != 5 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "无效请求", "", "协议错误", time.Since(startTime))
+		return
+	}
+
+	clientConn.Write([]byte{5, 2})
+
+	n, err = clientConn.Read(buf)
+	if err != nil || n < 2 || buf[0] != 1 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "认证失败", "", "无效认证", time.Since(startTime))
+		return
+	}
+
+	userLen := int(buf[1])
+	if n < 2+userLen+1 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "认证失败", "", "数据不完整", time.Since(startTime))
+		return
+	}
+
+	username := string(buf[2 : 2+userLen])
+	passLen := int(buf[2+userLen])
+	if n < 2+userLen+1+passLen {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "认证失败", "", "数据不完整", time.Since(startTime))
+		return
+	}
+
+	password := string(buf[2+userLen+1 : 2+userLen+1+passLen])
+
+	if subtle.ConstantTimeCompare([]byte(username), []byte(authUser)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(password), []byte(authPass)) != 1 {
+		clientConn.Write([]byte{1, 1})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "认证失败", "", "用户名或密码错误", time.Since(startTime))
+		return
+	}
+
+	clientConn.Write([]byte{1, 0})
+
+	n, err = clientConn.Read(buf)
+	if err != nil || n < 4 || buf[0] != 5 || buf[1] != 1 {
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, "连接失败", "", "无效请求", time.Since(startTime))
+		return
+	}
+
+	var targetAddr string
+	switch buf[3] {
+	case 1:
+		if n < 10 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			addFailLog(clientIP, "连接失败", "", "IPv4地址不完整", time.Since(startTime))
+			return
+		}
+		ip := net.IP(buf[4:8])
+		port := binary.BigEndian.Uint16(buf[8:10])
+		targetAddr = fmt.Sprintf("%s:%d", ip, port)
+	case 3:
+		if n < 5 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			addFailLog(clientIP, "连接失败", "", "域名数据不完整", time.Since(startTime))
+			return
+		}
+		domainLen := int(buf[4])
+		if n < 5+domainLen+2 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			addFailLog(clientIP, "连接失败", "", "域名数据不完整", time.Since(startTime))
+			return
+		}
+		domain := string(buf[5 : 5+domainLen])
+		port := binary.BigEndian.Uint16(buf[5+domainLen : 5+domainLen+2])
+		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+	case 4:
+		if n < 22 {
+			atomic.AddInt64(&stats.FailedConns, 1)
+			addFailLog(clientIP, "连接失败", "", "IPv6地址不完整", time.Since(startTime))
+			return
+		}
+		ip := net.IP(buf[4:20])
+		port := binary.BigEndian.Uint16(buf[20:22])
+		targetAddr = fmt.Sprintf("[%s]:%d", ip, port)
+	default:
+		clientConn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, targetAddr, "", "不支持的地址类型", time.Since(startTime))
+		return
+	}
+
+	srcIP, err := generateIPv6()
+	if err != nil {
+		clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, targetAddr, "", "IP池耗尽", time.Since(startTime))
+		return
+	}
+
+	srcAddr := &net.TCPAddr{IP: srcIP, Port: 0}
+	dialer := &net.Dialer{
+		LocalAddr: srcAddr,
+		Timeout:   10 * time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	connID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), clientIP)
+	addActiveConn(connID, clientIP, targetAddr, srcIP.String())
+
+	remoteConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	if err != nil {
+		clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
+		atomic.AddInt64(&stats.FailedConns, 1)
+		addFailLog(clientIP, targetAddr, srcIP.String(), fmt.Sprintf("连接失败: %v", err), time.Since(startTime))
+		
+		discardQueue <- srcIP
+		removeActiveConn(connID)
+		return
+	}
+	defer remoteConn.Close()
+
+	clientConn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
+
+	atomic.AddInt64(&stats.SuccessConns, 1)
+	addConnLog(clientIP, targetAddr, srcIP.String(), "成功", time.Since(startTime))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var clientToRemote, remoteToClient int64
+
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(remoteConn, clientConn)
+		atomic.AddInt64(&clientToRemote, n)
+		remoteConn.(*net.TCPConn).CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+		n, _ := io.Copy(clientConn, remoteConn)
+		atomic.AddInt64(&remoteToClient, n)
+		clientConn.(*net.TCPConn).CloseWrite()
+	}()
+
+	wg.Wait()
+
+	atomic.AddInt64(&stats.TotalBytesSent, clientToRemote)
+	atomic.AddInt64(&stats.TotalBytesRecv, remoteToClient)
+
+	duration := time.Since(startTime)
+	atomic.AddInt64(&stats.TotalDuration, int64(duration))
+
+	discardQueue <- srcIP
+	removeActiveConn(connID)
 }
 
 func addConnLog(clientIP, target, ipv6, status string, duration time.Duration) {
-	connLog := &ConnLog{
+	connLogsLock.Lock()
+	defer connLogsLock.Unlock()
+
+	log := &ConnLog{
 		Time:     time.Now().Format("15:04:05"),
 		ClientIP: clientIP,
 		Target:   target,
 		IPv6:     ipv6,
 		Status:   status,
-		Duration: fmt.Sprintf("%.2fs", duration.Seconds()),
+		Duration: duration.Round(time.Millisecond).String(),
 	}
-	
-	connLogsLock.Lock()
-	if len(connLogs) >= maxLogs {
-		connLogs = connLogs[1:]
-	}
-	connLogs = append(connLogs, connLog)
-	connLogsLock.Unlock()
-	
-	if !strings.Contains(status, "✅") {
-		failLogsLock.Lock()
-		if len(failLogs) >= maxLogs {
-			failLogs = failLogs[1:]
-		}
-		failLogs = append(failLogs, connLog)
-		failLogsLock.Unlock()
+
+	connLogs = append([]*ConnLog{log}, connLogs...)
+	if len(connLogs) > maxLogs {
+		connLogs = connLogs[:maxLogs]
 	}
 }
 
-func populateIPPool(numToAdd int) ([]net.IP, int) {
-	newIPs := make([]net.IP, 0, numToAdd)
-	success := 0
-	
-	for i := 0; i < numToAdd; i++ {
-		ip := generateRandomIP()
-		if addIPv6(ip) == nil {
-			newIPs = append(newIPs, ip)
-			success++
-		}
-		if term.IsTerminal(int(syscall.Stdin)) && ((i+1)%100 == 0 || (i+1) == numToAdd) {
-			fmt.Printf("\r   进度: %d/%d ", i+1, numToAdd)
-		}
-	}
-	if term.IsTerminal(int(syscall.Stdin)) && numToAdd > 0 {
-		fmt.Println()
-	}
-	return newIPs, success
-}
+func addFailLog(clientIP, target, ipv6, status string, duration time.Duration) {
+	failLogsLock.Lock()
+	defer failLogsLock.Unlock()
 
-func initIPv6Pool() error {
-	log.Printf("初始化: %d 个IP", config.InitialPool)
-	if config.InitialPool == 0 {
-		return nil
+	log := &ConnLog{
+		Time:     time.Now().Format("15:04:05"),
+		ClientIP: clientIP,
+		Target:   target,
+		IPv6:     ipv6,
+		Status:   status,
+		Duration: duration.Round(time.Millisecond).String(),
 	}
 
-	newIPs, success := populateIPPool(config.InitialPool)
-	ipv6Pool = newIPs
-	ipv6PoolIndex = make(map[string]int, success)
-	for i, ip := range newIPs {
-		ipv6PoolIndex[ip.String()] = i
-	}
-	atomic.StoreInt64(&stats.PoolSize, int64(success))
-
-	if success == 0 {
-		return fmt.Errorf("初始化失败")
-	}
-	return nil
-}
-
-func backgroundAddTask(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if atomic.LoadInt32(&backgroundRunning) == 0 {
-				continue
-			}
-			
-			currentSize := int(atomic.LoadInt64(&stats.PoolSize))
-			if currentSize >= config.TargetPool {
-				atomic.StoreInt32(&backgroundRunning, 0)
-				continue
-			}
-			
-			for i := 0; i < 50 && currentSize < config.TargetPool; i++ {
-				ip := generateRandomIP()
-				if addIPv6(ip) == nil {
-					poolLock.Lock()
-					ipv6Pool = append(ipv6Pool, ip)
-					ipv6PoolIndex[ip.String()] = len(ipv6Pool) - 1
-					poolLock.Unlock()
-					atomic.AddInt64(&stats.PoolSize, 1)
-					atomic.AddInt64(&backgroundAdded, 1)
-					currentSize++
-				}
-			}
-		}
+	failLogs = append([]*ConnLog{log}, failLogs...)
+	if len(failLogs) > maxLogs {
+		failLogs = failLogs[:maxLogs]
 	}
 }
 
-func discardWorker(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	batch := make([]net.IP, 0, 1000)
-	
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ip := <-discardQueue:
-			batch = append(batch, ip)
-			if len(batch) >= 100 {
-				processBatch(batch)
-				batch = batch[:0]
-			}
-		case <-ticker.C:
-			if len(batch) > 0 {
-				processBatch(batch)
-				batch = batch[:0]
-			}
-		}
-	}
-}
+func addActiveConn(id, clientIP, target, ipv6 string) {
+	activeConnectionsLock.Lock()
+	defer activeConnectionsLock.Unlock()
 
-func processBatch(ips []net.IP) {
-	if len(ips) == 0 {
-		return
-	}
-	
-	for _, ip := range ips {
-		delIPv6(ip)
-	}
-	
-	poolLock.Lock()
-	for _, ip := range ips {
-		ipString := ip.String()
-		if index, ok := ipv6PoolIndex[ipString]; ok {
-			lastIP := ipv6Pool[len(ipv6Pool)-1]
-			ipv6Pool[index] = lastIP
-			ipv6PoolIndex[lastIP.String()] = index
-			ipv6Pool = ipv6Pool[:len(ipv6Pool)-1]
-			delete(ipv6PoolIndex, ipString)
-		}
-	}
-	poolLock.Unlock()
-	
-	newSize := atomic.AddInt64(&stats.PoolSize, -int64(len(ips)))
-	if int(newSize) < config.TargetPool {
-		atomic.StoreInt32(&backgroundRunning, 1)
-	}
-}
-
-func getRandomIP() net.IP {
-	poolLock.RLock()
-	if len(ipv6Pool) == 0 {
-		poolLock.RUnlock()
-		return nil
-	}
-	rngLock.Lock()
-	index := rng.Intn(len(ipv6Pool))
-	rngLock.Unlock()
-	ip := ipv6Pool[index]
-	poolLock.RUnlock()
-	return ip
-}
-
-func checkAuth(user, pass string) bool {
-	return user == config.Username && pass == config.Password
-}
-
-func transfer(dst net.Conn, src net.Conn, wg *sync.WaitGroup) {
-	defer wg.Done()
-	deadline := time.Now().Add(120 * time.Second)
-	src.SetReadDeadline(deadline)
-	dst.SetWriteDeadline(deadline)
-	buf := make([]byte, 64*1024)
-	
-	// 自定义复制以统计流量
-	var totalBytes int64
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			totalBytes += int64(nr)
-			nw, ew := dst.Write(buf[0:nr])
-			if nw < 0 || nr < nw {
-				nw = 0
-				if ew == nil {
-					ew = errors.New("invalid write result")
-				}
-			}
-			if ew != nil {
-				break
-			}
-			if nr != nw {
-				break
-			}
-		}
-		if er != nil {
-			break
-		}
-	}
-	
-	// 统计流量 - 根据src和dst的类型判断方向
-	// 简化处理：统计所有传输的字节
-	atomic.AddInt64(&stats.TotalBytesSent, totalBytes)
-}
-
-func handleSOCKS5(conn net.Conn) {
-	defer conn.Close()
-	defer atomic.AddInt64(&stats.ActiveConns, -1)
-	buf := make([]byte, 512)
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return
-	}
-	nmethods := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:nmethods]); err != nil {
-		return
-	}
-	conn.Write([]byte{5, 2})
-	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
-		return
-	}
-	ulen := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:ulen]); err != nil {
-		return
-	}
-	username := string(buf[:ulen])
-	if _, err := io.ReadFull(conn, buf[:1]); err != nil {
-		return
-	}
-	plen := int(buf[0])
-	if _, err := io.ReadFull(conn, buf[:plen]); err != nil {
-		return
-	}
-	password := string(buf[:plen])
-	if !checkAuth(username, password) {
-		conn.Write([]byte{1, 1})
-		atomic.AddInt64(&stats.FailedConns, 1)
-		return
-	}
-	conn.Write([]byte{1, 0})
-	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
-		return
-	}
-	var host string
-	var port uint16
-	atyp := buf[3]
-	switch atyp {
-	case 1:
-		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
-			return
-		}
-		host = fmt.Sprintf("%d.%d.%d.%d", buf[0], buf[1], buf[2], buf[3])
-		port = binary.BigEndian.Uint16(buf[4:6])
-	case 3:
-		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
-			return
-		}
-		dlen := int(buf[0])
-		if _, err := io.ReadFull(conn, buf[:dlen+2]); err != nil {
-			return
-		}
-		host = string(buf[:dlen])
-		port = binary.BigEndian.Uint16(buf[dlen : dlen+2])
-	default:
-		conn.Write([]byte{5, 8, 0, 1, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	connectAndProxy(conn, host, port, true)
-}
-
-func handleHTTP(conn net.Conn, firstByte byte) {
-	defer conn.Close()
-	defer atomic.AddInt64(&stats.ActiveConns, -1)
-	buf := make([]byte, 4096)
-	buf[0] = firstByte
-	n, err := conn.Read(buf[1:])
-	if err != nil {
-		return
-	}
-	request := string(buf[:n+1])
-	lines := strings.Split(request, "\r\n")
-	if len(lines) < 1 {
-		return
-	}
-	parts := strings.Fields(lines[0])
-	if len(parts) < 3 {
-		return
-	}
-	method := parts[0]
-	target := parts[1]
-	authorized := false
-	for _, line := range lines {
-		if strings.HasPrefix(strings.ToLower(line), "proxy-authorization: basic ") {
-			encoded := strings.TrimSpace(line[27:])
-			if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
-				credentials := strings.SplitN(string(decoded), ":", 2)
-				if len(credentials) == 2 && checkAuth(credentials[0], credentials[1]) {
-					authorized = true
-					break
-				}
-			}
-		}
-	}
-	if !authorized {
-		conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Proxy\"\r\n\r\n"))
-		atomic.AddInt64(&stats.FailedConns, 1)
-		return
-	}
-	if method != "CONNECT" {
-		conn.Write([]byte("HTTP/1.1 405 Method Not Allowed\r\n\r\n"))
-		return
-	}
-	hostPort := strings.Split(target, ":")
-	if len(hostPort) != 2 {
-		return
-	}
-	host := hostPort[0]
-	var port uint16
-	fmt.Sscanf(hostPort[1], "%d", &port)
-	connectAndProxy(conn, host, port, false)
-}
-
-func connectAndProxy(clientConn net.Conn, host string, port uint16, isSocks bool) {
-	startTime := time.Now()
-	clientIP := clientConn.RemoteAddr().String()
-	target := fmt.Sprintf("%s:%d", host, port)
-
-	ip := getRandomIP()
-	if ip == nil {
-		addConnLog(clientIP, target, "N/A", "❌ 无IP", time.Since(startTime))
-		if isSocks {
-			clientConn.Write([]byte{5, 1, 0, 1, 0, 0, 0, 0, 0, 0})
-		} else {
-			clientConn.Write([]byte("HTTP/1.1 503 Unavailable\r\n\r\n"))
-		}
-		atomic.AddInt64(&stats.FailedConns, 1)
-		return
-	}
-
-	ipv6String := ip.String()
-	
-	connID := fmt.Sprintf("%s-%d", clientIP, time.Now().UnixNano())
-	activeConn := &ActiveConn{
-		ID:        connID,
+	activeConnections[id] = &ActiveConn{
+		ID:        id,
 		ClientIP:  clientIP,
 		Target:    target,
-		IPv6:      ipv6String,
-		StartTime: startTime,
+		IPv6:      ipv6,
+		StartTime: time.Now(),
+		Duration:  "0s",
 	}
+}
+
+func removeActiveConn(id string) {
 	activeConnectionsLock.Lock()
-	activeConnections[connID] = activeConn
-	activeConnectionsLock.Unlock()
-	
-	defer func() {
-		activeConnectionsLock.Lock()
-		delete(activeConnections, connID)
-		activeConnectionsLock.Unlock()
-	}()
-	
-	localAddr := &net.TCPAddr{IP: ip}
-	dialer := &net.Dialer{
-		LocalAddr: localAddr,
-		Timeout:   15 * time.Second,
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	remoteConn, err := dialer.DialContext(ctx, "tcp", target)
-	if err != nil {
-		var status string
-		shouldDiscard := false
-		
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = "⏱️ 总超时"
-			atomic.AddInt64(&stats.TimeoutConns, 1)
-			shouldDiscard = true
-		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			status = "⏱️ 连接超时"
-			atomic.AddInt64(&stats.TimeoutConns, 1)
-		} else {
-			errMsg := err.Error()
-			if len(errMsg) > 30 {
-				errMsg = errMsg[:30]
-			}
-			status = fmt.Sprintf("❌ %s", errMsg)
-			shouldDiscard = strings.Contains(err.Error(), "refused") ||
-				strings.Contains(err.Error(), "unreachable")
-		}
-		
-		addConnLog(clientIP, target, ipv6String, status, time.Since(startTime))
-		if isSocks {
-			clientConn.Write([]byte{5, 4, 0, 1, 0, 0, 0, 0, 0, 0})
-		} else {
-			clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		}
-		atomic.AddInt64(&stats.FailedConns, 1)
-		
-		if config.AutoClean && shouldDiscard {
-			select {
-			case discardQueue <- ip:
-			default:
-			}
-		}
-		return
-	}
-	defer remoteConn.Close()
-
-	atomic.AddInt64(&stats.SuccessConns, 1)
-	duration := time.Since(startTime)
-	atomic.AddInt64(&stats.TotalDuration, duration.Nanoseconds())
-	addConnLog(clientIP, target, ipv6String, "✅ 成功", duration)
-
-	if isSocks {
-		clientConn.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
-	} else {
-		clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go transfer(remoteConn, clientConn, &wg)
-	go transfer(clientConn, remoteConn, &wg)
-	wg.Wait()
+	defer activeConnectionsLock.Unlock()
+	delete(activeConnections, id)
 }
 
-func handleConnection(conn net.Conn) {
-	atomic.AddInt64(&stats.ActiveConns, 1)
-	atomic.AddInt64(&stats.TotalConns, 1)
-	firstByte := make([]byte, 1)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	n, err := conn.Read(firstByte)
-	if err != nil {
-		conn.Close()
-		atomic.AddInt64(&stats.ActiveConns, -1)
-		return
-	}
-	conn.SetReadDeadline(time.Time{})
+func updateActiveConnDurations() {
+	activeConnectionsLock.Lock()
+	defer activeConnectionsLock.Unlock()
 
-	if n == 1 && firstByte[0] == 0x05 {
-		handleSOCKS5(conn)
-	} else if n == 1 {
-		handleHTTP(conn, firstByte[0])
-	} else {
-		conn.Close()
-		atomic.AddInt64(&stats.ActiveConns, -1)
+	for _, conn := range activeConnections {
+		conn.Duration = time.Since(conn.StartTime).Round(time.Second).String()
 	}
 }
 
-func statsCPURoutine(ctx context.Context) {
-	p, err := process.NewProcess(int32(os.Getpid()))
-	if err != nil {
-		return
-	}
-	
-	p.CPUPercent()
-	time.Sleep(10 * time.Second)
+// ===== HTTP API =====
 
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			processCPU, err := p.CPUPercent()
-			if err == nil {
-				atomic.StoreInt64(&stats.ProcessCPUPercent, int64(processCPU*100))
-			}
-			
-			systemCPU, err := cpu.Percent(0, false)
-			if err == nil && len(systemCPU) > 0 {
-				atomic.StoreInt64(&stats.SystemCPUPercent, int64(systemCPU[0]*100))
-			}
-		}
-	}
-}
-
-func statsHistoryRoutine(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			uptime := time.Since(stats.StartTime)
-			total := atomic.LoadInt64(&stats.TotalConns)
-			qps := 0.0
-			if uptime.Seconds() > 0 {
-				qps = float64(total) / uptime.Seconds()
-			}
-
-			successConns := atomic.LoadInt64(&stats.SuccessConns)
-			successRate := 0.0
-			if total > 0 {
-				successRate = float64(successConns) * 100 / float64(total)
-			}
-
-			snapshot := &StatsSnapshot{
-				Timestamp:   time.Now().Format("15:04:05"),
-				QPS:         qps,
-				SuccessRate: successRate,
-				ProcessCPU:  float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100.0,
-				SystemCPU:   float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100.0,
-				ActiveConns: atomic.LoadInt64(&stats.ActiveConns),
-			}
-
-			statsHistoryLock.Lock()
-			if len(statsHistory) >= maxHistory {
-				statsHistory = statsHistory[1:]
-			}
-			statsHistory = append(statsHistory, snapshot)
-			statsHistoryLock.Unlock()
-		}
-	}
-}
-
-func statsRoutine(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			log.Printf("📊 活跃:%d 总:%d 成功:%d 失败:%d 池:%d",
-				atomic.LoadInt64(&stats.ActiveConns),
-				atomic.LoadInt64(&stats.TotalConns),
-				atomic.LoadInt64(&stats.SuccessConns),
-				atomic.LoadInt64(&stats.FailedConns),
-				atomic.LoadInt64(&stats.PoolSize))
-		}
-	}
-}
-
-func logClearRoutine(ctx context.Context) {
-	ticker := time.NewTicker(12 * time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			connLogsLock.Lock()
-			connLogs = []*ConnLog{}
-			connLogsLock.Unlock()
-			failLogsLock.Lock()
-			failLogs = []*ConnLog{}
-			failLogsLock.Unlock()
-		}
-	}
-}
-
-func autoRotateRoutine(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if atomic.LoadInt32(&autoRotateEnabled) == 0 {
-				continue
-			}
-
-			nextRotateTimeLock.RLock()
-			shouldRotate := time.Now().After(nextRotateTime)
-			nextRotateTimeLock.RUnlock()
-
-			if shouldRotate {
-				log.Printf("自动轮换...")
-				rotateIPPool(ctx)
-				
-				hours := atomic.LoadInt64(&autoRotateInterval)
-				nextRotateTimeLock.Lock()
-				nextRotateTime = time.Now().Add(time.Duration(hours) * time.Hour)
-				nextRotateTimeLock.Unlock()
-			}
-		}
-	}
-}
-
-// 新增：流量速率计算routine
-func trafficRateRoutine(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	
-	var lastRecv, lastSent int64
-	var lastTime = time.Now()
-	
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-			elapsed := now.Sub(lastTime).Seconds()
-			if elapsed <= 0 {
-				continue
-			}
-			
-			currentRecv := atomic.LoadInt64(&stats.TotalBytesRecv)
-			currentSent := atomic.LoadInt64(&stats.TotalBytesSent)
-			
-			recvRate := int64(float64(currentRecv-lastRecv) / elapsed)
-			sendRate := int64(float64(currentSent-lastSent) / elapsed)
-			
-			atomic.StoreInt64(&stats.CurrentRecvRate, recvRate)
-			atomic.StoreInt64(&stats.CurrentSendRate, sendRate)
-			
-			lastRecv = currentRecv
-			lastSent = currentSent
-			lastTime = now
-		}
-	}
-}
-
-func rotateIPPool(ctx context.Context) {
-	atomic.StoreInt32(&backgroundRunning, 0)
-	time.Sleep(100 * time.Millisecond)
-
-	newIPs, success := populateIPPool(config.InitialPool)
-	if success == 0 {
-		if config.TargetPool > int(atomic.LoadInt64(&stats.PoolSize)) {
-			atomic.StoreInt32(&backgroundRunning, 1)
-		}
-		return
-	}
-	
-	newIPMap := make(map[string]int, success)
-	for i, ip := range newIPs {
-		newIPMap[ip.String()] = i
-	}
-	
-	poolLock.Lock()
-	oldIPs := ipv6Pool
-	ipv6Pool = newIPs
-	ipv6PoolIndex = newIPMap
-	poolLock.Unlock()
-	
-	atomic.StoreInt64(&stats.PoolSize, int64(success))
-	log.Printf("✅ 轮换: %d IP", success)
-
-	go cleanupOldIPs(oldIPs)
-	
-	if config.TargetPool > success {
-		atomic.StoreInt32(&backgroundRunning, 1)
-	}
-}
-
-func cleanupOldIPs(oldIPs []net.IP) {
-	time.Sleep(30 * time.Minute)
-	for _, ip := range oldIPs {
-		delIPv6(ip)
-	}
-}
-
-func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	uptime := time.Since(stats.StartTime)
-	total := atomic.LoadInt64(&stats.TotalConns)
-	qps := 0.0
+	avgDuration := int64(0)
+	if stats.SuccessConns > 0 {
+		avgDuration = stats.TotalDuration / stats.SuccessConns
+	}
+
+	successRate := float64(0)
+	if stats.TotalConns > 0 {
+		successRate = float64(stats.SuccessConns) / float64(stats.TotalConns) * 100
+	}
+
+	qps := float64(0)
 	if uptime.Seconds() > 0 {
-		qps = float64(total) / uptime.Seconds()
-	}
-	currentPool := atomic.LoadInt64(&stats.PoolSize)
-	targetPool := int64(config.TargetPool)
-	progress := 0.0
-	if targetPool > 0 {
-		progress = float64(currentPool) * 100 / float64(targetPool)
-		if progress > 100 {
-			progress = 100
-		}
+		qps = float64(stats.SuccessConns) / uptime.Seconds()
 	}
 
-	var avgDurationMs float64
-	successConns := atomic.LoadInt64(&stats.SuccessConns)
-	if successConns > 0 {
-		avgDurationMs = float64(atomic.LoadInt64(&stats.TotalDuration)) / float64(successConns) / float64(time.Millisecond)
+	currentPrefix := ""
+	if config.ActivePrefixIndex >= 0 && config.ActivePrefixIndex < len(config.IPv6Prefixes) {
+		currentPrefix = config.IPv6Prefixes[config.ActivePrefixIndex]
 	}
 
-	processCPU := float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100.0
-	systemCPU := float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100.0
-
-	nextRotateTimeLock.RLock()
-	nextRotate := nextRotateTime.Format("2006-01-02 15:04:05")
-	nextRotateTimeLock.RUnlock()
-
-	data := map[string]interface{}{
-		"active":          atomic.LoadInt64(&stats.ActiveConns),
-		"total":           total,
-		"success":         successConns,
-		"failed":          atomic.LoadInt64(&stats.FailedConns),
-		"timeout":         atomic.LoadInt64(&stats.TimeoutConns),
-		"pool":            currentPool,
-		"target":          targetPool,
-		"progress":        progress,
-		"bg_running":      atomic.LoadInt32(&backgroundRunning) == 1,
-		"bg_added":        atomic.LoadInt64(&backgroundAdded),
-		"qps":             qps,
-		"uptime":          fmt.Sprintf("%dd %dh %dm", int(uptime.Hours())/24, int(uptime.Hours())%24, int(uptime.Minutes())%60),
-		"avg_duration":    avgDurationMs,
-		"process_cpu":     processCPU,
-		"system_cpu":      systemCPU,
-		"auto_rotate":     atomic.LoadInt32(&autoRotateEnabled) == 1,
-		"rotate_interval": atomic.LoadInt64(&autoRotateInterval),
-		"next_rotate":     nextRotate,
-		"auto_clean":      config.AutoClean,
-		// 新增：流量统计
-		"total_bytes_recv":  atomic.LoadInt64(&stats.TotalBytesRecv),
-		"total_bytes_sent":  atomic.LoadInt64(&stats.TotalBytesSent),
-		"current_recv_rate": atomic.LoadInt64(&stats.CurrentRecvRate),
-		"current_send_rate": atomic.LoadInt64(&stats.CurrentSendRate),
-		// 当前代理端口
-		"current_port":      config.Port,
-		"current_username":  config.Username,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total_conns":       atomic.LoadInt64(&stats.TotalConns),
+		"active_conns":      atomic.LoadInt64(&stats.ActiveConns),
+		"success_conns":     atomic.LoadInt64(&stats.SuccessConns),
+		"failed_conns":      atomic.LoadInt64(&stats.FailedConns),
+		"timeout_conns":     atomic.LoadInt64(&stats.TimeoutConns),
+		"pool_size":         atomic.LoadInt64(&stats.PoolSize),
+		"target_pool":       config.TargetPool,
+		"uptime":            int64(uptime.Seconds()),
+		"uptime_str":        uptime.Round(time.Second).String(),
+		"avg_duration_ms":   avgDuration / 1e6,
+		"success_rate":      fmt.Sprintf("%.2f%%", successRate),
+		"qps":               fmt.Sprintf("%.2f", qps),
+		"process_cpu":       float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100,
+		"system_cpu":        float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100,
+		"total_recv_mb":     float64(atomic.LoadInt64(&stats.TotalBytesRecv)) / 1024 / 1024,
+		"total_sent_mb":     float64(atomic.LoadInt64(&stats.TotalBytesSent)) / 1024 / 1024,
+		"recv_rate_mbps":    float64(atomic.LoadInt64(&stats.CurrentRecvRate)) * 8 / 1024 / 1024,
+		"send_rate_mbps":    float64(atomic.LoadInt64(&stats.CurrentSendRate)) * 8 / 1024 / 1024,
+		"current_prefix":    currentPrefix,
+		"prefix_index":      config.ActivePrefixIndex,
+		"total_prefixes":    len(config.IPv6Prefixes),
+	})
 }
 
-func handleAPILogs(w http.ResponseWriter, r *http.Request) {
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	connLogsLock.RLock()
-	logs := make([]*ConnLog, len(connLogs))
-	copy(logs, connLogs)
-	connLogsLock.RUnlock()
-
-	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
-		logs[i], logs[j] = logs[j], logs[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	defer connLogsLock.RUnlock()
+	json.NewEncoder(w).Encode(connLogs)
 }
 
-func handleAPIFailLogs(w http.ResponseWriter, r *http.Request) {
+func handleFailLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	failLogsLock.RLock()
-	logs := make([]*ConnLog, len(failLogs))
-	copy(logs, failLogs)
-	failLogsLock.RUnlock()
-
-	for i, j := 0, len(logs)-1; i < j; i, j = i+1, j-1 {
-		logs[i], logs[j] = logs[j], logs[i]
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(logs)
+	defer failLogsLock.RUnlock()
+	json.NewEncoder(w).Encode(failLogs)
 }
 
-func handleAPISearchLogs(w http.ResponseWriter, r *http.Request) {
-	query := strings.ToLower(r.URL.Query().Get("q"))
-	if query == "" {
-		http.Error(w, `{"error":"缺少搜索关键词"}`, http.StatusBadRequest)
-		return
-	}
-
-	connLogsLock.RLock()
-	allLogs := make([]*ConnLog, len(connLogs))
-	copy(allLogs, connLogs)
-	connLogsLock.RUnlock()
-
-	var results []*ConnLog
-	for _, log := range allLogs {
-		if strings.Contains(strings.ToLower(log.ClientIP), query) ||
-			strings.Contains(strings.ToLower(log.Target), query) ||
-			strings.Contains(strings.ToLower(log.IPv6), query) ||
-			strings.Contains(strings.ToLower(log.Status), query) {
-			results = append(results, log)
-		}
-	}
-
-	for i, j := 0, len(results)-1; i < j; i, j = i+1, j-1 {
-		results[i], results[j] = results[j], results[i]
-	}
-
+func handleActiveConns(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
-}
+	updateActiveConnDurations()
 
-func handleAPIActiveConns(w http.ResponseWriter, r *http.Request) {
 	activeConnectionsLock.RLock()
+	defer activeConnectionsLock.RUnlock()
+
 	conns := make([]*ActiveConn, 0, len(activeConnections))
 	for _, conn := range activeConnections {
-		connCopy := *conn
-		connCopy.Duration = fmt.Sprintf("%.1fs", time.Since(conn.StartTime).Seconds())
-		conns = append(conns, &connCopy)
+		conns = append(conns, conn)
 	}
-	activeConnectionsLock.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(conns)
 }
 
-func handleAPIHistory(w http.ResponseWriter, r *http.Request) {
+func handleChart(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	statsHistoryLock.RLock()
-	history := make([]*StatsSnapshot, len(statsHistory))
-	copy(history, statsHistory)
-	statsHistoryLock.RUnlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(history)
+	defer statsHistoryLock.RUnlock()
+	json.NewEncoder(w).Encode(statsHistory)
 }
 
-func handleAPIPoolResize(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Target int `json:"target"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+func handleRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if req.Target < 100 {
-		http.Error(w, `{"error":"目标值至少100"}`, http.StatusBadRequest)
-		return
-	}
+	poolLock.Lock()
+	defer poolLock.Unlock()
 
-	config.TargetPool = req.Target
-	saveConfigToFile()
+	oldSize := len(ipv6Pool)
 	
-	if atomic.LoadInt64(&stats.PoolSize) < int64(config.TargetPool) {
-		atomic.StoreInt32(&backgroundRunning, 1)
+	for _, ip := range ipv6Pool {
+		discardQueue <- ip
 	}
+
+	ipv6Pool = make([]net.IP, 0, config.TargetPool)
+	ipv6PoolIndex = make(map[string]int)
+	atomic.StoreInt64(&stats.PoolSize, 0)
+
+	go fillInitialPool()
+
+	log.Printf("🔄 手动轮换: 丢弃 %d 个IP", oldSize)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("已设置: %d", req.Target)})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"message":      "IP池已轮换",
+		"discarded":    oldSize,
+		"next_rotate":  nextRotateTime.Format("2006-01-02 15:04:05"),
+	})
 }
 
-func handleAPIRotate(ctx context.Context) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-			return
-		}
-		
-		go rotateIPPool(ctx)
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"message": "轮换已开始"})
-	}
-}
-
-func handleAPIUpdateConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var newConfig Config
-	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
-		http.Error(w, `{"error":"无效配置"}`, http.StatusBadRequest)
-		return
-	}
-
-	newConfig.IPv6Prefix = config.IPv6Prefix
-	newConfig.Interface = config.Interface
-
-	config = newConfig
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存失败"}`, http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "配置已更新，需重启生效"})
-}
-
-func handleAPIAutoRotate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Enabled  bool `json:"enabled"`
-		Interval int  `json:"interval"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Interval < 1 {
-		req.Interval = 6
-	}
-
-	config.AutoRotate = req.Enabled
-	config.AutoRotateHours = req.Interval
-	saveConfigToFile()
-
-	if req.Enabled {
-		atomic.StoreInt32(&autoRotateEnabled, 1)
-		atomic.StoreInt64(&autoRotateInterval, int64(req.Interval))
-		nextRotateTimeLock.Lock()
-		nextRotateTime = time.Now().Add(time.Duration(req.Interval) * time.Hour)
-		nextRotateTimeLock.Unlock()
-	} else {
-		atomic.StoreInt32(&autoRotateEnabled, 0)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "设置已更新"})
-}
-
-func handleAPIAutoClean(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+func handleAutoRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req struct {
 		Enabled bool `json:"enabled"`
+		Hours   int  `json:"hours"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	config.AutoClean = req.Enabled
-	saveConfigToFile()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "自清理设置已更新"})
-}
-
-// 新增：修改端口密码
-func handleAPIChangePassword(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
+	config.AutoRotate = req.Enabled
+	if req.Hours > 0 {
+		config.AutoRotateHours = req.Hours
 	}
 
-	var req struct {
-		Port     string `json:"port"`
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Port == "" || req.Username == "" || req.Password == "" {
-		http.Error(w, `{"error":"端口、用户名和密码不能为空"}`, http.StatusBadRequest)
-		return
-	}
-
-	// 查找并更新端口配置
-	updated := false
-	
-	// 检查是否是主端口
-	if req.Port == config.Port {
-		config.Username = req.Username
-		config.Password = req.Password
-		updated = true
+	if config.AutoRotate {
+		atomic.StoreInt32(&autoRotateEnabled, 1)
+		nextRotateTimeLock.Lock()
+		nextRotateTime = time.Now().Add(time.Duration(config.AutoRotateHours) * time.Hour)
+		nextRotateTimeLock.Unlock()
 	} else {
-		// 检查是否在Ports数组中
-		for i := range config.Ports {
-			if config.Ports[i].Port == req.Port {
-				config.Ports[i].Username = req.Username
-				config.Ports[i].Password = req.Password
-				updated = true
-				break
-			}
-		}
+		atomic.StoreInt32(&autoRotateEnabled, 0)
 	}
-	
-	if !updated {
-		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
-		return
-	}
-	
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
-		return
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "密码已更新，重启服务后生效"})
-}
 
-// 新增：获取端口列表
-func handleAPIPortList(w http.ResponseWriter, r *http.Request) {
-	type PortInfo struct {
-		Port      string `json:"port"`
-		Username  string `json:"username"`
-		Enabled   bool   `json:"enabled"`
-		IsPrimary bool   `json:"is_primary"`
-		Created   string `json:"created"`
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存配置失败", http.StatusInternalServerError)
+		return
 	}
-	
-	var ports []PortInfo
-	
-	// 添加主端口
-	ports = append(ports, PortInfo{
-		Port:      config.Port,
-		Username:  config.Username,
-		Enabled:   true,
-		IsPrimary: true,
-		Created:   "主端口",
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"enabled":     config.AutoRotate,
+		"hours":       config.AutoRotateHours,
+		"next_rotate": nextRotateTime.Format("2006-01-02 15:04:05"),
 	})
-	
-	// 添加其他端口
-	for _, p := range config.Ports {
-		ports = append(ports, PortInfo{
-			Port:      p.Port,
-			Username:  p.Username,
-			Enabled:   p.Enabled,
-			IsPrimary: false,
-			Created:   p.Created,
-		})
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ports)
 }
 
-// 新增：添加端口
-func handleAPIAddPort(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+func handlePorts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(config.Ports)
+}
+
+func handleAddPort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1550,52 +1554,42 @@ func handleAPIAddPort(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.Port == "" || req.Username == "" || req.Password == "" {
-		http.Error(w, `{"error":"端口、用户名和密码不能为空"}`, http.StatusBadRequest)
-		return
-	}
-	
-	// 检查端口是否已存在
-	if req.Port == config.Port {
-		http.Error(w, `{"error":"端口已存在（主端口）"}`, http.StatusBadRequest)
-		return
-	}
 	for _, p := range config.Ports {
 		if p.Port == req.Port {
-			http.Error(w, `{"error":"端口已存在"}`, http.StatusBadRequest)
+			http.Error(w, "端口已存在", http.StatusBadRequest)
 			return
 		}
 	}
-	
-	// 添加新端口
-	newPort := PortConfig{
+
+	config.Ports = append(config.Ports, PortConfig{
 		Port:     req.Port,
 		Username: req.Username,
 		Password: req.Password,
-		Enabled:  true,
-		Created:  time.Now().Format("2006-01-02 15:04:05"),
-	}
-	
-	config.Ports = append(config.Ports, newPort)
-	
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+	})
+
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存失败", http.StatusInternalServerError)
 		return
 	}
-	
+
+	portNum, _ := strconv.Atoi(req.Port)
+	go startProxyServer(portNum, len(config.Ports)-1, &config.Ports[len(config.Ports)-1])
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "端口已添加，重启服务后生效"})
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("端口 %s 添加成功", req.Port),
+	})
 }
 
-// 新增：批量添加端口
-func handleAPIBatchAddPorts(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+func handleBatchAddPorts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -1605,791 +1599,1091 @@ func handleAPIBatchAddPorts(w http.ResponseWriter, r *http.Request) {
 		Username  string `json:"username"`
 		Password  string `json:"password"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.StartPort <= 0 || req.EndPort <= 0 || req.StartPort > req.EndPort {
-		http.Error(w, `{"error":"端口范围无效"}`, http.StatusBadRequest)
+	if req.EndPort-req.StartPort > 100 {
+		http.Error(w, "一次最多添加100个端口", http.StatusBadRequest)
 		return
 	}
-	
-	if req.EndPort - req.StartPort > 100 {
-		http.Error(w, `{"error":"一次最多添加100个端口"}`, http.StatusBadRequest)
-		return
-	}
-	
-	if req.Username == "" || req.Password == "" {
-		http.Error(w, `{"error":"用户名和密码不能为空"}`, http.StatusBadRequest)
-		return
-	}
-	
+
 	added := 0
-	skipped := 0
-	now := time.Now().Format("2006-01-02 15:04:05")
-	
 	for port := req.StartPort; port <= req.EndPort; port++ {
-		portStr := fmt.Sprintf("%d", port)
+		portStr := strconv.Itoa(port)
 		
-		// 检查端口是否已存在
 		exists := false
-		if portStr == config.Port {
-			exists = true
-		} else {
-			for _, p := range config.Ports {
-				if p.Port == portStr {
-					exists = true
-					break
-				}
+		for _, p := range config.Ports {
+			if p.Port == portStr {
+				exists = true
+				break
 			}
 		}
 		
 		if exists {
-			skipped++
 			continue
 		}
-		
-		// 添加新端口
-		newPort := PortConfig{
+
+		config.Ports = append(config.Ports, PortConfig{
 			Port:     portStr,
 			Username: req.Username,
 			Password: req.Password,
-			Enabled:  true,
-			Created:  now,
-		}
-		config.Ports = append(config.Ports, newPort)
+		})
+
+		go startProxyServer(port, len(config.Ports)-1, &config.Ports[len(config.Ports)-1])
 		added++
 	}
-	
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存失败", http.StatusInternalServerError)
 		return
 	}
-	
-	message := fmt.Sprintf("成功添加%d个端口", added)
-	if skipped > 0 {
-		message += fmt.Sprintf("，跳过%d个已存在端口", skipped)
-	}
-	message += "，重启服务后生效"
-	
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": message,
-		"added":   added,
-		"skipped": skipped,
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("成功添加 %d 个端口", added),
 	})
 }
 
-// 新增：删除端口
-func handleAPIDeletePort(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
+func handleDeletePort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req struct {
 		Port string `json:"port"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if req.Port == "" {
-		http.Error(w, `{"error":"端口不能为空"}`, http.StatusBadRequest)
-		return
-	}
-	
-	// 不能删除主端口
-	if req.Port == config.Port {
-		http.Error(w, `{"error":"不能删除主端口"}`, http.StatusBadRequest)
-		return
-	}
-	
-	// 查找并删除端口
 	found := false
-	newPorts := []PortConfig{}
-	for _, p := range config.Ports {
+	for i, p := range config.Ports {
 		if p.Port == req.Port {
-			found = true
-			continue
-		}
-		newPorts = append(newPorts, p)
-	}
-	
-	if !found {
-		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
-		return
-	}
-	
-	config.Ports = newPorts
-	
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
-		return
-	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "端口已删除，重启服务后生效"})
-}
-
-// 新增：切换端口启用状态
-func handleAPITogglePort(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, `{"error":"仅支持POST"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Port    string `json:"port"`
-		Enabled bool   `json:"enabled"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error":"无效请求"}`, http.StatusBadRequest)
-		return
-	}
-
-	if req.Port == "" {
-		http.Error(w, `{"error":"端口不能为空"}`, http.StatusBadRequest)
-		return
-	}
-	
-	// 主端口始终启用
-	if req.Port == config.Port {
-		http.Error(w, `{"error":"主端口始终启用"}`, http.StatusBadRequest)
-		return
-	}
-	
-	// 查找并更新端口状态
-	found := false
-	for i := range config.Ports {
-		if config.Ports[i].Port == req.Port {
-			config.Ports[i].Enabled = req.Enabled
+			config.Ports = append(config.Ports[:i], config.Ports[i+1:]...)
 			found = true
 			break
 		}
 	}
-	
+
 	if !found {
-		http.Error(w, `{"error":"端口不存在"}`, http.StatusNotFound)
+		http.Error(w, "端口不存在", http.StatusNotFound)
 		return
 	}
-	
-	if err := saveConfigToFile(); err != nil {
-		http.Error(w, `{"error":"保存配置失败"}`, http.StatusInternalServerError)
+
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存失败", http.StatusInternalServerError)
 		return
 	}
-	
-	status := "禁用"
-	if req.Enabled {
-		status = "启用"
-	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": fmt.Sprintf("端口已%s，重启服务后生效", status)})
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("端口 %s 已删除（需重启生效）", req.Port),
+	})
 }
 
-
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	html, err := os.ReadFile(indexHTMLPath)
-	if err != nil {
-		http.Error(w, "index.html not found", http.StatusInternalServerError)
+func handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write(html)
+
+	var req struct {
+		Port     string `json:"port"`
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	found := false
+	for i := range config.Ports {
+		if config.Ports[i].Port == req.Port {
+			config.Ports[i].Username = req.Username
+			config.Ports[i].Password = req.Password
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		http.Error(w, "端口不存在", http.StatusNotFound)
+		return
+	}
+
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存失败", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "密码已更新",
+	})
 }
 
-func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+// ===== 多前缀API处理函数 =====
+
+func handlePrefixes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	status := getPrefixStatus()
+	json.NewEncoder(w).Encode(status)
+}
+
+func handleDetectPrefixes(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	detected := detectIPv6Prefixes()
+	
+	// 过滤掉已配置的前缀
+	var available []DetectedPrefix
+	for _, d := range detected {
+		found := false
+		for _, configured := range config.IPv6Prefixes {
+			if d.Prefix == configured {
+				found = true
+				break
+			}
+		}
+		if !found {
+			available = append(available, d)
+		}
+	}
+	
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"detected": detected,
+		"available": available,
+	})
+}
+
+func handleSwitchPrefix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Index int `json:"index"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := switchToPrefix(req.Index); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("已切换到前缀 #%d", req.Index),
+		"prefix":  config.IPv6Prefixes[req.Index],
+	})
+}
+
+func handleAddPrefix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Prefix string `json:"prefix"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := addPrefix(req.Prefix); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "前缀添加成功",
+		"prefix":  req.Prefix,
+		"index":   len(config.IPv6Prefixes) - 1,
+	})
+}
+
+func handleDeletePrefix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Index int `json:"index"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := deletePrefix(req.Index); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("前缀 #%d 已删除", req.Index),
+	})
+}
+
+func handleAutoSwitchPrefix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+		Hours   int  `json:"hours"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := setAutoSwitch(req.Enabled, req.Hours); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	nextSwitchTimeLock.RLock()
+	nextSwitch := nextSwitchTime
+	nextSwitchTimeLock.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":     true,
+		"enabled":     req.Enabled,
+		"hours":       config.SwitchIntervalHours,
+		"next_switch": nextSwitch.Format("2006-01-02 15:04:05"),
+	})
+}
+
+// ===== Web服务器和认证 =====
+
+func basicAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, pass, ok := r.BasicAuth()
-		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(config.WebUsername)) != 1 || 
-		   subtle.ConstantTimeCompare([]byte(pass), []byte(config.WebPassword)) != 1 {
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(config.WebUsername)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(pass), []byte(config.WebPassword)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte("Unauthorized\n"))
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next(w, r)
+		handler(w, r)
 	}
 }
 
-func startWebServer(ctx context.Context) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", basicAuth(handleIndex))
-	mux.HandleFunc("/api/stats", basicAuth(handleAPIStats))
-	mux.HandleFunc("/api/logs", basicAuth(handleAPILogs))
-	mux.HandleFunc("/api/faillogs", basicAuth(handleAPIFailLogs))
-	mux.HandleFunc("/api/search", basicAuth(handleAPISearchLogs))
-	mux.HandleFunc("/api/active", basicAuth(handleAPIActiveConns))
-	mux.HandleFunc("/api/history", basicAuth(handleAPIHistory))
-	mux.HandleFunc("/api/pool/resize", basicAuth(handleAPIPoolResize))
-	mux.HandleFunc("/api/rotate", basicAuth(handleAPIRotate(ctx)))
-	mux.HandleFunc("/api/config", basicAuth(handleAPIUpdateConfig))
-	mux.HandleFunc("/api/autorotate", basicAuth(handleAPIAutoRotate))
-	mux.HandleFunc("/api/autoclean", basicAuth(handleAPIAutoClean))
-	mux.HandleFunc("/api/changepassword", basicAuth(handleAPIChangePassword))
-	// 新增：端口管理API
-	mux.HandleFunc("/api/ports", basicAuth(handleAPIPortList))
-	mux.HandleFunc("/api/ports/add", basicAuth(handleAPIAddPort))
-	mux.HandleFunc("/api/ports/batch", basicAuth(handleAPIBatchAddPorts))
-	mux.HandleFunc("/api/ports/delete", basicAuth(handleAPIDeletePort))
-	mux.HandleFunc("/api/ports/toggle", basicAuth(handleAPITogglePort))
+func startWebServer() {
+	http.HandleFunc("/", basicAuth(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, indexHTMLPath)
+	}))
 
-	srv := &http.Server{
-		Addr:    ":" + config.WebPort,
-		Handler: mux,
+	http.HandleFunc("/api/stats", basicAuth(handleStats))
+	http.HandleFunc("/api/logs", basicAuth(handleLogs))
+	http.HandleFunc("/api/faillogs", basicAuth(handleFailLogs))
+	http.HandleFunc("/api/active", basicAuth(handleActiveConns))
+	http.HandleFunc("/api/chart", basicAuth(handleChart))
+	http.HandleFunc("/api/rotate", basicAuth(handleRotate))
+	http.HandleFunc("/api/autorotate", basicAuth(handleAutoRotate))
+	http.HandleFunc("/api/ports", basicAuth(handlePorts))
+	http.HandleFunc("/api/ports/add", basicAuth(handleAddPort))
+	http.HandleFunc("/api/ports/batch", basicAuth(handleBatchAddPorts))
+	http.HandleFunc("/api/ports/delete", basicAuth(handleDeletePort))
+	http.HandleFunc("/api/changepassword", basicAuth(handleChangePassword))
+
+	// 多前缀API
+	http.HandleFunc("/api/prefixes", basicAuth(handlePrefixes))
+	http.HandleFunc("/api/prefixes/detect", basicAuth(handleDetectPrefixes))
+	http.HandleFunc("/api/prefixes/switch", basicAuth(handleSwitchPrefix))
+	http.HandleFunc("/api/prefixes/add", basicAuth(handleAddPrefix))
+	http.HandleFunc("/api/prefixes/delete", basicAuth(handleDeletePrefix))
+	http.HandleFunc("/api/prefixes/auto-switch", basicAuth(handleAutoSwitchPrefix))
+
+	log.Printf("🌐 Web管理: http://0.0.0.0:%s", config.WebPort)
+	log.Fatal(http.ListenAndServe(":"+config.WebPort, nil))
+}
+
+func startProxyServer(port, index int, portCfg *PortConfig) {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		log.Printf("❌ 无法启动端口 %d: %v", port, err)
+		return
 	}
+	defer listener.Close()
 
-	log.Printf("Web: http://0.0.0.0:%s", config.WebPort)
+	log.Printf("🚀 代理端口 %d 已启动", port)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go handleClient(conn, index, portCfg)
+	}
+}
+
+func startCPUMonitor() {
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Web失败: %v", err)
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		pid := int32(os.Getpid())
+		proc, _ := process.NewProcess(pid)
+
+		for range ticker.C {
+			if percent, err := proc.CPUPercent(); err == nil {
+				atomic.StoreInt64(&stats.ProcessCPUPercent, int64(percent*100))
+			}
+
+			if percents, err := cpu.Percent(0, false); err == nil && len(percents) > 0 {
+				atomic.StoreInt64(&stats.SystemCPUPercent, int64(percents[0]*100))
+			}
 		}
 	}()
-	return srv
 }
 
-func cleanupIPs() {
-	poolLock.RLock()
-	ipsToClean := make([]net.IP, len(ipv6Pool))
-	copy(ipsToClean, ipv6Pool)
-	poolLock.RUnlock()
+func startStatsRecorder() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 
-	for _, ip := range ipsToClean {
-		delIPv6(ip)
-	}
+		lastSuccess := int64(0)
+		lastTime := time.Now()
+
+		for range ticker.C {
+			currentTotal := atomic.LoadInt64(&stats.TotalConns)
+			currentSuccess := atomic.LoadInt64(&stats.SuccessConns)
+			currentTime := time.Now()
+
+			elapsed := currentTime.Sub(lastTime).Seconds()
+			qps := float64(currentSuccess-lastSuccess) / elapsed
+
+			successRate := float64(0)
+			if currentTotal > 0 {
+				successRate = float64(currentSuccess) / float64(currentTotal) * 100
+			}
+
+			snapshot := &StatsSnapshot{
+				Timestamp:   currentTime.Format("15:04:05"),
+				QPS:         qps,
+				SuccessRate: successRate,
+				ProcessCPU:  float64(atomic.LoadInt64(&stats.ProcessCPUPercent)) / 100,
+				SystemCPU:   float64(atomic.LoadInt64(&stats.SystemCPUPercent)) / 100,
+				ActiveConns: atomic.LoadInt64(&stats.ActiveConns),
+			}
+
+			statsHistoryLock.Lock()
+			statsHistory = append(statsHistory, snapshot)
+			if len(statsHistory) > maxHistory {
+				statsHistory = statsHistory[1:]
+			}
+			statsHistoryLock.Unlock()
+
+			lastSuccess = currentSuccess
+			lastTime = currentTime
+		}
+	}()
 }
+
+func startAutoRotateMonitor() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if atomic.LoadInt32(&autoRotateEnabled) != 1 {
+				continue
+			}
+
+			nextRotateTimeLock.RLock()
+			shouldRotate := time.Now().After(nextRotateTime)
+			nextRotateTimeLock.RUnlock()
+
+			if shouldRotate {
+				log.Printf("⏰ 触发自动轮换")
+				
+				poolLock.Lock()
+				oldSize := len(ipv6Pool)
+				
+				for _, ip := range ipv6Pool {
+					discardQueue <- ip
+				}
+
+				ipv6Pool = make([]net.IP, 0, config.TargetPool)
+				ipv6PoolIndex = make(map[string]int)
+				atomic.StoreInt64(&stats.PoolSize, 0)
+				poolLock.Unlock()
+
+				go fillInitialPool()
+
+				nextRotateTimeLock.Lock()
+				nextRotateTime = time.Now().Add(time.Duration(config.AutoRotateHours) * time.Hour)
+				nextRotateTimeLock.Unlock()
+
+				log.Printf("✅ 自动轮换完成: 丢弃 %d 个IP", oldSize)
+			}
+		}
+	}()
+}
+
+// ===== 主函数 =====
 
 func main() {
-	mrand.Seed(time.Now().UnixNano())
-	
-	log.Printf("IPv6 代理 v7.4 Final")
+	if err := loadOrCreateConfig(); err != nil {
+		log.Fatalf("❌ 配置错误: %v", err)
+	}
+
+	if len(config.IPv6Prefixes) == 0 {
+		log.Fatal("❌ 没有配置IPv6前缀")
+	}
+
+	log.Printf("📋 配置的IPv6前缀:")
+	for i, prefix := range config.IPv6Prefixes {
+		if i == config.ActivePrefixIndex {
+			log.Printf("   #%d: %s ⭐ (当前激活)", i, prefix)
+		} else {
+			log.Printf("   #%d: %s", i, prefix)
+		}
+	}
+
+	if err := initIPv6(); err != nil {
+		log.Fatalf("❌ IPv6初始化失败: %v", err)
+	}
 
 	stats.StartTime = time.Now()
+	ipv6Pool = make([]net.IP, 0, config.TargetPool)
+	ipv6PoolIndex = make(map[string]int)
 
-	exePath, err := os.Executable()
-	if err != nil {
-		log.Fatalf("无法获取路径: %v", err)
-	}
-	exeDir := filepath.Dir(exePath)
-	configFilePath = filepath.Join(exeDir, "config.json")
-	indexHTMLPath = filepath.Join(exeDir, "index.html")
-
-	isInteractive := term.IsTerminal(int(syscall.Stdin))
-
-	if isInteractive {
-		if err := runInteractiveSetup(); err != nil {
-			log.Fatalf("设置失败: %v", err)
-		}
-		if err := saveConfigToFile(); err != nil {
-			log.Fatalf("保存失败: %v", err)
-		}
-	} else {
-		if err := loadConfigFromFile(); err != nil {
-			log.Fatalf("加载失败: %v", err)
-		}
-	}
-
-	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix + "::/64")
-	if err != nil {
-		log.Fatalf("无法解析前缀: %v", err)
-	}
-	iface, err = netlink.LinkByName(config.Interface)
-	if err != nil {
-		log.Fatalf("无法找到网卡: %v", err)
-	}
-
-	log.Printf("")
-	log.Printf("配置: 代理:%s Web:%s", config.Port, config.WebPort)
-	log.Printf("网络: %s::/64 @ %s", config.IPv6Prefix, config.Interface)
-	log.Printf("IP池: %d → %d", config.InitialPool, config.TargetPool)
-	if config.AutoRotate {
-		log.Printf("轮换: 每 %d 小时", config.AutoRotateHours)
-	}
-	log.Printf("")
-
-	if err := initIPv6Pool(); err != nil {
-		log.Fatalf("初始化失败: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	if config.TargetPool > config.InitialPool {
-		atomic.StoreInt32(&backgroundRunning, 1) 
-	}
-	
-	discardQueue = make(chan net.IP, 5000)
+	fillInitialPool()
+	startBackgroundIPManager()
+	startCPUMonitor()
+	startStatsRecorder()
+	startAutoRotateMonitor()
+	startAutoSwitchMonitor()
 
 	if config.AutoRotate {
 		atomic.StoreInt32(&autoRotateEnabled, 1)
-		atomic.StoreInt64(&autoRotateInterval, int64(config.AutoRotateHours))
 		nextRotateTime = time.Now().Add(time.Duration(config.AutoRotateHours) * time.Hour)
+		log.Printf("⏰ 自动轮换: 已启用, 间隔 %d 小时", config.AutoRotateHours)
 	}
 
-	go backgroundAddTask(ctx)
-	go discardWorker(ctx)
-	go statsRoutine(ctx)
-	go statsCPURoutine(ctx)
-	go statsHistoryRoutine(ctx)
-	go logClearRoutine(ctx)
-	go autoRotateRoutine(ctx)
-	go trafficRateRoutine(ctx)
-
-	webServer := startWebServer(ctx)
-
-	listener, err := net.Listen("tcp", ":"+config.Port)
-	if err != nil {
-		log.Fatalf("监听失败: %v", err)
+	if config.AutoSwitchPrefix {
+		atomic.StoreInt32(&autoSwitchEnabled, 1)
+		nextSwitchTime = time.Now().Add(time.Duration(config.SwitchIntervalHours) * time.Hour)
+		log.Printf("⏰ 自动切换前缀: 已启用, 间隔 %d 小时", config.SwitchIntervalHours)
 	}
 
-	log.Printf("✅ 服务就绪")
+	go startWebServer()
 
-	shutdownChan := make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
+	basePort, _ := strconv.Atoi(config.Port)
+	go startProxyServer(basePort, -1, nil)
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				if strings.Contains(err.Error(), "closed network connection") {
-					break
-				}
-				continue
-			}
-			go handleConnection(conn)
-		}
-	}()
+	for i := range config.Ports {
+		port, _ := strconv.Atoi(config.Ports[i].Port)
+		go startProxyServer(port, i, &config.Ports[i])
+	}
 
-	<-shutdownChan
-	log.Printf("\n关闭中...")
-	cancel()
-	webServer.Shutdown(context.Background())
-	listener.Close()
-	cleanupIPs()
-	log.Printf("✅ 已关闭")
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("\n👋 正在关闭...")
 }
 GOEOF
 
-print_success "源代码完成"
+print_success "Go代码生成完成"
 echo ""
 
-# --- 步骤 4: 创建前端 ---
+# --- 步骤 4: 创建HTML前端 (包含多前缀管理界面) ---
 echo "--- 步骤 4: 创建前端 ---"
+
 cat << 'HTMLEOF' > index.html
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>柯南的代理池</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<title>IPv6 代理运行监控</title>
 <style>
-:root {
-    --bg-primary: #0f172a;
-    --bg-secondary: #1e293b;
-    --bg-card: #1a2332;
-    --primary: #3b82f6;
-    --primary-light: #60a5fa;
-    --secondary: #06b6d4;
-    --success: #10b981;
-    --warning: #f59e0b;
-    --danger: #ef4444;
-    --text-primary: #e2e8f0;
-    --text-secondary: #94a3b8;
-    --text-muted: #64748b;
-    --border: #2d3748;
-}
-
-* {margin:0;padding:0;box-sizing:border-box}
+* { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-    background: linear-gradient(135deg, #0f172a 0%, #1a202c 100%);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+    background: #0f1419;
+    color: #e5e7eb;
     min-height: 100vh;
-    color: var(--text-primary);
+    padding: 15px;
 }
 
 .container {
     max-width: 1600px;
     margin: 0 auto;
-    padding: 20px;
 }
 
+/* 顶部标题 */
 .header {
-    background: var(--bg-card);
-    border-radius: 12px;
-    padding: 25px 30px;
-    margin-bottom: 25px;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--border);
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 15px 25px;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+    margin-bottom: 15px;
+    display: flex;
+    align-items: center;
+}
+
+.header-icon {
+    font-size: 24px;
+    margin-right: 12px;
 }
 
 .header h1 {
-    font-size: 26px;
-    color: var(--text-primary);
-    display: flex;
-    align-items: center;
-    gap: 12px;
+    font-size: 20px;
+    font-weight: 500;
+    color: #f0f0f0;
 }
 
-.header h1::before {
-    content: '🚀';
-    font-size: 28px;
-}
-
-.grid {
+/* 统计卡片网格 */
+.stats-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 20px;
-    margin-bottom: 25px;
-}
-
-.card {
-    background: var(--bg-card);
-    border-radius: 12px;
-    padding: 20px;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--border);
-    transition: all 0.3s ease;
-    position: relative;
-}
-
-.card:hover {
-    transform: translateY(-3px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-    border-color: var(--primary);
-}
-
-.card-title {
-    font-size: 12px;
-    color: var(--text-secondary);
-    font-weight: 400;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
     margin-bottom: 12px;
 }
 
-.card-value {
-    font-size: 32px;
-    font-weight: bold;
-    color: var(--primary-light);
-    line-height: 1;
+.stat-card {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+    transition: all 0.3s;
 }
 
-.card-value-small {
-    font-size: 22px;
-    font-weight: bold;
+.stat-card:hover {
+    border-color: #3b82f6;
+    transform: translateY(-2px);
 }
 
-.card-value-small .success {color: var(--success)}
-.card-value-small .fail {color: var(--danger)}
-
-.card-sub {
+.stat-card .label {
     font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 8px;
+    color: #9ca3af;
+    margin-bottom: 8px;
 }
 
-.progress-bar {
+.stat-card .value {
+    font-size: 28px;
+    font-weight: 600;
+    color: #3b82f6;
+    line-height: 1.2;
+}
+
+.stat-card .sub-value {
+    font-size: 12px;
+    color: #6b7280;
+    margin-top: 4px;
+}
+
+.stat-card .progress-bar {
     width: 100%;
-    height: 6px;
-    background: var(--bg-secondary);
-    border-radius: 3px;
+    height: 3px;
+    background: #2d3748;
+    border-radius: 2px;
+    margin-top: 8px;
     overflow: hidden;
-    margin-top: 12px;
 }
 
-.progress-fill {
+.stat-card .progress-fill {
     height: 100%;
-    background: linear-gradient(90deg, var(--primary), var(--primary-light));
-    transition: width 0.5s ease;
+    background: linear-gradient(90deg, #3b82f6, #2563eb);
+    transition: width 0.3s;
 }
 
-.section {
-    background: var(--bg-card);
-    border-radius: 12px;
-    padding: 25px;
-    margin-bottom: 25px;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
-    border: 1px solid var(--border);
+/* 功能区网格 */
+.function-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-bottom: 15px;
 }
 
-.section-title {
-    font-size: 18px;
-    font-weight: 500;
-    color: var(--text-primary);
+.function-card {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 16px;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+}
+
+.function-card h3 {
+    font-size: 14px;
+    color: #f0f0f0;
+    margin-bottom: 12px;
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 20px;
-    padding-bottom: 15px;
-    border-bottom: 1px solid var(--border);
 }
 
-.log-container {
-    max-height: 400px;
-    overflow-y: auto;
-    overflow-x: auto;
-    background: var(--bg-secondary);
+.function-card h3::before {
+    content: '⚙️';
+    margin-right: 8px;
+}
+
+.form-group {
+    margin-bottom: 15px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 12px;
+    color: #9ca3af;
+    margin-bottom: 8px;
+}
+
+.form-group input,
+.form-group select {
+    width: 100%;
+    padding: 10px 12px;
+    background: #1a1f2e;
+    border: 1px solid #2d3748;
+    border-radius: 6px;
+    color: #e5e7eb;
+    font-size: 14px;
+    transition: all 0.3s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    background: #252d3d;
+}
+
+.button {
+    width: 100%;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.3s;
+    margin-bottom: 8px;
+}
+
+.button-primary {
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+    color: white;
+}
+
+.button-primary:hover {
+    background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+}
+
+.button-warning {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    color: white;
+}
+
+.button-warning:hover {
+    background: linear-gradient(135deg, #d97706, #b45309);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(245, 158, 11, 0.4);
+}
+
+.button-secondary {
+    background: #2d3748;
+    color: #e5e7eb;
+}
+
+.button-secondary:hover {
+    background: #374151;
+}
+
+/* 图表区域 */
+.chart-container {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 12px 20px 15px;
     border-radius: 8px;
-    padding: 10px;
+    border: 1px solid #2d3748;
+    margin-bottom: 15px;
 }
 
-/* 滚动条样式 */
-.log-container::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+.chart-container h3 {
+    font-size: 14px;
+    color: #f0f0f0;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
 }
 
-.log-container::-webkit-scrollbar-track {
-    background: var(--bg-secondary);
-    border-radius: 4px;
+.chart-container h3::before {
+    content: '📊';
+    margin-right: 8px;
 }
 
-.log-container::-webkit-scrollbar-thumb {
-    background: var(--border);
-    border-radius: 4px;
+#chart {
+    width: 100%;
+    height: 140px;
 }
 
-.log-container::-webkit-scrollbar-thumb:hover {
-    background: var(--text-muted);
+/* 表格 */
+.table-container {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+    margin-bottom: 15px;
+    overflow: hidden;
+}
+
+.table-header {
+    padding: 12px 20px;
+    border-bottom: 1px solid #2d3748;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.table-header h3 {
+    font-size: 14px;
+    color: #f0f0f0;
+    display: flex;
+    align-items: center;
+}
+
+.table-header h3::before {
+    content: '🔗';
+    margin-right: 8px;
+}
+
+.table-badge {
+    background: #3b82f6;
+    color: white;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 12px;
+    margin-left: 8px;
 }
 
 table {
     width: 100%;
     border-collapse: collapse;
-    min-width: 600px;
+}
+
+thead {
+    background: #1a1f2e;
 }
 
 th {
-    background: var(--bg-primary);
-    padding: 12px 15px;
+    padding: 10px 16px;
     text-align: left;
-    font-weight: 500;
-    color: var(--text-secondary);
     font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
-    z-index: 10;
+    font-weight: 500;
+    color: #9ca3af;
+    border-bottom: 1px solid #2d3748;
 }
 
 td {
-    padding: 10px 15px;
-    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
     font-size: 13px;
-    color: var(--text-primary);
-    white-space: nowrap;
+    color: #e5e7eb;
+    border-bottom: 1px solid #2d3748;
 }
 
 tr:hover {
-    background: rgba(59, 130, 246, 0.05);
+    background: #1a1f2e;
 }
 
-.status-success {color: var(--success); font-weight: 500;}
-.status-fail {color: var(--danger); font-weight: 500;}
-.status-timeout {color: var(--warning); font-weight: 500;}
+.status-success {
+    color: #10b981;
+    font-weight: 500;
+}
 
-.input-group {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    align-items: center;
+.status-fail {
+    color: #ef4444;
+    font-weight: 500;
+}
+
+/* 搜索框 */
+.search-container {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 15px 20px;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
     margin-bottom: 15px;
 }
 
-input[type=number], input[type=text], input[type=password], select {
-    padding: 10px 15px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
+.search-container h3 {
     font-size: 14px;
-    transition: all 0.3s ease;
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    min-width: 120px;
-}
-
-input[type=number]:focus, input[type=text]:focus, input[type=password]:focus {
-    outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
-}
-
-input[type=number]::placeholder, input[type=text]::placeholder, input[type=password]::placeholder {
-    color: var(--text-muted);
-}
-
-button {
-    background: var(--primary);
-    color: white;
-    border: none;
-    padding: 10px 20px;
-    border-radius: 8px;
-    cursor: pointer;
-    transition: all 0.3s ease;
-    font-size: 14px;
-    font-weight: 500;
-}
-
-button:hover {
-    background: var(--primary-light);
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
-}
-
-button.warning {
-    background: var(--warning);
-}
-
-button.warning:hover {
-    background: #d97706;
-    box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
-}
-
-.badge {
-    display: inline-block;
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 11px;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-.badge-success {
-    background: rgba(16, 185, 129, 0.2);
-    color: var(--success);
-}
-
-.badge-info {
-    background: rgba(59, 130, 246, 0.2);
-    color: var(--primary-light);
-}
-
-.chart-container {
-    height: 250px;
-    margin-top: 15px;
-    background: var(--bg-secondary);
-    border-radius: 8px;
-    padding: 15px;
-}
-
-canvas {
-    max-height: 220px;
-}
-
-/* 提示框样式 */
-/* 标签样式 */
-label {
-    color: var(--text-secondary);
-}
-
-input[type=checkbox] {
-    width: 18px;
-    height: 18px;
-    cursor: pointer;
-}
-
-/* 紧凑配置卡片样式 */
-.config-card {
-    min-height: 140px;
+    color: #f0f0f0;
+    margin-bottom: 12px;
     display: flex;
-    flex-direction: column;
+    align-items: center;
 }
 
-.compact-form {
+.search-container h3::before {
+    content: '🔍';
+    margin-right: 8px;
+}
+
+.search-box {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
+    gap: 10px;
+}
+
+.search-box input {
     flex: 1;
-}
-
-.compact-input {
-    padding: 6px 10px;
-    border: 1px solid var(--border);
+    padding: 10px 12px;
+    background: #1a1f2e;
+    border: 1px solid #2d3748;
     border-radius: 6px;
-    font-size: 13px;
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    width: 100%;
+    color: #e5e7eb;
+    font-size: 14px;
 }
 
-.compact-input:focus {
+.search-box input:focus {
     outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    border-color: #3b82f6;
 }
 
-.compact-btn {
-    padding: 6px 12px;
-    font-size: 13px;
-    border-radius: 6px;
-    background: var(--primary);
-    color: white;
+.search-box button {
+    padding: 10px 20px;
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
     border: none;
+    border-radius: 6px;
+    color: white;
+    font-size: 14px;
     cursor: pointer;
-    transition: all 0.3s ease;
-    width: 100%;
+    transition: all 0.3s;
 }
 
-.compact-btn:hover {
-    background: var(--primary-light);
+.search-box button:hover {
+    background: linear-gradient(135deg, #2563eb, #1d4ed8);
+    box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
 }
 
-.compact-btn.warning {
-    background: var(--warning);
+/* 前缀管理 */
+.prefix-container {
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
+    padding: 15px 20px;
+    border-radius: 8px;
+    border: 1px solid #2d3748;
+    margin-bottom: 15px;
 }
 
-.compact-btn.warning:hover {
-    background: #d97706;
-}
-
-.checkbox-label {
+.prefix-container h3 {
+    font-size: 14px;
+    color: #f0f0f0;
+    margin-bottom: 12px;
     display: flex;
     align-items: center;
-    gap: 8px;
+}
+
+.prefix-container h3::before {
+    content: '📡';
+    margin-right: 8px;
+}
+
+.prefix-info {
+    background: #1a1f2e;
+    padding: 12px 16px;
+    border-radius: 6px;
+    margin-bottom: 15px;
     font-size: 13px;
-    color: var(--text-primary);
 }
 
-.checkbox-label input {
-    width: 16px;
-    height: 16px;
+.prefix-info strong {
+    color: #3b82f6;
 }
 
-.input-row {
+.prefix-list {
+    display: grid;
+    gap: 10px;
+}
+
+.prefix-item {
+    background: #1a1f2e;
+    padding: 15px;
+    border-radius: 6px;
+    border: 1px solid #2d3748;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    transition: all 0.3s;
+}
+
+.prefix-item:hover {
+    border-color: #3b82f6;
+}
+
+.prefix-item.active {
+    background: linear-gradient(135deg, #1e3a8a, #1e40af);
+    border-color: #3b82f6;
+}
+
+.prefix-item.active .prefix-title {
+    color: #60a5fa;
+}
+
+.prefix-title {
+    font-size: 13px;
+    color: #e5e7eb;
+    font-weight: 500;
+}
+
+.prefix-meta {
+    font-size: 11px;
+    color: #9ca3af;
+    margin-top: 4px;
+}
+
+.prefix-badge {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+    margin-right: 8px;
+}
+
+.badge-active {
+    background: #10b981;
+    color: white;
+}
+
+.prefix-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.btn-sm {
+    padding: 6px 12px;
+    font-size: 12px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+
+.btn-sm.btn-switch {
+    background: #3b82f6;
+    color: white;
+}
+
+.btn-sm.btn-switch:hover {
+    background: #2563eb;
+}
+
+.btn-sm.btn-delete {
+    background: #ef4444;
+    color: white;
+}
+
+.btn-sm.btn-delete:hover {
+    background: #dc2626;
+}
+
+.btn-sm:disabled {
+    background: #374151;
+    color: #6b7280;
+    cursor: not-allowed;
+}
+
+/* 自动切换面板 */
+.auto-switch-panel {
+    background: #1a1f2e;
+    padding: 15px;
+    border-radius: 6px;
+    margin: 15px 0;
+}
+
+.switch-row {
     display: flex;
     align-items: center;
-    gap: 5px;
+    justify-content: space-between;
+    margin-bottom: 12px;
 }
 
-.mini-label {
-    font-size: 12px;
-    color: var(--text-secondary);
-    white-space: nowrap;
+.switch-row label {
+    font-size: 13px;
+    color: #9ca3af;
 }
 
-.unit {
-    font-size: 12px;
-    color: var(--text-muted);
+.switch-toggle {
+    position: relative;
+    width: 48px;
+    height: 24px;
 }
 
-.status-text {
-    font-size: 11px;
-    margin-top: 4px;
-    height: 16px;
+.switch-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
 }
 
-.info-text {
-    font-size: 11px;
-    color: var(--text-muted);
-    margin-top: 4px;
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #374151;
+    transition: .3s;
+    border-radius: 24px;
 }
 
-/* 弹窗样式 */
+.slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: .3s;
+    border-radius: 50%;
+}
+
+input:checked + .slider {
+    background-color: #10b981;
+}
+
+input:checked + .slider:before {
+    transform: translateX(24px);
+}
+
+.countdown {
+    background: linear-gradient(135deg, #f59e0b, #d97706);
+    padding: 12px;
+    border-radius: 6px;
+    text-align: center;
+    font-size: 13px;
+    color: white;
+    margin: 15px 0;
+}
+
+/* 弹窗 */
 .modal {
     display: none;
     position: fixed;
@@ -2400,765 +2694,948 @@ input[type=checkbox] {
     height: 100%;
     background-color: rgba(0, 0, 0, 0.7);
     backdrop-filter: blur(4px);
-    animation: fadeIn 0.3s ease;
 }
 
 .modal-content {
-    background: var(--bg-card);
+    background: linear-gradient(135deg, #1e2533 0%, #252d3d 100%);
     margin: 5% auto;
     padding: 30px;
-    border: 1px solid var(--border);
-    border-radius: 16px;
+    border: 1px solid #2d3748;
+    border-radius: 12px;
     width: 90%;
-    max-width: 500px;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-    animation: slideUp 0.3s ease;
+    max-width: 600px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
 }
 
-.modal-header {
+.modal-content h2 {
+    color: #f0f0f0;
+    margin-bottom: 20px;
+    font-size: 18px;
+}
+
+.close {
+    color: #9ca3af;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+
+.close:hover {
+    color: #3b82f6;
+}
+
+/* 响应式 */
+@media (max-width: 768px) {
+    .stats-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    
+    .function-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .stat-card .value {
+        font-size: 20px;
+    }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1a1f2e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #374151;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #4b5563;
+}
+
+/* 加载动画 */
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.loading {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* 提示信息 */
+.info-text {
+    font-size: 12px;
+    color: #6b7280;
+    margin-top: 8px;
+}
+
+.detected-list {
+    max-height: 400px;
+    overflow-y: auto;
+    margin-top: 15px;
+}
+
+.detected-item {
+    background: #1a1f2e;
+    padding: 15px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    border: 1px solid #2d3748;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 24px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid var(--border);
 }
 
-.modal-title {
-    font-size: 20px;
-    font-weight: 600;
-    color: var(--text-primary);
+.detected-info {
+    flex: 1;
 }
 
-.modal-close {
-    font-size: 28px;
-    font-weight: bold;
-    color: var(--text-muted);
-    cursor: pointer;
-    background: none;
-    border: none;
-    padding: 0;
-    width: 30px;
-    height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.3s ease;
-}
-
-.modal-close:hover {
-    color: var(--danger);
-    transform: rotate(90deg);
-}
-
-.modal-body {
-    margin-bottom: 20px;
-}
-
-.modal-input {
-    width: 100%;
-    padding: 12px 16px;
-    margin-bottom: 16px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text-primary);
+.detected-info strong {
+    color: #3b82f6;
     font-size: 14px;
 }
 
-.modal-input:focus {
-    outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
-}
-
-.modal-label {
+.detected-info small {
     display: block;
-    margin-bottom: 8px;
-    color: var(--text-secondary);
-    font-size: 13px;
-    font-weight: 500;
-}
-
-.modal-footer {
-    display: flex;
-    gap: 12px;
-    justify-content: flex-end;
-}
-
-.modal-btn {
-    padding: 12px 24px;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.3s ease;
-}
-
-.modal-btn-primary {
-    background: var(--primary);
-    color: white;
-}
-
-.modal-btn-primary:hover {
-    background: var(--primary-light);
-}
-
-.modal-btn-secondary {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-}
-
-.modal-btn-secondary:hover {
-    background: var(--border);
-}
-
-@keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-}
-
-@keyframes slideUp {
-    from {
-        transform: translateY(30px);
-        opacity: 0;
-    }
-    to {
-        transform: translateY(0);
-        opacity: 1;
-    }
-}
-
-@media (max-width: 768px) {
-    .container {padding: 15px;}
-    .grid {grid-template-columns: 1fr;}
-    .header h1 {font-size: 20px;}
-    .config-card {min-height: auto; padding: 15px;}
-    .compact-form {gap: 10px;}
+    color: #9ca3af;
+    font-size: 11px;
+    margin-top: 4px;
 }
 </style>
 </head>
 <body>
+
 <div class="container">
+    <!-- 顶部标题 -->
     <div class="header">
-        <h1> IPv6 代理运行监控-LA</h1>
+        <span class="header-icon">📡</span>
+        <h1>IPv6 代理运行监控 v8.1.1</h1>
     </div>
-    
-    <!-- 数据统计卡片 -->
-    <div class="grid">
-        <div class="card">
-            <div class="card-title">活跃连接</div>
-            <div class="card-value" id="active">-</div>
+
+    <!-- 统计卡片 -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="label">总连接数</div>
+            <div class="value" id="total-conns">0</div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">总连接数</div>
-            <div class="card-value" id="total">-</div>
-            <div class="card-sub">QPS: <span id="qps">-</span></div>
+        <div class="stat-card">
+            <div class="label">成功连接</div>
+            <div class="value" id="success-conns">0</div>
+            <div class="sub-value">QPS: <span id="qps">0.00</span></div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">连接统计</div>
-            <div class="card-value-small">
-                <span class="success" id="success">-</span> / <span class="fail" id="failed">-</span>
-            </div>
-            <div class="card-sub">超时: <span id="timeout">-</span></div>
+        <div class="stat-card">
+            <div class="label">连接结果</div>
+            <div class="value"><span id="success-count">0</span>/<span id="fail-count" style="color:#ef4444">0</span></div>
+            <div class="sub-value">成功/失败</div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">进程 CPU</div>
-            <div class="card-value" id="process-cpu">- %</div>
-            <div class="card-sub">ipv6-proxy</div>
+        <div class="stat-card">
+            <div class="label">进程 CPU</div>
+            <div class="value" id="process-cpu">0.0 %</div>
+            <div class="sub-value">当前进程</div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">系统 CPU</div>
-            <div class="card-value" id="system-cpu">- %</div>
-            <div class="card-sub">服务器</div>
+        <div class="stat-card">
+            <div class="label">系统 CPU</div>
+            <div class="value" id="system-cpu">0.0 %</div>
+            <div class="sub-value">整体系统</div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">平均耗时</div>
-            <div class="card-value" id="avg-duration">- ms</div>
+        <div class="stat-card">
+            <div class="label">平均耗时</div>
+            <div class="value" id="avg-duration">0 ms</div>
         </div>
-        
-        <div class="card">
-            <div class="card-title">IPv6 池</div>
-            <div class="card-value" id="pool-size">-</div>
-            <div class="card-sub">目标: <span id="pool-target">-</span></div>
+        <div class="stat-card">
+            <div class="label">IPv6 池</div>
+            <div class="value" id="pool-size">0</div>
+            <div class="sub-value">当前/目标: <span id="pool-target">0</span></div>
             <div class="progress-bar">
-                <div class="progress-fill" id="pool-progress"></div>
+                <div class="progress-fill" id="pool-progress" style="width: 0%"></div>
             </div>
-        </div>
-        
-        <div class="card">
-            <div class="card-title">运行时间</div>
-            <div class="card-value" style="font-size:20px" id="uptime">-</div>
-        </div>
-        
-        <!-- 实时流量监控 -->
-        <div class="card">
-            <div class="card-title">📊 实时流量</div>
-            <div class="card-value" style="font-size:24px" id="realtime-rate">- KB/s</div>
-            <div class="card-sub">⬆️ <span id="send-rate">- KB/s</span> | ⬇️ <span id="recv-rate">- KB/s</span></div>
-        </div>
-        
-        <div class="card">
-            <div class="card-title">💾 总流量</div>
-            <div class="card-value" style="font-size:24px" id="total-traffic">- GB</div>
-            <div class="card-sub">上传+下载</div>
         </div>
     </div>
 
-    <!-- 功能控制卡片 -->
-    <div class="grid">
-        <!-- 自动轮换卡片 -->
-        <div class="card config-card">
-            <div class="card-title">🔄 自动轮换</div>
-            <div class="compact-form">
-                <label class="checkbox-label">
-                    <input type="checkbox" id="auto-rotate-enabled">
-                    <span>启用</span>
+    <!-- 第二行统计 -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="label">运行时间</div>
+            <div class="value" id="uptime" style="font-size: 20px;">0d 0h 0m</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">实时流量</div>
+            <div class="value" style="font-size: 18px;">
+                <span id="recv-rate">0.00</span> KB/s
+            </div>
+            <div class="sub-value">↓ 下载 | ↑ 上传 <span id="send-rate">0.00</span> KB/s</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">流量统计</div>
+            <div class="value" style="font-size: 18px;">
+                <span id="total-recv">0.00</span> GB
+            </div>
+            <div class="sub-value">↓ 下行 | ↑ 上行 <span id="total-sent">0.00</span> GB</div>
+        </div>
+    </div>
+
+    <!-- IPv6前缀管理 -->
+    <div class="prefix-container">
+        <h3>IPv6 前缀管理</h3>
+        
+        <div class="prefix-info">
+            <strong>当前使用:</strong> <span id="current-prefix">加载中...</span> | 
+            <strong>前缀数:</strong> <span id="total-prefixes">0</span>
+        </div>
+
+        <div class="auto-switch-panel">
+            <div class="switch-row">
+                <label>⏰ 自动切换前缀</label>
+                <label class="switch-toggle">
+                    <input type="checkbox" id="auto-switch-enabled" onchange="toggleAutoSwitch()">
+                    <span class="slider"></span>
                 </label>
-                <div class="input-row">
-                    <label class="mini-label">间隔:</label>
-                    <input type="number" id="auto-rotate-hours" value="6" min="1" max="168" class="compact-input">
-                    <span class="unit">小时</span>
+            </div>
+            <div class="switch-row">
+                <label>切换间隔</label>
+                <div style="display:flex; gap:10px; align-items:center;">
+                    <input type="number" id="switch-interval" min="1" max="168" value="24" 
+                           style="width:80px; padding:6px 10px;">
+                    <span style="font-size:13px; color:#9ca3af;">小时</span>
+                    <button class="btn-sm btn-switch" onclick="saveAutoSwitchSettings()">保存</button>
                 </div>
-                <button onclick="saveAutoRotate()" class="compact-btn">保存</button>
-                <div id="auto-rotate-status" class="status-text"></div>
-                <div id="next-rotate-info" class="info-text"></div>
+            </div>
+            <div id="countdown-display" class="countdown" style="display:none;">
+                下次切换: <span id="next-switch-time">--</span> (剩余 <span id="seconds-until-switch">--</span> 秒)
             </div>
         </div>
 
-        <!-- 自动清理卡片 -->
-        <div class="card config-card">
-            <div class="card-title">🧹 自动清理</div>
-            <div class="compact-form">
-                <label class="checkbox-label">
-                    <input type="checkbox" id="auto-clean-enabled">
-                    <span>启用失效IPv6自动删除补入</span>
-                </label>
-                <button onclick="saveAutoClean()" class="compact-btn">保存</button>
-                <div id="auto-clean-status" class="status-text"></div>
-                <div class="info-text">连接失败的IPv6将自动清理</div>
-            </div>
+        <div style="margin: 15px 0;">
+            <button class="button button-primary" onclick="showAddPrefixModal()">➕ 添加新前缀</button>
         </div>
 
-        <!-- IP池管理卡片 -->
-        <div class="card config-card">
-            <div class="card-title">📊 IP 池管理</div>
-            <div class="compact-form">
-                <label class="mini-label">目标:</label>
-                <input type="number" id="new-target" placeholder="100000" min="100" step="1000" class="compact-input">
-                <button onclick="resizePool()" class="compact-btn">应用</button>
-                <button onclick="rotateIPs()" class="compact-btn warning">🔄 立即轮换</button>
-                <div id="pool-status" class="status-text"></div>
-            </div>
+        <div id="prefix-list" class="prefix-list">
+            <p style="text-align:center; color:#6b7280; padding:20px;">加载中...</p>
         </div>
-        
-        <!-- 增强:端口管理卡片 -->
-        <div class="card config-card">
-            <div class="card-title">🔌 端口管理</div>
-            <div class="compact-form">
-                <div class="info-text" style="margin-bottom:8px">
-                    总端口数: <strong id="total-ports-display">-</strong>
+    </div>
+
+    <!-- 功能区 -->
+    <div class="function-grid">
+        <div class="function-card">
+            <h3>IP 池管理</h3>
+            <div class="form-group">
+                <label>目标池大小</label>
+                <input type="number" id="target-pool" value="5000" min="100" max="100000">
+            </div>
+            <button class="button button-primary" onclick="rotatePool()">🔄 轮换 IP 池</button>
+            <button class="button button-warning" onclick="updateTargetPool()">📝 更新目标池</button>
+        </div>
+
+        <div class="function-card">
+            <h3>自动轮换设置</h3>
+            <div class="form-group">
+                <div class="switch-row">
+                    <label>启用自动轮换</label>
+                    <label class="switch-toggle">
+                        <input type="checkbox" id="auto-rotate-enabled">
+                        <span class="slider"></span>
+                    </label>
                 </div>
-                <button onclick="showPortList()" class="compact-btn">📋 端口列表</button>
-                <button onclick="showAddPort()" class="compact-btn">➕ 新增端口</button>
-                <button onclick="showBatchAddPort()" class="compact-btn warning">📦 批量新增</button>
-                <div id="port-status" class="status-text"></div>
             </div>
+            <div class="form-group">
+                <label>轮换间隔（小时）</label>
+                <input type="number" id="rotate-interval" min="1" max="168" value="24">
+            </div>
+            <button class="button button-primary" onclick="saveAutoRotateSettings()">💾 保存设置</button>
+        </div>
+
+        <div class="function-card">
+            <h3>端口管理</h3>
+            <div class="form-group">
+                <label>当前端口数</label>
+                <div style="font-size:24px; color:#3b82f6; font-weight:600;">
+                    <span id="total-ports">0</span>
+                </div>
+            </div>
+            <button class="button button-primary" onclick="showAddPort()">➕ 添加端口</button>
+            <button class="button button-secondary" onclick="showBatchAddPort()">📦 批量添加</button>
+            <button class="button button-secondary" onclick="showPortList()">📋 查看列表</button>
+        </div>
+
+        <div class="function-card">
+            <h3>监听端口添加</h3>
+            <div class="form-group">
+                <label>端口号</label>
+                <input type="number" id="quick-port" placeholder="例如: 10080" min="1024" max="65535">
+            </div>
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" id="quick-username" placeholder="用户名">
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="password" id="quick-password" placeholder="密码">
+            </div>
+            <button class="button button-primary" onclick="quickAddPort()">➕ 快速添加</button>
         </div>
     </div>
 
-    <!-- 可视化图表 -->
-    <div class="section">
-        <div class="section-title">
-            📊 性能监控
-            <span class="badge badge-info">实时</span>
-        </div>
-        <div class="chart-container">
-            <canvas id="statsChart"></canvas>
-        </div>
+    <!-- 性能监控图表 -->
+    <div class="chart-container">
+        <h3>性能监控 - 实时</h3>
+        <canvas id="chart"></canvas>
     </div>
 
-    <!-- 活动连接 -->
-    <div class="section">
-        <div class="section-title">
-            👥 实时连接
-            <span class="badge badge-info" id="active-count">0</span>
+    <!-- 实时连接 -->
+    <div class="table-container">
+        <div class="table-header">
+            <h3>实时连接 <span class="table-badge" id="active-count">0</span></h3>
         </div>
-        <div class="log-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>客户端</th>
-                        <th>目标</th>
-                        <th>IPv6</th>
-                        <th>时长</th>
-                    </tr>
-                </thead>
-                <tbody id="active-table">
-                    <tr><td colspan="4" style="text-align:center;color:#64748b">无连接</td></tr>
-                </tbody>
-            </table>
-        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>客户端IP</th>
+                    <th>目标地址</th>
+                    <th>使用IPv6</th>
+                    <th>持续时间</th>
+                </tr>
+            </thead>
+            <tbody id="active-table">
+                <tr><td colspan="4" style="text-align:center; color:#6b7280;">暂无活跃连接</td></tr>
+            </tbody>
+        </table>
     </div>
 
-    <!-- 搜索 -->
-    <div class="section">
-        <div class="section-title">🔍 日志搜索</div>
-        <div class="input-group">
-            <input type="text" id="search-query" placeholder="搜索 IP、域名..." style="flex:1">
+    <!-- 日志搜索 -->
+    <div class="search-container">
+        <h3>日志搜索</h3>
+        <div class="search-box">
+            <input type="text" id="search-query" placeholder="输入目标地址、IP等关键词...">
             <button onclick="searchLogs()">搜索</button>
-            <button onclick="clearSearch()">清除</button>
-            <span id="search-results-count"></span>
-        </div>
-        <div class="log-container" id="search-results-container" style="display:none">
-            <table>
-                <thead>
-                    <tr>
-                        <th>时间</th>
-                        <th>客户端</th>
-                        <th>目标</th>
-                        <th>IPv6</th>
-                        <th>状态</th>
-                        <th>耗时</th>
-                    </tr>
-                </thead>
-                <tbody id="search-results-table"></tbody>
-            </table>
+            <button onclick="clearSearch()" class="button-secondary" style="background:#374151;">清除</button>
         </div>
     </div>
 
     <!-- 最近连接 -->
-    <div class="section">
-        <div class="section-title">📝 最近连接</div>
-        <div class="log-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>时间</th>
-                        <th>客户端</th>
-                        <th>目标</th>
-                        <th>IPv6</th>
-                        <th>状态</th>
-                        <th>耗时</th>
-                    </tr>
-                </thead>
-                <tbody id="logs-table">
-                    <tr><td colspan="6" style="text-align:center;color:#64748b">等待...</td></tr>
-                </tbody>
-            </table>
+    <div class="table-container">
+        <div class="table-header">
+            <h3>最近连接</h3>
         </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>客户端IP</th>
+                    <th>目标地址</th>
+                    <th>使用IPv6</th>
+                    <th>状态</th>
+                    <th>耗时</th>
+                </tr>
+            </thead>
+            <tbody id="logs-table">
+                <tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无连接记录</td></tr>
+            </tbody>
+        </table>
     </div>
+</div>
 
-    <!-- 失败日志 -->
-    <div class="section">
-        <div class="section-title">❌ 失败日志</div>
-        <div class="log-container">
-            <table>
-                <thead>
-                    <tr>
-                        <th>时间</th>
-                        <th>客户端</th>
-                        <th>目标</th>
-                        <th>IPv6</th>
-                        <th>状态</th>
-                        <th>耗时</th>
-                    </tr>
-                </thead>
-                <tbody id="fail-logs-table">
-                    <tr><td colspan="6" style="text-align:center;color:#64748b">无失败</td></tr>
-                </tbody>
-            </table>
+<!-- 添加前缀弹窗 -->
+<div id="addPrefixModal" class="modal">
+    <div class="modal-content">
+        <span class="close" onclick="closeAddPrefixModal()">&times;</span>
+        <h2>➕ 添加新前缀</h2>
+        
+        <div style="margin-bottom: 20px;">
+            <button class="button button-primary" onclick="detectPrefixes()">🔍 自动检测可用前缀</button>
         </div>
+        
+        <div id="detected-prefixes-list" style="display:none;">
+            <h3 style="font-size:14px; margin-bottom:10px;">检测到的可用前缀:</h3>
+            <div id="detected-prefixes-content" class="detected-list"></div>
+        </div>
+        
+        <div class="form-group">
+            <label>或手动输入 IPv6前缀 (CIDR格式):</label>
+            <input type="text" id="new-prefix" placeholder="例如: 2001:db8:1234::/64">
+            <div class="info-text">格式: 前缀地址/前缀长度（如 2001:db8::/64）</div>
+        </div>
+        <button class="button button-primary" onclick="saveAddPrefix()">添加</button>
+        <button class="button button-secondary" onclick="closeAddPrefixModal()">取消</button>
+        <p id="add-prefix-status" style="margin-top:15px;color:#10b981;"></p>
     </div>
 </div>
 
 <!-- 端口列表弹窗 -->
 <div id="portListModal" class="modal">
-    <div class="modal-content" style="max-width:800px">
-        <div class="modal-header">
-            <h2 class="modal-title">📋 端口列表</h2>
-            <span class="modal-close" onclick="closePortListModal()">&times;</span>
-        </div>
-        <div class="modal-body">
-            <div class="log-container" style="max-height:500px">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>端口</th>
-                            <th>用户名</th>
-                            <th>状态</th>
-                            <th>类型</th>
-                            <th>创建时间</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="port-list-table">
-                        <tr><td colspan="6" style="text-align:center;color:#64748b">加载中...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closePortListModal()">关闭</button>
-        </div>
+    <div class="modal-content">
+        <span class="close" onclick="closePortListModal()">&times;</span>
+        <h2>🔌 端口列表</h2>
+        <div id="port-list-content"></div>
     </div>
 </div>
 
-<!-- 新增端口弹窗 -->
+<!-- 添加端口弹窗 -->
 <div id="addPortModal" class="modal">
     <div class="modal-content">
-        <div class="modal-header">
-            <h2 class="modal-title">➕ 新增端口</h2>
-            <span class="modal-close" onclick="closeAddPortModal()">&times;</span>
+        <span class="close" onclick="closeAddPortModal()">&times;</span>
+        <h2>➕ 添加端口</h2>
+        <div class="form-group">
+            <label>端口号</label>
+            <input type="number" id="add-port-number" min="1024" max="65535" placeholder="1024-65535">
         </div>
-        <div class="modal-body">
-            <label class="modal-label">端口号</label>
-            <input type="number" id="add-port-number" class="modal-input" placeholder="例如: 1081" min="1" max="65535">
-            
-            <label class="modal-label">用户名</label>
-            <input type="text" id="add-port-username" class="modal-input" placeholder="输入用户名">
-            
-            <label class="modal-label">密码</label>
-            <input type="password" id="add-port-password" class="modal-input" placeholder="输入密码">
-            
-            <div id="add-port-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+        <div class="form-group">
+            <label>用户名</label>
+            <input type="text" id="add-port-username" placeholder="用户名">
         </div>
-        <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closeAddPortModal()">取消</button>
-            <button class="modal-btn modal-btn-primary" onclick="saveAddPort()">添加</button>
+        <div class="form-group">
+            <label>密码</label>
+            <input type="password" id="add-port-password" placeholder="密码">
         </div>
+        <button class="button button-primary" onclick="saveAddPort()">添加</button>
+        <button class="button button-secondary" onclick="closeAddPortModal()">取消</button>
+        <p id="add-status" style="margin-top:15px;color:#10b981;"></p>
     </div>
 </div>
 
-<!-- 批量新增端口弹窗 -->
+<!-- 批量添加端口弹窗 -->
 <div id="batchAddPortModal" class="modal">
     <div class="modal-content">
-        <div class="modal-header">
-            <h2 class="modal-title">📦 批量新增端口</h2>
-            <span class="modal-close" onclick="closeBatchAddPortModal()">&times;</span>
+        <span class="close" onclick="closeBatchAddPortModal()">&times;</span>
+        <h2>📦 批量添加端口</h2>
+        <div class="form-group">
+            <label>起始端口</label>
+            <input type="number" id="batch-start-port" min="1024" max="65535">
         </div>
-        <div class="modal-body">
-            <label class="modal-label">起始端口</label>
-            <input type="number" id="batch-start-port" class="modal-input" placeholder="例如: 10000" min="1" max="65535">
-            
-            <label class="modal-label">结束端口</label>
-            <input type="number" id="batch-end-port" class="modal-input" placeholder="例如: 10100" min="1" max="65535">
-            
-            <label class="modal-label">用户名（统一）</label>
-            <input type="text" id="batch-username" class="modal-input" placeholder="所有端口使用相同用户名">
-            
-            <label class="modal-label">密码（统一）</label>
-            <input type="password" id="batch-password" class="modal-input" placeholder="所有端口使用相同密码">
-            
-            <div style="color:var(--warning);font-size:12px;margin-top:10px;padding:10px;background:rgba(245,158,11,0.1);border-radius:6px">
-                ⚠️ 一次最多添加100个端口
-            </div>
-            
-            <div id="batch-add-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+        <div class="form-group">
+            <label>结束端口</label>
+            <input type="number" id="batch-end-port" min="1024" max="65535">
         </div>
-        <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closeBatchAddPortModal()">取消</button>
-            <button class="modal-btn modal-btn-primary" onclick="saveBatchAddPort()">批量添加</button>
+        <div class="form-group">
+            <label>用户名 (所有端口共用)</label>
+            <input type="text" id="batch-username">
         </div>
+        <div class="form-group">
+            <label>密码 (所有端口共用)</label>
+            <input type="password" id="batch-password">
+        </div>
+        <button class="button button-primary" onclick="saveBatchAddPort()">批量添加</button>
+        <button class="button button-secondary" onclick="closeBatchAddPortModal()">取消</button>
+        <p id="batch-add-status" style="margin-top:15px;color:#10b981;"></p>
     </div>
 </div>
 
-<!-- 修改端口信息弹窗 -->
+<!-- 编辑端口弹窗 -->
 <div id="editPortModal" class="modal">
     <div class="modal-content">
-        <div class="modal-header">
-            <h2 class="modal-title">✏️ 修改端口信息</h2>
-            <span class="modal-close" onclick="closeEditPortModal()">&times;</span>
+        <span class="close" onclick="closeEditPortModal()">&times;</span>
+        <h2>✏️ 修改端口</h2>
+        <div class="form-group">
+            <label>端口号</label>
+            <input type="text" id="edit-port-number" readonly style="background:#1a1f2e;">
         </div>
-        <div class="modal-body">
-            <label class="modal-label">端口号</label>
-            <input type="text" id="edit-port-number" class="modal-input" readonly style="background:var(--bg-primary)">
-            
-            <label class="modal-label">用户名</label>
-            <input type="text" id="edit-port-username" class="modal-input" placeholder="输入新用户名">
-            
-            <label class="modal-label">密码</label>
-            <input type="password" id="edit-port-password" class="modal-input" placeholder="输入新密码">
-            
-            <div id="edit-port-status" style="color:var(--success);margin-top:10px;font-size:13px"></div>
+        <div class="form-group">
+            <label>用户名</label>
+            <input type="text" id="edit-port-username">
         </div>
-        <div class="modal-footer">
-            <button class="modal-btn modal-btn-secondary" onclick="closeEditPortModal()">取消</button>
-            <button class="modal-btn modal-btn-primary" onclick="saveEditPort()">保存修改</button>
+        <div class="form-group">
+            <label>密码</label>
+            <input type="password" id="edit-port-password">
         </div>
+        <button class="button button-primary" onclick="saveEditPort()">保存</button>
+        <button class="button button-secondary" onclick="closeEditPortModal()">取消</button>
+        <p id="edit-port-status" style="margin-top:15px;color:#10b981;"></p>
     </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
-let statsChart;
+let chart;
+let searchFilter = '';
+
+async function updateStats() {
+    try {
+        const stats = await fetch('/api/stats').then(r => r.json());
+        document.getElementById('total-conns').textContent = stats.total_conns.toLocaleString();
+        document.getElementById('success-conns').textContent = stats.success_conns.toLocaleString();
+        document.getElementById('qps').textContent = parseFloat(stats.qps).toFixed(2);
+        document.getElementById('success-count').textContent = stats.success_conns.toLocaleString();
+        document.getElementById('fail-count').textContent = stats.failed_conns.toLocaleString();
+        document.getElementById('process-cpu').textContent = stats.process_cpu.toFixed(1) + ' %';
+        document.getElementById('system-cpu').textContent = stats.system_cpu.toFixed(1) + ' %';
+        document.getElementById('avg-duration').textContent = stats.avg_duration_ms + ' ms';
+        document.getElementById('pool-size').textContent = stats.pool_size.toLocaleString();
+        document.getElementById('pool-target').textContent = stats.target_pool.toLocaleString();
+        
+        const poolPercent = stats.target_pool > 0 ? (stats.pool_size / stats.target_pool * 100) : 0;
+        document.getElementById('pool-progress').style.width = Math.min(poolPercent, 100) + '%';
+        
+        document.getElementById('uptime').textContent = stats.uptime_str;
+        document.getElementById('recv-rate').textContent = (stats.recv_rate_mbps * 1024).toFixed(2);
+        document.getElementById('send-rate').textContent = (stats.send_rate_mbps * 1024).toFixed(2);
+        document.getElementById('total-recv').textContent = stats.total_recv_mb.toFixed(2);
+        document.getElementById('total-sent').textContent = stats.total_sent_mb.toFixed(2);
+        
+        if (stats.current_prefix) {
+            document.getElementById('current-prefix').textContent = `#${stats.prefix_index}: ${stats.current_prefix}`;
+        }
+        document.getElementById('total-prefixes').textContent = stats.total_prefixes || 0;
+    } catch (e) {
+        console.error('Failed to update stats:', e);
+    }
+}
+
+async function updateActiveConns() {
+    try {
+        const conns = await fetch('/api/active').then(r => r.json());
+        const tbody = document.getElementById('active-table');
+        document.getElementById('active-count').textContent = conns.length;
+        
+        if (conns.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:#6b7280;">暂无活跃连接</td></tr>';
+            return;
+        }
+        
+        tbody.innerHTML = conns.map(conn => `
+            <tr>
+                <td>${conn.client_ip}</td>
+                <td>${conn.target}</td>
+                <td>${conn.ipv6}</td>
+                <td>${conn.duration}</td>
+            </tr>
+        `).join('');
+    } catch (e) {}
+}
+
+async function updateLogs() {
+    try {
+        const logs = await fetch('/api/logs').then(r => r.json());
+        const tbody = document.getElementById('logs-table');
+        
+        const filtered = searchFilter ? 
+            logs.filter(log => 
+                log.target.toLowerCase().includes(searchFilter.toLowerCase()) ||
+                log.client_ip.includes(searchFilter) ||
+                log.ipv6.includes(searchFilter)
+            ) : logs;
+        
+        if (filtered.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无连接记录</td></tr>';
+            return;
+        }
+        
+        tbody.innerHTML = filtered.slice(0, 50).map(log => `
+            <tr>
+                <td>${log.time}</td>
+                <td>${log.client_ip}</td>
+                <td>${log.target}</td>
+                <td>${log.ipv6}</td>
+                <td class="status-success">${log.status}</td>
+                <td>${log.duration}</td>
+            </tr>
+        `).join('');
+    } catch (e) {}
+}
+
+function searchLogs() {
+    searchFilter = document.getElementById('search-query').value;
+    updateLogs();
+}
+
+function clearSearch() {
+    searchFilter = '';
+    document.getElementById('search-query').value = '';
+    updateLogs();
+}
+
+async function updateChart() {
+    try {
+        const data = await fetch('/api/chart').then(r => r.json());
+        if (!chart) return;
+        
+        chart.data.labels = data.map(d => d.timestamp);
+        chart.data.datasets[0].data = data.map(d => d.qps);
+        chart.data.datasets[1].data = data.map(d => d.success_rate);
+        chart.data.datasets[2].data = data.map(d => d.active_conns);
+        chart.update('none');
+    } catch (e) {}
+}
+
 function initChart() {
-    const ctx = document.getElementById('statsChart').getContext('2d');
-    statsChart = new Chart(ctx, {
+    const ctx = document.getElementById('chart').getContext('2d');
+    chart = new Chart(ctx, {
         type: 'line',
         data: {
             labels: [],
             datasets: [
-                {label: 'QPS', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', yAxisID: 'y', tension: 0.4, borderWidth: 2},
-                {label: '成功率%', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16, 185, 129, 0.1)', yAxisID: 'y1', tension: 0.4, borderWidth: 2},
-                {label: 'CPU%', data: [], borderColor: '#f59e0b', backgroundColor: 'rgba(245, 158, 11, 0.1)', yAxisID: 'y1', tension: 0.4, borderWidth: 2}
+                {
+                    label: 'QPS',
+                    data: [],
+                    borderColor: '#3b82f6',
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    yAxisID: 'y',
+                    tension: 0.4,
+                },
+                {
+                    label: '成功率 (%)',
+                    data: [],
+                    borderColor: '#10b981',
+                    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                    yAxisID: 'y1',
+                    tension: 0.4,
+                },
+                {
+                    label: '活跃连接',
+                    data: [],
+                    borderColor: '#f59e0b',
+                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                    yAxisID: 'y2',
+                    tension: 0.4,
+                }
             ]
         },
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
             plugins: {
-                legend: {
-                    labels: {
-                        color: '#94a3b8',
-                        padding: 15,
-                        font: {size: 12}
-                    }
-                },
-                grid: {
-                    color: '#2d3748'
+                legend: { 
+                    display: true, 
+                    position: 'top',
+                    labels: { color: '#9ca3af', font: { size: 11 } }
                 }
             },
             scales: {
                 x: {
-                    ticks: {color: '#64748b', font: {size: 11}},
-                    grid: {color: '#2d3748', drawOnChartArea: true}
+                    ticks: { color: '#6b7280', font: { size: 10 } },
+                    grid: { color: '#2d3748' }
                 },
-                y: {
-                    type: 'linear',
+                y: { 
+                    type: 'linear', 
+                    display: true, 
                     position: 'left',
-                    ticks: {color: '#64748b', font: {size: 11}},
-                    grid: {color: '#2d3748'}
+                    ticks: { color: '#3b82f6' },
+                    grid: { color: '#2d3748' }
                 },
-                y1: {
-                    type: 'linear',
+                y1: { 
+                    type: 'linear', 
+                    display: true, 
                     position: 'right',
-                    ticks: {color: '#64748b', font: {size: 11}},
-                    grid: {display: false}
+                    ticks: { color: '#10b981' },
+                    grid: { drawOnChartArea: false }
+                },
+                y2: { 
+                    type: 'linear', 
+                    display: false
                 }
             }
         }
     });
 }
 
-async function updateStats() {
+async function rotatePool() {
+    if (!confirm('确定要轮换IP池吗？')) return;
     try {
-        const d = await fetch('/api/stats').then(r => r.json());
-        document.getElementById('active').textContent = d.active;
-        document.getElementById('total').textContent = d.total;
-        document.getElementById('qps').textContent = d.qps.toFixed(2);
-        document.getElementById('success').textContent = d.success;
-        document.getElementById('failed').textContent = d.failed;
-        document.getElementById('timeout').textContent = d.timeout;
-        document.getElementById('process-cpu').textContent = d.process_cpu.toFixed(1) + ' %';
-        document.getElementById('system-cpu').textContent = d.system_cpu.toFixed(1) + ' %';
-        document.getElementById('avg-duration').textContent = d.avg_duration.toFixed(0) + ' ms';
-        document.getElementById('pool-size').textContent = d.pool;
-        document.getElementById('pool-target').textContent = d.target;
-        document.getElementById('pool-progress').style.width = d.progress.toFixed(1) + '%';
-        document.getElementById('uptime').textContent = d.uptime;
-        document.getElementById('pool-status').innerHTML = d.bg_running ? '<span class="badge badge-info">运行中</span>' : '<span class="badge badge-success">就绪</span>';
-        
-        // 更新流量监控
-        if (d.current_recv_rate !== undefined && d.current_send_rate !== undefined) {
-            const recvKB = (d.current_recv_rate / 1024).toFixed(2);
-            const sendKB = (d.current_send_rate / 1024).toFixed(2);
-            const totalKB = ((d.current_recv_rate + d.current_send_rate) / 1024).toFixed(2);
-            
-            document.getElementById('realtime-rate').textContent = totalKB + ' KB/s';
-            document.getElementById('recv-rate').textContent = recvKB + ' KB/s';
-            document.getElementById('send-rate').textContent = sendKB + ' KB/s';
-        }
-        
-        if (d.total_bytes_recv !== undefined && d.total_bytes_sent !== undefined) {
-            const totalGB = ((d.total_bytes_recv + d.total_bytes_sent) / 1024 / 1024 / 1024).toFixed(2);
-            document.getElementById('total-traffic').textContent = totalGB + ' GB';
-        }
-        
-        // 更新当前端口显示
-        if (d.current_port) {
-            document.getElementById('current-port-display').textContent = d.current_port;
-        }
-        
-        if (d.auto_rotate) {
-            document.getElementById('auto-rotate-enabled').checked = true;
-            document.getElementById('auto-rotate-hours').value = d.rotate_interval;
-            document.getElementById('next-rotate-info').innerHTML = `⏰ 下次: <strong>${d.next_rotate}</strong>`;
-        }
-        
-        if (d.auto_clean !== undefined) {
-            document.getElementById('auto-clean-enabled').checked = d.auto_clean;
-        }
-    } catch (e) {}
+        const r = await fetch('/api/rotate', { method: 'POST' }).then(r => r.json());
+        alert(r.message);
+        updateStats();
+    } catch (e) {
+        alert('轮换失败');
+    }
 }
 
-async function updateChart() {
-    try {
-        const h = await fetch('/api/history').then(r => r.json());
-        if (h.length === 0) return;
-        statsChart.data.labels = h.map(x => x.timestamp);
-        statsChart.data.datasets[0].data = h.map(x => x.qps);
-        statsChart.data.datasets[1].data = h.map(x => x.success_rate);
-        statsChart.data.datasets[2].data = h.map(x => x.process_cpu);
-        statsChart.update('none');
-    } catch (e) {}
-}
-
-function renderLogTable(tid, logs, msg) {
-    const t = document.getElementById(tid);
-    if (!logs || logs.length === 0) {
-        t.innerHTML = `<tr><td colspan="6" style="text-align:center;color:#64748b">${msg}</td></tr>`;
+async function updateTargetPool() {
+    const target = parseInt(document.getElementById('target-pool').value);
+    if (!target || target < 100) {
+        alert('目标池大小必须 ≥ 100');
         return;
     }
-    t.innerHTML = logs.map(l => {
-        let c = l.status.includes('✅') ? 'status-success' : l.status.includes('⏱') ? 'status-timeout' : 'status-fail';
-        return `<tr><td>${l.time}</td><td>${l.client_ip}</td><td>${l.target}</td><td>${l.ipv6}</td><td class="${c}">${l.status}</td><td>${l.duration}</td></tr>`;
-    }).join('');
+    // 这里需要添加API接口来更新目标池大小
+    alert('目标池更新功能待实现');
 }
 
-async function updateLogs() {
-    try {
-        const logs = await fetch('/api/logs').then(r => r.json());
-        renderLogTable('logs-table', logs, '等待...');
-    } catch (e) {}
-}
-
-async function updateFailLogs() {
-    try {
-        const logs = await fetch('/api/faillogs').then(r => r.json());
-        renderLogTable('fail-logs-table', logs, '无失败');
-    } catch (e) {}
-}
-
-async function updateActiveConns() {
-    try {
-        const conns = await fetch('/api/active').then(r => r.json());
-        document.getElementById('active-count').textContent = conns.length;
-        const t = document.getElementById('active-table');
-        if (conns.length === 0) {
-            t.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#64748b">无连接</td></tr>';
-            return;
-        }
-        t.innerHTML = conns.map(c => `<tr><td>${c.client_ip}</td><td>${c.target}</td><td>${c.ipv6}</td><td>${c.duration}</td></tr>`).join('');
-    } catch (e) {}
-}
-
-async function searchLogs() {
-    const q = document.getElementById('search-query').value.trim();
-    if (!q) {alert('请输入关键词'); return;}
-    try {
-        const r = await fetch(`/api/search?q=${encodeURIComponent(q)}`).then(r => r.json());
-        document.getElementById('search-results-count').textContent = `找到 ${r.length} 条`;
-        document.getElementById('search-results-container').style.display = 'block';
-        renderLogTable('search-results-table', r, '未找到');
-    } catch (e) {alert('搜索失败');}
-}
-
-function clearSearch() {
-    document.getElementById('search-query').value = '';
-    document.getElementById('search-results-count').textContent = '';
-    document.getElementById('search-results-container').style.display = 'none';
-}
-
-async function saveConfig() {
-    const cfg = {
-        port: document.getElementById('cfg-port').value || '1080',
-        web_port: document.getElementById('cfg-web-port').value || '8080',
-        username: document.getElementById('cfg-username').value || 'proxy',
-        password: document.getElementById('cfg-password').value || ''
-    };
-    try {
-        const r = await fetch('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg)}).then(r => r.json());
-        document.getElementById('config-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
-        setTimeout(() => {document.getElementById('config-status').textContent = '';}, 5000);
-    } catch (e) {alert('失败');}
-}
-
-async function saveAutoRotate() {
+async function saveAutoRotateSettings() {
     const enabled = document.getElementById('auto-rotate-enabled').checked;
-    const hours = parseInt(document.getElementById('auto-rotate-hours').value) || 6;
-    try {
-        const r = await fetch('/api/autorotate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled, interval: hours})}).then(r => r.json());
-        document.getElementById('auto-rotate-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
-        setTimeout(() => {document.getElementById('auto-rotate-status').textContent = ''; updateStats();}, 2000);
-    } catch (e) {alert('失败');}
-}
-
-async function saveAutoClean() {
-    const enabled = document.getElementById('auto-clean-enabled').checked;
-    try {
-        const r = await fetch('/api/autoclean', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled})}).then(r => r.json());
-        document.getElementById('auto-clean-status').innerHTML = '<span class="badge badge-success">✅ ' + r.message + '</span>';
-        setTimeout(() => {document.getElementById('auto-clean-status').textContent = ''; updateStats();}, 2000);
-    } catch (e) {alert('失败');}
-}
-
-async function resizePool() {
-    const target = parseInt(document.getElementById('new-target').value);
-    if (!target || target < 100) {alert('无效值'); return;}
-    try {
-        const r = await fetch('/api/pool/resize', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({target})}).then(r => r.json());
-        alert(r.message);
-        updateStats();
-    } catch (e) {alert('失败');}
-}
-
-async function rotateIPs() {
-    if (!confirm('确定轮换?')) return;
-    try {
-        const r = await fetch('/api/rotate', {method: 'POST'}).then(r => r.json());
-        alert(r.message);
-        updateStats();
-    } catch (e) {alert('失败');}
-}
-
-// 端口管理弹窗函数
-async function showPortList() {
-    const modal = document.getElementById('portListModal');
-    modal.style.display = 'block';
+    const hours = parseInt(document.getElementById('rotate-interval').value);
+    
+    if (!hours || hours < 1 || hours > 168) {
+        alert('请输入有效的小时数 (1-168)');
+        return;
+    }
     
     try {
-        const ports = await fetch('/api/ports').then(r => r.json());
-        const tbody = document.getElementById('port-list-table');
+        const r = await fetch('/api/autorotate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled, hours})
+        }).then(r => r.json());
         
-        if (!ports || ports.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b">暂无端口</td></tr>';
+        alert(enabled ? '已启用自动轮换' : '已关闭自动轮换');
+    } catch (e) {
+        alert('保存失败');
+    }
+}
+
+async function loadPrefixes() {
+    try {
+        const status = await fetch('/api/prefixes').then(r => r.json());
+        
+        document.getElementById('auto-switch-enabled').checked = status.auto_switch_enabled;
+        document.getElementById('switch-interval').value = status.switch_interval_hours;
+        
+        if (status.auto_switch_enabled && status.seconds_until_switch > 0) {
+            document.getElementById('countdown-display').style.display = 'block';
+            document.getElementById('next-switch-time').textContent = status.next_switch_time;
+            document.getElementById('seconds-until-switch').textContent = status.seconds_until_switch;
+        } else {
+            document.getElementById('countdown-display').style.display = 'none';
+        }
+        
+        const listDiv = document.getElementById('prefix-list');
+        if (status.prefixes.length === 0) {
+            listDiv.innerHTML = '<p style="text-align:center; color:#6b7280;">暂无前缀配置</p>';
             return;
         }
         
-        tbody.innerHTML = ports.map(p => {
-            const statusBadge = p.enabled ? 
-                '<span style="color:var(--success)">✓ 启用</span>' : 
-                '<span style="color:var(--text-muted)">✗ 禁用</span>';
-            const typeBadge = p.is_primary ? 
-                '<span class="badge badge-info">主端口</span>' : 
-                '<span class="badge badge-success">次端口</span>';
-            const actions = p.is_primary ? 
-                `<button onclick="editPort('${p.port}')" class="compact-btn" style="padding:4px 8px;font-size:12px">✏️ 编辑</button>` :
-                `<button onclick="editPort('${p.port}')" class="compact-btn" style="padding:4px 8px;font-size:12px">✏️ 编辑</button>
-                 <button onclick="deletePort('${p.port}')" class="compact-btn warning" style="padding:4px 8px;font-size:12px;margin-left:4px">🗑️ 删除</button>`;
+        listDiv.innerHTML = status.prefixes.map(prefix => {
+            const activeClass = prefix.is_active ? 'active' : '';
+            const badge = prefix.is_active ? 
+                '<span class="prefix-badge badge-active">✓ 当前</span>' : '';
             
-            return `<tr>
-                <td><strong>${p.port}</strong></td>
-                <td>${p.username}</td>
-                <td>${statusBadge}</td>
-                <td>${typeBadge}</td>
-                <td>${p.created}</td>
-                <td>${actions}</td>
-            </tr>`;
+            const actions = prefix.is_active ?
+                `<button class="btn-sm" disabled>使用中</button>` :
+                `<button class="btn-sm btn-switch" onclick="switchPrefix(${prefix.index})">切换</button>
+                 <button class="btn-sm btn-delete" onclick="deletePrefix(${prefix.index})">删除</button>`;
+            
+            return `
+                <div class="prefix-item ${activeClass}">
+                    <div>
+                        <div class="prefix-title">${badge} 前缀 #${prefix.index}</div>
+                        <div class="prefix-meta">${prefix.prefix}</div>
+                    </div>
+                    <div class="prefix-actions">${actions}</div>
+                </div>
+            `;
         }).join('');
         
-        // 更新总端口数
-        document.getElementById('total-ports-display').textContent = ports.length;
     } catch (e) {
-        alert('加载端口列表失败');
+        console.error('加载前缀失败:', e);
     }
+}
+
+async function switchPrefix(index) {
+    if (!confirm(`确定要切换到前缀 #${index} 吗？`)) return;
+    
+    try {
+        const r = await fetch('/api/prefixes/switch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({index})
+        }).then(r => r.json());
+        
+        alert(r.message);
+        loadPrefixes();
+        updateStats();
+    } catch (e) {
+        alert('切换失败');
+    }
+}
+
+async function deletePrefix(index) {
+    if (!confirm(`确定要删除前缀 #${index} 吗？`)) return;
+    
+    try {
+        const r = await fetch('/api/prefixes/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({index})
+        }).then(r => r.json());
+        
+        alert(r.message);
+        loadPrefixes();
+    } catch (e) {
+        alert('删除失败');
+    }
+}
+
+function showAddPrefixModal() {
+    const modal = document.getElementById('addPrefixModal');
+    document.getElementById('new-prefix').value = '';
+    document.getElementById('add-prefix-status').textContent = '';
+    document.getElementById('detected-prefixes-list').style.display = 'none';
+    modal.style.display = 'block';
+}
+
+function closeAddPrefixModal() {
+    document.getElementById('addPrefixModal').style.display = 'none';
+}
+
+async function detectPrefixes() {
+    try {
+        const result = await fetch('/api/prefixes/detect').then(r => r.json());
+        const listDiv = document.getElementById('detected-prefixes-list');
+        const contentDiv = document.getElementById('detected-prefixes-content');
+        
+        if (result.available.length === 0) {
+            contentDiv.innerHTML = '<p style="text-align:center; color:#6b7280; padding:20px;">未检测到新的可用前缀</p>';
+            listDiv.style.display = 'block';
+            return;
+        }
+        
+        contentDiv.innerHTML = result.available.map(p => `
+            <div class="detected-item">
+                <div class="detected-info">
+                    <strong>${p.Prefix}</strong><br>
+                    <small>📡 ${p.Interface} | 示例: ${p.SampleIP} | 长度: /${p.PrefixLen}</small>
+                </div>
+                <button class="btn-sm btn-switch" onclick="addDetectedPrefix('${p.Prefix}')">添加</button>
+            </div>
+        `).join('');
+        
+        listDiv.style.display = 'block';
+    } catch (e) {
+        alert('检测失败');
+    }
+}
+
+async function addDetectedPrefix(prefix) {
+    try {
+        const r = await fetch('/api/prefixes/add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({prefix})
+        }).then(r => r.json());
+        
+        alert(r.message);
+        closeAddPrefixModal();
+        loadPrefixes();
+    } catch (e) {
+        alert('添加失败');
+    }
+}
+
+async function saveAddPrefix() {
+    const prefix = document.getElementById('new-prefix').value.trim();
+    
+    if (!prefix) {
+        alert('请输入IPv6前缀');
+        return;
+    }
+    
+    try {
+        const r = await fetch('/api/prefixes/add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({prefix})
+        }).then(r => r.json());
+        
+        document.getElementById('add-prefix-status').textContent = '✅ ' + r.message;
+        setTimeout(() => {
+            closeAddPrefixModal();
+            loadPrefixes();
+        }, 1500);
+    } catch (e) {
+        alert('添加失败');
+    }
+}
+
+async function toggleAutoSwitch() {
+    const enabled = document.getElementById('auto-switch-enabled').checked;
+    const hours = parseInt(document.getElementById('switch-interval').value) || 24;
+    
+    try {
+        const r = await fetch('/api/prefixes/auto-switch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled, hours})
+        }).then(r => r.json());
+        
+        alert(enabled ? '已启用自动切换' : '已关闭自动切换');
+        loadPrefixes();
+    } catch (e) {
+        alert('设置失败');
+        document.getElementById('auto-switch-enabled').checked = !enabled;
+    }
+}
+
+async function saveAutoSwitchSettings() {
+    const enabled = document.getElementById('auto-switch-enabled').checked;
+    const hours = parseInt(document.getElementById('switch-interval').value);
+    
+    if (!hours || hours < 1 || hours > 168) {
+        alert('请输入有效的小时数 (1-168)');
+        return;
+    }
+    
+    try {
+        const r = await fetch('/api/prefixes/auto-switch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({enabled, hours})
+        }).then(r => r.json());
+        
+        alert('设置已保存');
+        loadPrefixes();
+    } catch (e) {
+        alert('保存失败');
+    }
+}
+
+async function quickAddPort() {
+    const port = document.getElementById('quick-port').value;
+    const username = document.getElementById('quick-username').value;
+    const password = document.getElementById('quick-password').value;
+    
+    if (!port || !username || !password) {
+        alert('请填写所有字段');
+        return;
+    }
+    
+    try {
+        const r = await fetch('/api/ports/add', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({port, username, password})
+        }).then(r => r.json());
+        
+        alert(r.message);
+        document.getElementById('quick-port').value = '';
+        document.getElementById('quick-username').value = '';
+        document.getElementById('quick-password').value = '';
+        updatePortCount();
+    } catch (e) {
+        alert('添加失败');
+    }
+}
+
+function showPortList() {
+    fetch('/api/ports')
+        .then(r => r.json())
+        .then(ports => {
+            const modal = document.getElementById('portListModal');
+            const content = document.getElementById('port-list-content');
+            
+            if (ports.length === 0) {
+                content.innerHTML = '<p style="text-align:center; color:#6b7280; padding:20px;">暂无额外端口</p>';
+            } else {
+                content.innerHTML = ports.map(p => `
+                    <div class="detected-item">
+                        <div class="detected-info">
+                            <strong>端口 ${p.port}</strong><br>
+                            <small>用户: ${p.username}</small>
+                        </div>
+                        <div style="display:flex; gap:8px;">
+                            <button class="btn-sm btn-switch" onclick="editPort('${p.port}')">编辑</button>
+                            <button class="btn-sm btn-delete" onclick="deletePort('${p.port}')">删除</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+            
+            modal.style.display = 'block';
+        });
 }
 
 function closePortListModal() {
@@ -3170,7 +3647,7 @@ function showAddPort() {
     document.getElementById('add-port-number').value = '';
     document.getElementById('add-port-username').value = '';
     document.getElementById('add-port-password').value = '';
-    document.getElementById('add-port-status').textContent = '';
+    document.getElementById('add-status').textContent = '';
     modal.style.display = 'block';
 }
 
@@ -3195,10 +3672,10 @@ async function saveAddPort() {
             body: JSON.stringify({port, username, password})
         }).then(r => r.json());
         
-        document.getElementById('add-port-status').textContent = '✅ ' + r.message;
+        document.getElementById('add-status').textContent = '✅ ' + r.message;
         setTimeout(() => {
             closeAddPortModal();
-            showPortList(); // 刷新列表
+            updatePortCount();
         }, 1500);
     } catch (e) {
         alert('添加失败');
@@ -3250,7 +3727,7 @@ async function saveBatchAddPort() {
         document.getElementById('batch-add-status').textContent = '✅ ' + r.message;
         setTimeout(() => {
             closeBatchAddPortModal();
-            showPortList(); // 刷新列表
+            updatePortCount();
         }, 2000);
     } catch (e) {
         alert('批量添加失败');
@@ -3262,7 +3739,6 @@ function editPort(port) {
     document.getElementById('edit-port-number').value = port;
     document.getElementById('edit-port-status').textContent = '';
     
-    // 获取当前端口信息
     fetch('/api/ports')
         .then(r => r.json())
         .then(ports => {
@@ -3300,7 +3776,6 @@ async function saveEditPort() {
         document.getElementById('edit-port-status').textContent = '✅ ' + r.message;
         setTimeout(() => {
             closeEditPortModal();
-            showPortList(); // 刷新列表
         }, 1500);
     } catch (e) {
         alert('保存失败');
@@ -3308,9 +3783,7 @@ async function saveEditPort() {
 }
 
 async function deletePort(port) {
-    if (!confirm(`确定要删除端口 ${port} 吗？`)) {
-        return;
-    }
+    if (!confirm(`确定要删除端口 ${port} 吗？`)) return;
     
     try {
         const r = await fetch('/api/ports/delete', {
@@ -3320,23 +3793,22 @@ async function deletePort(port) {
         }).then(r => r.json());
         
         alert(r.message);
-        showPortList(); // 刷新列表
+        showPortList();
+        updatePortCount();
     } catch (e) {
         alert('删除失败');
     }
 }
 
-// 更新总端口数显示
 async function updatePortCount() {
     try {
         const ports = await fetch('/api/ports').then(r => r.json());
-        document.getElementById('total-ports-display').textContent = ports.length;
+        document.getElementById('total-ports').textContent = ports.length;
     } catch (e) {}
 }
 
-// 点击弹窗外部关闭
 window.onclick = function(event) {
-    const modals = ['portListModal', 'addPortModal', 'batchAddPortModal', 'editPortModal'];
+    const modals = ['addPrefixModal', 'portListModal', 'addPortModal', 'batchAddPortModal', 'editPortModal'];
     modals.forEach(modalId => {
         const modal = document.getElementById(modalId);
         if (event.target === modal) {
@@ -3353,15 +3825,15 @@ initChart();
 setInterval(updateStats, 3000);
 setInterval(updateChart, 5000);
 setInterval(updateLogs, 5000);
-setInterval(updateFailLogs, 5000);
 setInterval(updateActiveConns, 3000);
-setInterval(updatePortCount, 10000); // 每10秒更新一次端口数量
+setInterval(updatePortCount, 10000);
+setInterval(loadPrefixes, 10000);
 updateStats();
 updateChart();
 updateLogs();
-updateFailLogs();
 updateActiveConns();
-updatePortCount(); // 初始化时更新端口数量
+updatePortCount();
+loadPrefixes();
 </script>
 </body>
 </html>
@@ -3373,7 +3845,6 @@ echo ""
 # --- 步骤 5: 编译 ---
 echo "--- 步骤 5: 编译 ---"
 
-# 检测是否在中国，配置GOPROXY
 if ping -c 1 -W 1 goproxy.cn >/dev/null 2>&1; then
     export GOPROXY=https://goproxy.cn,direct
     echo "使用中国代理: goproxy.cn"
@@ -3409,7 +3880,7 @@ echo ""
 echo "--- 步骤 7: 创建服务 ---"
 cat << SERVICEEOF > /etc/systemd/system/ipv6-proxy.service
 [Unit]
-Description=IPv6 Proxy v7.4 Final
+Description=IPv6 Proxy v8.1 Multi-Prefix Auto-Detect
 After=network-online.target
 
 [Service]
@@ -3437,7 +3908,6 @@ echo "【首次配置】"
 echo "============================================="
 echo ""
 
-# 运行配置
 cd "$INSTALL_DIR"
 ./ipv6-proxy || true
 
@@ -3477,7 +3947,6 @@ echo "【启动服务】"
 systemctl enable ipv6-proxy >/dev/null 2>&1
 systemctl start ipv6-proxy
 
-# 检查服务状态
 sleep 2
 if systemctl is-active --quiet ipv6-proxy; then
     print_success "服务启动成功"
@@ -3488,7 +3957,7 @@ fi
 
 echo ""
 echo "================================================"
-echo "🎉 IPv6 代理 v7.4 Final 安装成功！"
+echo "🎉 IPv6 代理 v8.1 多前缀智能版 安装成功！"
 echo "================================================"
 echo ""
 echo "Web 面板: http://$(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${WEB_PORT}"
@@ -3499,6 +3968,14 @@ echo "代理地址: $(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${PROX
 echo "  用户: proxy"
 echo "  密码: proxy123"
 echo ""
+echo "🆕 v8.1 新功能:"
+echo "  ✅ 自动检测系统所有IPv6前缀"
+echo "  ✅ 智能选择和配置多前缀"
+echo "  ✅ Web界面一键检测可用前缀"
+echo "  ✅ 支持手动/自动切换前缀"
+echo "  ✅ 实时倒计时显示"
+echo "  ✅ 循环轮换所有配置的前缀"
+echo ""
 echo "管理命令:"
 echo "  systemctl status ipv6-proxy     # 查看状态"
 echo "  systemctl restart ipv6-proxy    # 重启服务"
@@ -3507,5 +3984,5 @@ echo "  journalctl -u ipv6-proxy -f     # 查看日志"
 echo ""
 echo "配置文件: $INSTALL_DIR/config.json"
 echo ""
-echo "🎊 享受你的 IPv6 代理服务！"
+echo "🎊 享受你的智能多前缀 IPv6 代理服务！"
 echo "================================================"
