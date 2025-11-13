@@ -194,6 +194,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,7 @@ type Config struct {
 	Username          string       `json:"username"`
 	Password          string       `json:"password"`
 	IPv6Prefix        string       `json:"ipv6_prefix"`
+	NextHopAddr       string       `json:"nexthop_addr"`  // BuyVM 路由子网的下一跳地址
 	Interface         string       `json:"interface"`
 	InitialPool       int          `json:"initial_pool"`
 	TargetPool        int          `json:"target_pool"`
@@ -405,29 +407,62 @@ func selectIPv6Prefix(iface netlink.Link) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	prefixMap := make(map[string]bool)
+	prefixMap := make(map[string]string) // value: 完整的CIDR格式
 	for _, addr := range addrs {
 		if addr.IPNet != nil && addr.IPNet.IP.IsGlobalUnicast() {
 			ones, bits := addr.IPNet.Mask.Size()
-			if bits == 128 && ones <= 64 {
-				ip64 := addr.IPNet.IP.Mask(net.CIDRMask(64, 128))
-				prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-					ip64[0], ip64[1], ip64[2], ip64[3], ip64[4], ip64[5], ip64[6], ip64[7])
-				prefixMap[prefixStr] = true
+			if bits == 128 {
+				// 支持 /48 和 /64
+				if ones == 48 {
+					ip48 := addr.IPNet.IP.Mask(net.CIDRMask(48, 128))
+					prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x",
+						ip48[0], ip48[1], ip48[2], ip48[3], ip48[4], ip48[5])
+					cidr := fmt.Sprintf("%s::/48", prefixStr)
+					prefixMap[cidr] = cidr
+				} else if ones == 64 {
+					ip64 := addr.IPNet.IP.Mask(net.CIDRMask(64, 128))
+					prefixStr := fmt.Sprintf("%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+						ip64[0], ip64[1], ip64[2], ip64[3], ip64[4], ip64[5], ip64[6], ip64[7])
+					cidr := fmt.Sprintf("%s::/64", prefixStr)
+					prefixMap[cidr] = cidr
+				} else if ones < 64 {
+					// 对于 /56 等其他前缀，使用实际掩码
+					ipPrefix := addr.IPNet.IP.Mask(net.CIDRMask(ones, 128))
+					parts := make([]string, ones/16)
+					for i := 0; i < ones/16; i++ {
+						parts[i] = fmt.Sprintf("%02x%02x", ipPrefix[i*2], ipPrefix[i*2+1])
+					}
+					cidr := fmt.Sprintf("%s::/%d", strings.Join(parts, ":"), ones)
+					prefixMap[cidr] = cidr
+				}
 			}
 		}
 	}
 	if len(prefixMap) == 0 {
-		log.Println("请输入 IPv6 /64 前缀:")
+		log.Println("未检测到 IPv6 前缀")
+		log.Println("请输入完整的 IPv6 前缀 (例如: 2605:6400:408c::/48 或 2605:6400:20:48::/64):")
 		reader := bufio.NewReader(os.Stdin)
 		text, _ := reader.ReadString('\n')
 		return strings.TrimSpace(text), nil
 	}
+	
+	// 排序：/48 排在前面
 	var validPrefixes []string
-	for prefix := range prefixMap {
-		validPrefixes = append(validPrefixes, prefix)
+	for cidr := range prefixMap {
+		validPrefixes = append(validPrefixes, cidr)
 	}
-	log.Println("IPv6 前缀:")
+	sort.Slice(validPrefixes, func(i, j int) bool {
+		// /48 优先
+		if strings.Contains(validPrefixes[i], "/48") {
+			return true
+		}
+		if strings.Contains(validPrefixes[j], "/48") {
+			return false
+		}
+		return validPrefixes[i] < validPrefixes[j]
+	})
+	
+	log.Println("检测到的 IPv6 前缀:")
 	for i, prefix := range validPrefixes {
 		log.Printf("  %d: %s", i+1, prefix)
 	}
@@ -458,6 +493,20 @@ func runInteractiveSetup() error {
 		return err
 	}
 	config.IPv6Prefix = selectedPrefix
+
+	// 如果是 /48 或更大的路由子网，询问下一跳地址
+	if strings.Contains(config.IPv6Prefix, "/48") || strings.Contains(config.IPv6Prefix, "/56") {
+		log.Println("\n--- 路由子网配置 ---")
+		log.Println("检测到路由子网，需要配置下一跳地址（NextHop Address）")
+		log.Println("这通常是一个在 /64 子网中的地址，用于路由流量")
+		config.NextHopAddr = readUserString("下一跳地址", "")
+		
+		if config.NextHopAddr == "" {
+			log.Println("⚠️  警告：未配置下一跳地址")
+			log.Println("   对于 BuyVM 等路由子网，需要先配置一个 /64 地址作为下一跳")
+			log.Println("   否则代理可能无法正常工作")
+		}
+	}
 
 	log.Println("\n--- IP 池 ---")
 	config.InitialPool = readUserInt("初始池", 10000)
@@ -511,7 +560,13 @@ func delIPv6(ip net.IP) {
 }
 
 func addIPv6(ip net.IP) error {
-	addr, _ := netlink.ParseAddr(ip.String() + "/128")
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(128, 128),
+		},
+		Flags: syscall.IFA_F_NODAD, // 禁用 DAD，立即可用
+	}
 	return netlink.AddrAdd(iface, addr)
 }
 
@@ -1892,7 +1947,7 @@ func main() {
 		}
 	}
 
-	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix + "::/64")
+	prefixIP, prefixNet, err = net.ParseCIDR(config.IPv6Prefix)
 	if err != nil {
 		log.Fatalf("无法解析前缀: %v", err)
 	}
@@ -1901,9 +1956,38 @@ func main() {
 		log.Fatalf("无法找到网卡: %v", err)
 	}
 
+	// 如果配置了 NextHopAddr，先添加这个地址
+	if config.NextHopAddr != "" {
+		nexthopIP := net.ParseIP(config.NextHopAddr)
+		if nexthopIP == nil {
+			log.Fatalf("无效的下一跳地址: %s", config.NextHopAddr)
+		}
+		
+		// 添加下一跳地址到网卡 (使用 /64 或 /128)
+		nexthopAddr := &netlink.Addr{
+			IPNet: &net.IPNet{
+				IP:   nexthopIP,
+				Mask: net.CIDRMask(64, 128), // 通常是 /64
+			},
+			Flags: syscall.IFA_F_NODAD,
+		}
+		
+		// 尝试添加地址，如果已存在则忽略错误
+		if err := netlink.AddrAdd(iface, nexthopAddr); err != nil {
+			if !strings.Contains(err.Error(), "file exists") {
+				log.Printf("⚠️  添加下一跳地址失败: %v", err)
+			}
+		} else {
+			log.Printf("✓ 已配置下一跳地址: %s", config.NextHopAddr)
+		}
+	}
+
 	log.Printf("")
 	log.Printf("配置: 代理:%s Web:%s", config.Port, config.WebPort)
-	log.Printf("网络: %s::/64 @ %s", config.IPv6Prefix, config.Interface)
+	log.Printf("网络: %s @ %s", config.IPv6Prefix, config.Interface)
+	if config.NextHopAddr != "" {
+		log.Printf("下一跳: %s", config.NextHopAddr)
+	}
 	log.Printf("IP池: %d → %d", config.InitialPool, config.TargetPool)
 	if config.AutoRotate {
 		log.Printf("轮换: 每 %d 小时", config.AutoRotateHours)
