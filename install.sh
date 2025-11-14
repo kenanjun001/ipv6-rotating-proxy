@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# IPv6 代理 v7.4 Final 完全集成版安装脚本
+# IPv6 代理 v7.5  修复V6地址自动删除BUG
 # 包含：自动处理dpkg锁、错误恢复、界面优化
 #
 
@@ -479,7 +479,7 @@ func runInteractiveSetup() error {
 	config.Port = readUserString("代理端口", "1080")
 	config.WebPort = readUserString("Web端口", "8080")
 	config.Username = readUserString("代理用户名", "proxy")
-	config.Password = readUserPassword("代理密码", "proxy123")
+	config.Password = readUserPassword("代理密码", "proxy")
 
 	log.Println("\n--- 网络 ---")
 	selectedIface, err := selectInterface()
@@ -3515,6 +3515,132 @@ systemctl daemon-reload
 print_success "服务创建完成"
 echo ""
 
+
+# ============================================
+# 步骤 8: 系统优化（支持 3万+ 并发连接）
+# ============================================
+echo "--- 步骤 8: 系统优化 (支持 30000+ 并发连接) ---"
+echo ""
+
+echo "=== 1. 增加邻居表限制到 10000 ==="
+sysctl -w net.ipv6.neigh.default.gc_thresh1=2048 >/dev/null 2>&1
+sysctl -w net.ipv6.neigh.default.gc_thresh2=4096 >/dev/null 2>&1
+sysctl -w net.ipv6.neigh.default.gc_thresh3=10000 >/dev/null 2>&1
+sysctl -w net.ipv6.neigh.eth0.gc_thresh1=2048 >/dev/null 2>&1
+sysctl -w net.ipv6.neigh.eth0.gc_thresh2=4096 >/dev/null 2>&1
+sysctl -w net.ipv6.neigh.eth0.gc_thresh3=10000 >/dev/null 2>&1
+print_success "邻居表限制已设置"
+
+echo ""
+echo "=== 2. 优化 TCP 连接参数 (支持大量并发) ==="
+# 增加连接跟踪表
+sysctl -w net.netfilter.nf_conntrack_max=1000000 >/dev/null 2>&1 || true
+sysctl -w net.nf_conntrack_max=1000000 >/dev/null 2>&1 || true
+
+# TCP 连接优化
+sysctl -w net.core.somaxconn=8192 >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_max_syn_backlog=8192 >/dev/null 2>&1
+sysctl -w net.core.netdev_max_backlog=16384 >/dev/null 2>&1
+
+# 增加本地端口范围
+sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
+
+# TCP 快速回收和重用
+sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1
+
+# 增加 TCP 缓冲区
+sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
+sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216" >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216" >/dev/null 2>&1
+print_success "TCP 连接参数已优化"
+
+echo ""
+echo "=== 3. 写入永久配置 ==="
+# 备份原有配置
+if [ -f /etc/sysctl.conf ]; then
+    cp /etc/sysctl.conf /etc/sysctl.conf.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
+fi
+
+# 检查是否已存在优化配置
+if ! grep -q "IPv6 代理大并发优化" /etc/sysctl.conf; then
+    cat >> /etc/sysctl.conf << 'SYSCTLEOF'
+
+# ============================================
+# IPv6 代理大并发优化 (支持 30000+ 连接)
+# ============================================
+# IPv6 邻居表 - 支持 10000 个地址
+net.ipv6.neigh.default.gc_thresh1=2048
+net.ipv6.neigh.default.gc_thresh2=4096
+net.ipv6.neigh.default.gc_thresh3=10000
+net.ipv6.neigh.eth0.gc_thresh1=2048
+net.ipv6.neigh.eth0.gc_thresh2=4096
+net.ipv6.neigh.eth0.gc_thresh3=10000
+
+# 连接跟踪
+net.netfilter.nf_conntrack_max=1000000
+net.nf_conntrack_max=1000000
+
+# TCP 优化
+net.core.somaxconn=8192
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.netdev_max_backlog=16384
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+
+# TCP 缓冲区
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+SYSCTLEOF
+    print_success "永久配置已写入"
+else
+    print_info "优化配置已存在，跳过写入"
+fi
+
+echo ""
+echo "=== 4. 增加文件描述符限制 ==="
+# 当前进程
+ulimit -n 65535 2>/dev/null || true
+
+# 永久配置
+if ! grep -q "IPv6 Proxy FD limits" /etc/security/limits.conf; then
+    cat >> /etc/security/limits.conf << 'LIMITSEOF'
+
+# IPv6 Proxy FD limits
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+LIMITSEOF
+    print_success "文件描述符限制已配置"
+else
+    print_info "文件描述符限制已存在"
+fi
+
+# systemd 服务配置
+mkdir -p /etc/systemd/system/ipv6-proxy.service.d
+cat > /etc/systemd/system/ipv6-proxy.service.d/limits.conf << 'SERVICELIMITSEOF'
+[Service]
+LimitNOFILE=65535
+LimitNPROC=65535
+SERVICELIMITSEOF
+
+systemctl daemon-reload
+print_success "systemd 服务限制已配置"
+
+echo ""
+print_success "系统优化完成！"
+echo "   ✓ IPv6 邻居表: 10000"
+echo "   ✓ 连接跟踪: 1000000"
+echo "   ✓ TCP 连接队列: 8192"
+echo "   ✓ 端口范围: 1024-65535"
+echo "   ✓ 文件描述符: 65535"
+echo ""
+
 # --- 配置 ---
 echo "============================================="
 echo "【首次配置】"
@@ -3581,7 +3707,7 @@ echo "  密码: admin123"
 echo ""
 echo "代理地址: $(curl -s ifconfig.me 2>/dev/null || echo '你的IP'):${PROXY_PORT}"
 echo "  用户: proxy"
-echo "  密码: proxy123"
+echo "  密码: proxy"
 echo ""
 echo "管理命令:"
 echo "  systemctl status ipv6-proxy     # 查看状态"
